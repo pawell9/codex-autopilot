@@ -1,0 +1,59 @@
+{
+  "identity": {
+    "run_id": "e03m-manual-g5-2026-09-13",
+    "attempt_id": "A-E03M-WORKER-1",
+    "packet_hash": "94623e39528f122a4227bd5db6c60409047fcfa17d8204143c1f1f1e283b683b",
+    "intent_revision": "intent-v1",
+    "epoch": 0
+  },
+  "candidate_fingerprint": "0a5d2b78af78411f7c6b71405e262092b78da1eb",
+  "verdict": "PASS",
+  "outcomes": [
+    {
+      "criterion_id": "C-E03M-1",
+      "outcome": "fulfilled",
+      "evidence_refs": [
+        "ev-c-e03m-1-app-exact-bytes"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "check_id": "candidate-inventory-vs-manifest",
+      "outcome": "fulfilled",
+      "actual": "candidate-export contains exactly the three manifest-listed files (.gitignore, README.md, app.txt); each file size, SHA-256, and mode 0644 matches g5-bundle/manifest.json; no duplicate names, symlinks, or unsafe paths were observed",
+      "evidence_ref": "ev-candidate-inventory-manifest-match"
+    },
+    {
+      "check_id": "manifest-sha256",
+      "outcome": "fulfilled",
+      "actual": "3698d5ed9dfb344d4c2228da5cdbba2840dabc44eec889fea141cf9a1a70d98a",
+      "evidence_ref": "ev-g5-manifest-sha256"
+    },
+    {
+      "check_id": "packet-sha256",
+      "outcome": "fulfilled",
+      "actual": "94623e39528f122a4227bd5db6c60409047fcfa17d8204143c1f1f1e283b683b",
+      "evidence_ref": "ev-g5-packet-sha256"
+    },
+    {
+      "check_id": "projection-sha256",
+      "outcome": "fulfilled",
+      "actual": "79aedaeec289fb3cb43e0b355c63801c8cc1a1b70ce135c1bc13aff0c724ac7e",
+      "evidence_ref": "ev-g5-projection-sha256"
+    },
+    {
+      "check_id": "candidate-fingerprint-consistency",
+      "outcome": "fulfilled",
+      "actual": "0a5d2b78af78411f7c6b71405e262092b78da1eb is identical in manifest candidate_fingerprint, projection candidate_fingerprint, packet subject.candidate_sha, and packet subject_fingerprint",
+      "evidence_ref": "ev-candidate-fingerprint-consistency"
+    },
+    {
+      "check_id": "C-E03M-1-exact-content",
+      "outcome": "fulfilled",
+      "actual": "candidate-export/app.txt is 9 bytes, hex 56414c55453d34320a, UTF-8 VALUE=42 followed by one LF and no other content",
+      "evidence_ref": "ev-c-e03m-1-app-exact-bytes"
+    }
+  ],
+  "findings": []
+}

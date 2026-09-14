@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "expected", "actual", "write_attempts"],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["PASS", "BLOCK", "UNVERIFIABLE"]},
+    "expected": {"type": "string"},
+    "actual": {"type": "string"},
+    "write_attempts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "outcome"],
+        "properties": {
+          "path": {"type": "string"},
+          "outcome": {"type": "string"}
+        }
+      }
+    }
+  }
+}
+

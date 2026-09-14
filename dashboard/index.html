@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Autopilot · Read-only dashboard</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#f6f5f1; --panel:#fff; --ink:#1d1d1a; --muted:#707068; --line:#deddd6; --ok:#27724c; --warn:#9a6a08; --bad:#b33b32; --info:#35698e; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#151512; --panel:#20201c; --ink:#f2f1ea; --muted:#aaa89e; --line:#383831; --ok:#63c18e; --warn:#dfb65a; --bad:#ef8177; --info:#8cbbdf; } }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:28px 18px 56px; background:var(--bg); color:var(--ink); font:14px/1.45 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1120px; margin:auto; }
+    header { display:flex; flex-wrap:wrap; align-items:baseline; gap:12px 18px; margin-bottom:18px; }
+    h1 { margin:0; font-size:22px; letter-spacing:-.02em; }
+    h2 { margin:0 0 12px; font-size:16px; }
+    h3 { margin:0 0 5px; font-size:13px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
+    .header-meta { flex:1 1 360px; color:var(--muted); font-size:12px; }
+    button { border:1px solid var(--line); border-radius:8px; padding:7px 11px; background:var(--panel); color:var(--ink); cursor:pointer; }
+    button:hover { border-color:var(--muted); }
+    .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:14px; }
+    .card { grid-column:span 12; padding:16px; border:1px solid var(--line); border-radius:12px; background:var(--panel); min-width:0; }
+    .half { grid-column:span 6; }
+    .third { grid-column:span 4; }
+    @media (max-width:760px) { .half,.third { grid-column:span 12; } }
+    .hero { display:flex; flex-wrap:wrap; align-items:end; justify-content:space-between; gap:18px; }
+    .phase { font-size:28px; font-weight:650; letter-spacing:-.03em; }
+    .badge { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 9px; font-size:11px; font-weight:650; letter-spacing:.04em; }
+    .status-accepted,.status-passed,.status-integrated { color:var(--ok); }
+    .status-blocked,.status-failed,.status-cancelled { color:var(--bad); }
+    .status-current,.status-reached,.status-running,.status-review { color:var(--info); }
+    .status-pending,.status-planned,.status-ready,.status-stale { color:var(--muted); }
+    .status-candidate,.status-repair { color:var(--warn); }
+    .subtle { color:var(--muted); font-size:12px; }
+    .kv { display:grid; grid-template-columns:140px 1fr; gap:6px 12px; margin:0; }
+    .kv dt { color:var(--muted); }
+    .kv dd { margin:0; overflow-wrap:anywhere; }
+    code { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; overflow-wrap:anywhere; }
+    .gates { display:grid; grid-template-columns:repeat(7,1fr); gap:8px; }
+    .gate { border:1px solid var(--line); border-radius:9px; padding:9px; min-width:0; }
+    .gate strong { display:block; font-size:15px; }
+    .gate small { display:block; color:var(--muted); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    @media (max-width:760px) { .gates { grid-template-columns:repeat(2,1fr); } }
+    table { width:100%; border-collapse:collapse; }
+    th,td { text-align:left; vertical-align:top; padding:8px 6px; border-top:1px solid var(--line); }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+    ul { margin:0; padding-left:20px; }
+    li + li { margin-top:7px; }
+    .empty { color:var(--muted); }
+    .concern { border-left:3px solid var(--warn); padding-left:10px; }
+    .error { color:var(--bad); white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Codex Autopilot · read-only dashboard</h1>
+    <div class="header-meta" id="source">Загрузка current ledger…</div>
+    <button id="refresh" type="button">Обновить</button>
+  </header>
+
+  <div id="error" class="card error" hidden></div>
+  <div id="app" class="grid" hidden>
+    <section class="card hero">
+      <div><h3>Текущая фаза</h3><div class="phase" id="phase">—</div><div class="subtle" id="run-meta">—</div></div>
+      <div><h3>Общий статус run</h3><span class="badge" id="overall">—</span><div class="subtle" id="reason"></div></div>
+    </section>
+
+    <section class="card half"><h2>Настройки run</h2><div id="settings"></div><p class="subtle">Resolved при старте; status/dashboard — read-only projection.</p></section>
+
+    <section class="card"><h2>G0–G6</h2><div id="gates" class="gates"></div><p class="subtle">Статусы gate — derived projection из текущего ledger; dashboard не создаёт gate state.</p></section>
+
+    <section class="card half"><h2>Tickets</h2><div id="tickets"></div></section>
+    <section class="card half"><h2>Active worker / reviewer</h2><div id="active"></div></section>
+
+    <section class="card third"><h2>Current candidate</h2><div id="candidate"></div></section>
+    <section class="card third"><h2>Last action</h2><div id="last-action"></div></section>
+    <section class="card third"><h2>Next action</h2><div id="next-action"></div></section>
+
+    <section class="card half"><h2>Blockers</h2><div id="blockers"></div></section>
+    <section class="card half"><h2>CONCERN</h2><div id="concerns"></div></section>
+  </div>
+</main>
+<script>
+  const queryRun = new URLSearchParams(location.search).get('run_id');
+  const apiUrl = '/api/ledger' + (queryRun ? '?run_id=' + encodeURIComponent(queryRun) : '');
+  const $ = (id) => document.getElementById(id);
+  const esc = (value) => String(value ?? '—').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+  const pretty = (value) => value == null || value === '' ? '—' : esc(value);
+  const badge = (value) => '<span class="badge status-' + String(value ?? '').toLowerCase() + '">' + pretty(value) + '</span>';
+  const empty = (text='Нет записей в текущем ledger.') => '<div class="empty">' + esc(text) + '</div>';
+  const list = (items, render, fallback) => items.length ? '<ul>' + items.map(render).join('') + '</ul>' : empty(fallback);
+  const kv = (pairs) => '<dl class="kv">' + pairs.map(([key,value]) => '<dt>' + esc(key) + '</dt><dd>' + pretty(value) + '</dd>').join('') + '</dl>';
+
+  function render(data) {
+    const run = data.run;
+    $('app').hidden = false;
+    $('error').hidden = true;
+    $('source').textContent = `${data.source.ledger_path} · revision ${run.revision} · обновлён ${run.updated_at || '—'} · auto-refresh 3s`;
+    $('phase').textContent = run.phase || 'не определена';
+    $('run-meta').innerHTML = `run <code>${esc(run.id)}</code> · owner epoch ${pretty(run.owner_epoch)} · source sha <code>${esc(data.source.sha256)}</code>`;
+    $('overall').className = 'badge status-' + String(run.control || '').toLowerCase();
+    $('overall').textContent = run.control || 'не определён';
+    $('reason').textContent = run.reason ? 'reason: ' + run.reason : '';
+    $('settings').innerHTML = kv([['Режим', run.run_settings?.interaction_mode], ['Глубина', run.run_settings?.depth], ['Resolved', run.preset_display]]);
+
+    $('gates').innerHTML = data.gates.map((gate) => `<div class="gate status-${esc(gate.status)}"><strong>${esc(gate.id)} · ${esc(gate.status)}</strong><small>${esc(gate.phase)}</small><small>${esc(gate.basis)}</small></div>`).join('');
+
+    $('tickets').innerHTML = data.tickets.length ? `<table><thead><tr><th>ID</th><th>Status</th><th>Attempt</th></tr></thead><tbody>${data.tickets.map((ticket) => `<tr><td><code>${esc(ticket.id)}</code><br><span class="subtle">${esc(ticket.goal_ref)}</span></td><td>${badge(ticket.status)}</td><td><code>${pretty(ticket.current_attempt)}</code></td></tr>`).join('')}</tbody></table>` : empty();
+    $('active').innerHTML = list(data.active, (item) => `<li><strong>${esc(item.kind || 'unknown')}</strong> · ${badge(item.state)}<br><code>${esc(item.attempt_id)}</code> · subject <code>${esc(item.subject_ref)}</code><br><span class="subtle">lease ${pretty(item.lease_id)} · route ${pretty(item.route_ref)}</span></li>`, 'Нет active lease в текущем ledger.');
+
+    const current = data.candidate.current;
+    $('candidate').innerHTML = current ? kv([['SHA', current.sha || '—'], ['Tree SHA', current.tree_sha || '—'], ['Attempt', current.attempt_id], ['State', current.state]]) + (data.candidate.all.length > 1 ? `<p class="subtle">Всего candidate records: ${data.candidate.all.length}</p>` : '') : empty('Current candidate ещё не записан.');
+    $('last-action').innerHTML = kv([['Recorded reason', data.last_action.recorded_reason || 'не записан'], ['Revision', data.last_action.revision], ['Updated at', data.last_action.updated_at]]) + `<p class="subtle">${esc(data.last_action.note)}</p>`;
+    $('next-action').innerHTML = kv([['Kind', data.next_action.kind], ['Subjects', (data.next_action.subject_refs || []).join(', ') || '—'], ['Preconditions', (data.next_action.preconditions || []).join(' · ') || '—']]);
+
+    $('blockers').innerHTML = list(data.blockers, (item) => `<li><strong>${esc(item.id)}</strong> · ${esc(item.type || 'issue')} · ${esc(item.cause || 'unknown')}<br>${esc(item.disposition || '—')}<br><span class="subtle">affected: ${esc((item.affected_refs || []).join(', ') || '—')}</span></li>`, 'Blocking issues не зарегистрированы.');
+    $('concerns').innerHTML = list(data.concerns, (item) => `<li class="concern"><strong>${esc(item.code)}</strong><br>${esc(item.message)}</li>`, 'Нет concerns.');
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch(apiUrl, {cache:'no-store'});
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) throw new Error(payload.error || 'ledger read failed');
+      render(payload.data);
+    } catch (error) {
+      $('app').hidden = true;
+      $('error').hidden = false;
+      $('error').textContent = 'Не удалось прочитать current ledger: ' + error.message;
+      $('source').textContent = 'Dashboard остаётся read-only; повторная попытка через 3s.';
+    }
+  }
+  $('refresh').addEventListener('click', refresh);
+  refresh();
+  setInterval(refresh, 3000);
+</script>
+</body>
+</html>

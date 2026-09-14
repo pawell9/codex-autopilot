@@ -1,0 +1,19 @@
+{
+  "status": "PASS",
+  "candidate_fingerprint": "0a5d2b78af78411f7c6b71405e262092b78da1eb",
+  "candidate_sha": "0a5d2b78af78411f7c6b71405e262092b78da1eb",
+  "candidate_tree_sha": "d687e71ab613ea65a1ec578436a8a2662ab546ec",
+  "ledger_hash": "aa51aaefe71cc3f4bb13249d2cb0126e48078786fc3c73df70f455a85f0f8b37",
+  "intent_hash": "451bfd6693410a5f757cdff4646f1de6304fc7119a0f987c0e89e6b3b3270529",
+  "packet_hash": "94623e39528f122a4227bd5db6c60409047fcfa17d8204143c1f1f1e283b683b",
+  "projection_hash": "79aedaeec289fb3cb43e0b355c63801c8cc1a1b70ce135c1bc13aff0c724ac7e",
+  "manifest_hash": "3698d5ed9dfb344d4c2228da5cdbba2840dabc44eec889fea141cf9a1a70d98a",
+  "candidate_export_files": [
+    ".gitignore",
+    "README.md",
+    "app.txt"
+  ],
+  "candidate_export_git_status": "",
+  "authoritative_state_frozen": true,
+  "receipt_scope": "post-import manual-G5 lease/ticket reconciliation; candidate, intent, packet, projection, manifest, and export remain frozen"
+}

@@ -1,0 +1,30 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Autopilot runtime state and temporary outputs
+/.autopilot/
+*.pid
+*.log
+*.tmp
+*.temp
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+
+# Qualification fixture runtime metadata; frozen fixture evidence remains tracked
+experiments/fixtures/**/.autopilot/owner.lock
+experiments/fixtures/**/.git/
+# E04a empty bootstrap is generated only during qualification; evidence is tracked separately.
+experiments/fixtures/e04a/empty-repo/

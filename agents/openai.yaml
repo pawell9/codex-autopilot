@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex Autopilot"
+  short_description: "Run a scoped change with durable gates and independent verification"
+  default_prompt: "Use $codex-autopilot to start or resume a scoped Git-backed software run."
+policy:
+  allow_implicit_invocation: false

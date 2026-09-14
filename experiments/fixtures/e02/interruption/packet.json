@@ -1,0 +1,9 @@
+{
+  "kind": "e02_interruption_probe",
+  "attempt_id": "e02-interruption",
+  "writer": "experiments/fixtures/e02/interruption/writer.sh",
+  "output_root": "experiments/fixtures/e02/interruption",
+  "expected_steps": 12,
+  "return_marker": "E02_RETURN_76d9c4af"
+}
+

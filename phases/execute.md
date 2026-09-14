@@ -1,0 +1,27 @@
+# Execute, review, and G4
+
+Read `contracts/worker.md`, `contracts/reviewer.md`, `references/ledger.md`, `references/routing.md`, and `references/safety.md` for the branch you are about to run. The normal loop is one bounded worker attempt at a time.
+
+## Ticket loop
+
+1. Materialize a READY ticket only when dependencies are reviewed/current `INTEGRATED`, the packet/contract hashes are current, the literal zone is non-overlapping, the lease is free, the oracle is available, and the route is resolved.
+2. Generate the minimal immutable packet and hash. It must include identity, one observable goal, inline criteria, exact workspace/base, lease allow/deny, verification scenarios, risk, relevant pointers, and exact return target. Persist `PREPARED` before native spawn.
+3. Spawn one new bounded native worker for a new ticket. A repair attempt uses `mode=repair` and accepted findings. The worker may be `DEGRADED_CONTEXT` only under the worker eligibility rules; the orchestrator never edits product as fallback. Missing worker capability blocks execution.
+4. Worker verifies root, base, instructions, criteria, and zone before the first write. It returns `DONE`, `BLOCKED`, `FAILED`, or `HANDOFF` through the exact file inbox or message contract. A hard cutoff yields LOST/INTERRUPTED observation and recovery, never invented DONE.
+5. Ingest only a matching attempt/packet/contract/epoch return. Independently audit actual tracked, untracked, relevant ignored, type, rename, symlink, protected, and foreign changes. An undeclared effect quarantines the checkout and creates an ownership issue.
+6. Prepare the exact Git candidate effect. The orchestrator uses the normal approved Git boundary, never raw `.git` edits or a helper bypass. Verify base, intended tree, audited paths, hook effects, candidate SHA, clean index/worktree, and operation receipt. A nonempty candidate commit precedes review; a no-op keeps the existing SHA and requires evidence.
+7. Freeze the candidate and prepare a fresh `change` reviewer packet on the immutable SHA. Routine review uses the qualified export/barrier path. Elevated work adds the risk mandate; critical work adds a separate independent security/data/trust axis. Reviewers never receive worker self-rating or repair authority.
+8. Stop the reviewer, run the independent integrity barrier, and ingest its exact structured return. A subject/state/docs/evidence mismatch invalidates the verdict and quarantines the target. PASS on an altered or unverified subject is not PASS.
+9. On required PASS, mechanically verify integration and release the reservation; mark the ticket `INTEGRATED`. On a finding, preserve the immutable verdict and triage cause first. Semantic integration conflicts become worker integration-repair tickets. Do not batch away a blocking issue.
+
+## Cause-first repair
+
+`implementation` routes to a minimal worker repair with changed hypothesis and regression proof. `contract` or `user_intent` returns through versioned INTENT/DESIGN/PLAN. `oracle` reconstructs expected behavior independently. `environment`/`permission` performs a conditional preflight or records a user action. `ownership` quarantines and resolves the exact zone/base. `orchestration` reconciles ledger/attempt/effect state. `unknown` gets a fresh read-only diagnosis.
+
+Retry only after a confirmed transient cause and effect reconciliation. A repeat requires a changed causal input, approach, capability, or evidence and an expected distinguishing result. Repeated same-class failure first gets a diagnostic checkpoint; no arbitrary repair counter or automatic success exists. Fresh context is required after amendment, lost/context-saturated worker, or repeated causal defect after substantive repair.
+
+## G4
+
+When required tickets are current `INTEGRATED`, all leases are closed/reserved correctly, the changeset is frozen, and integration checks pass, publish G4. Any unresolved blocking issue, stale criterion, unexpected write, missing oracle, or pending effect keeps the run in `VERIFY`/`BLOCKED` as appropriate. Then route to `phases/accept.md` for G5; G4 is not final acceptance.
+
+**Done when:** every required ticket has independently reviewed evidence and an audited candidate/integration record, or the run has a durable cause-specific blocker and safe next action.

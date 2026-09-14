@@ -1,0 +1,35 @@
+{
+  "identity": {
+    "run_id": "e03m-manual-g5-2026-09-13",
+    "attempt_id": "A-E03M-WORKER-1",
+    "ticket_id": "T-E03M-1",
+    "packet_hash": null,
+    "epoch": 0,
+    "contract_refs": ["contract-e03m-acceptance-v1"]
+  },
+  "kind": "worker",
+  "mode": "implement",
+  "goal": "Change the disposable fixture so app.txt reports VALUE=42.",
+  "acceptance": [
+    {"criterion_id": "C-E03M-1", "done_when": "app.txt contains exactly VALUE=42"}
+  ],
+  "workspace": {
+    "root": "/Users/pawell_9/Documents/codex-autopilot/experiments/fixtures/e03m/seed-repo",
+    "expected_base": "f267b0c94a3aa290f03aaf945707708640c5527a",
+    "clean_required": true
+  },
+  "write": {
+    "allow": [{"path": "app.txt", "operations": ["modify"]}],
+    "deny": [".autopilot", ".git", "experiments"]
+  },
+  "verification": [
+    {"check_id": "worker-local-value", "command": "grep -Fx VALUE=42 app.txt", "required": true}
+  ],
+  "risk": {"level": "critical", "axes": ["current-intent", "manual-g5-roundtrip"]},
+  "context": [
+    {"ref": "contracts/worker.md", "slice": "worker return and zone contract"},
+    {"ref": "doc-e03m-intent:v1", "slice": "current fixture intent"}
+  ],
+  "return_target": {"transport": "file", "path": "return.json", "schema": "schemas/contracts.schema.json#/\u0024defs/worker_return"}
+}
+

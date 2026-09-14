@@ -1,0 +1,16 @@
+# Правила команд (execpolicy, экспериментально). Одна строка — одна команда и решение.
+# Куда положить: ~/.codex/rules/default.rules (правила читаются глобально) — scripts/setup.sh скопирует.
+# Проверка синтаксиса: codex execpolicy check
+# [ПРОВЕРИТЬ] формат pattern (список слов или строка) — по learn.chatgpt.com/docs/rules
+
+prefix_rule(pattern=["npm", "test"], decision="allow")
+prefix_rule(pattern=["npm", "run"], decision="allow")
+prefix_rule(pattern=["pytest"], decision="allow")
+prefix_rule(pattern=["git", "status"], decision="allow")
+prefix_rule(pattern=["git", "diff"], decision="allow")
+prefix_rule(pattern=["git", "log"], decision="allow")
+prefix_rule(pattern=["git", "push"], decision="prompt")
+prefix_rule(pattern=["curl"], decision="prompt")
+prefix_rule(pattern=["rm", "-rf"], decision="forbidden")
+prefix_rule(pattern=["git", "reset", "--hard"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "--force"], decision="forbidden")

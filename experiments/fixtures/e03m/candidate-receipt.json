@@ -1,0 +1,10 @@
+{
+  "status": "PASS",
+  "checkout": "/Users/pawell_9/Documents/codex-autopilot/experiments/fixtures/e03m/seed-repo",
+  "base_sha": "f267b0c94a3aa290f03aaf945707708640c5527a",
+  "commit_sha": "0a5d2b78af78411f7c6b71405e262092b78da1eb",
+  "tree_sha": "d687e71ab613ea65a1ec578436a8a2662ab546ec",
+  "authority_ref": "user-authorized-disposable-e03m-fixture",
+  "receipt_ref": "experiments/fixtures/e03m/candidate-receipt.json"
+}
+

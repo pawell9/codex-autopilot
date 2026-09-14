@@ -1,0 +1,45 @@
+{
+ "_комментарий": "Хуки проекта: 12 событий (SessionStart, SessionEnd, PreToolUse, PermissionRequest, PostToolUse, PreCompact, PostCompact, UserPromptSubmit, SubagentStart, SubagentStop, Stop, Interrupt); обработчик — command или mcp_tool; exit 2 = блок. Форма записи [ПРОВЕРИТЬ] по learn.chatgpt.com/docs/hooks; доверие каждому хуку — /hooks. Хуки с обработчиком-промптом из Claude Code сюда не переезжают.",
+ "hooks": {
+  "SessionStart": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "bash scripts/session-start.sh"
+     }
+    ]
+   }
+  ],
+  "PreToolUse": [
+   {
+    "matcher": "Bash",
+    "hooks": [
+     {
+      "type": "command",
+      "command": "bash scripts/guard-rm.sh"
+     }
+    ]
+   },
+   {
+    "matcher": "Bash",
+    "hooks": [
+     {
+      "type": "command",
+      "command": "bash scripts/pre-push-security.sh"
+     }
+    ]
+   }
+  ],
+  "Stop": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "bash scripts/on-stop.sh"
+     }
+    ]
+   }
+  ]
+ }
+}

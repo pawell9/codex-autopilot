@@ -1,0 +1,37 @@
+model = "gpt-6-astra"
+model_context_window = 1000000
+model_reasoning_effort = "high"
+approval_policy = "on-request"
+# Одна общая политика доступа для всех запусков, без переключаемых режимов.
+default_permissions = "workspace"
+
+[features]
+memories = true                  # /memories показывает, что запомнено
+
+[features.context_management]
+experimental_mode = true         # заметки между окнами + new_context; вход через ChatGPT
+
+[tui]
+auto_recap = true                # авто-сводка; ручная — /recap
+
+[agents]
+max_threads = 5                  # одновременно запущенные субагенты
+max_depth = 1                    # ограничение вложенности V1
+
+# ---------------- Общие правила доступа ----------------
+# Наследуем запись в рабочую папку и добавляем запреты чтения.
+# default_permissions не совмещается со старым sandbox_mode.
+
+[permissions.workspace]
+extends = ":workspace"
+
+[permissions.workspace.filesystem]
+glob_scan_max_depth = 3           # глубина поиска ** на Windows/Linux/WSL
+
+[permissions.workspace.filesystem.":workspace_roots"]
+"**/*.env" = "deny"
+"secrets" = "deny"
+"**/*.pem" = "deny"
+
+[permissions.workspace.network]
+enabled = true

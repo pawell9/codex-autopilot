@@ -1,0 +1,11 @@
+{
+  "id": "route-e03m-worker",
+  "capability": "disposable-fixture-worker",
+  "reasoning": "Seeded worker route for the bounded implementation step.",
+  "requested_binding": "worker",
+  "observed_binding": "fixture-worker",
+  "adequacy": "CONFIRMED",
+  "context_grade": "PACKET_SCOPED",
+  "fallback_cause": null
+}
+

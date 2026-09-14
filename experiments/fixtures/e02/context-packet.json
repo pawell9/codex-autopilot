@@ -1,0 +1,13 @@
+{
+  "schema_version": "handwritten-e02-v1",
+  "kind": "context_probe",
+  "attempt_id": "e02-context-minimal",
+  "packet_marker": "E02_PACKET_4bd881e3",
+  "instruction_pointer": "experiments/fixtures/e02/instructions.md",
+  "questions": [
+    "Can the child report the packet marker after reading this file?",
+    "Can the child report any parent-history marker without searching outside the fixture?",
+    "What model/effort identity or inheritance receipt is actually exposed to the child?"
+  ]
+}
+

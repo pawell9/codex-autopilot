@@ -1,0 +1,1979 @@
+#!/usr/bin/env python3
+"""Deterministic Codex Autopilot ledger and contract helper.
+
+The helper owns no orchestration loop and never invokes a model.  It validates
+closed-schema payloads, publishes one ledger revision under an advisory lock,
+and records exact evidence bytes.  Git mutations remain native approved
+orchestrator actions; this module only validates their receipts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+SKILL_VERSION = "1.0.0"
+POLICY_VERSION = "v1-manual-g5"
+SCHEMA_VERSION = "1.0"
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+PHASES = ("PREFLIGHT", "INTENT", "DESIGN", "PLAN", "EXECUTE", "VERIFY", "ACCEPT")
+CONTROLS = ("ACTIVE", "QUIESCING", "PAUSED", "BLOCKED", "RECOVERING", "ACCEPTED", "FAILED", "CANCELLED")
+CAUSES = ("implementation", "contract", "oracle", "environment", "permission", "ownership", "orchestration", "user_intent", "unknown")
+VALID_CONTEXT_GRADES = {"PACKET_SCOPED", "DEGRADED_CONTEXT", "MANUAL_ATTESTED_CLEAN", "STRICT_FRESH"}
+DEFAULT_RUN_SETTINGS = {"interaction_mode": "semi", "depth": "normal"}
+RUN_SETTING_LABELS = {
+    "interaction_mode": {"semi": "полуавтомат", "full": "полный автомат"},
+    "depth": {"normal": "обычная", "deep": "глубокая"},
+}
+USAGE_FIELDS = (
+    "helper_calls", "model_turns", "orchestrator_turns", "spawn_calls", "wait_calls", "git_calls",
+    "internal_publications", "packet_bytes", "return_bytes", "brief_bytes", "wall_time_ms",
+    "approvals", "user_interventions", "manual_handoffs", "manual_setup", "manual_wait",
+)
+
+
+class LedgerError(Exception):
+    """A safe, user-actionable validation or publication failure."""
+
+
+def fail(message: str) -> None:
+    raise LedgerError(message)
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def zero_usage() -> dict[str, int]:
+    return {field: 0 for field in USAGE_FIELDS}
+
+
+def default_usage() -> dict[str, Any]:
+    return {
+        "counters": zero_usage(),
+        "tokens": None,
+        "token_reason": "token_meter_unavailable",
+        "unknown_reason": "token meter unavailable on this runtime",
+        "trace": [],
+        "shared_setup": zero_usage(),
+        "gate_costs": {f"G{i}": zero_usage() for i in range(7)},
+    }
+
+
+def resolved_run_settings(state: dict[str, Any]) -> dict[str, str]:
+    """Return effective settings without migrating legacy ledgers."""
+    stored = state.get("run_settings")
+    if not isinstance(stored, dict):
+        stored = {}
+    return {
+        "interaction_mode": stored.get("interaction_mode", DEFAULT_RUN_SETTINGS["interaction_mode"]),
+        "depth": stored.get("depth", DEFAULT_RUN_SETTINGS["depth"]),
+    }
+
+
+def run_settings_display(settings: dict[str, str]) -> str:
+    mode = RUN_SETTING_LABELS["interaction_mode"].get(settings["interaction_mode"], settings["interaction_mode"])
+    depth = RUN_SETTING_LABELS["depth"].get(settings["depth"], settings["depth"])
+    return f"Режим: {mode} · глубина: {depth}"
+
+
+def parse_run_settings(request: str | None) -> dict[str, str]:
+    """Parse only obvious English/Russian preset phrases; ambiguity defaults."""
+    if not request:
+        return dict(DEFAULT_RUN_SETTINGS)
+    text = re.sub(r"[_/–—-]+", " ", request.casefold())
+    full = bool(re.search(r"(?:\bполный\s+автомат(?:ический)?\b|\bполностью\s+автомат(?:ический)?\b|\bfull\s+(?:auto|automatic|automated|automation|mode)\b|\bfully\s+automatic\b)", text))
+    semi = bool(re.search(r"(?:\bполуавтомат(?:ический)?\b|\bsemi\s+automatic\b|\bsemi\s+automated\b|\bsemi\s+mode\b)", text))
+    deep = bool(re.search(r"(?:\bглубок(?:ая|ий|ое|ую|о)?\b|\bdeep\b|\bin\s+depth\b|\bthorough\b|\bdetailed\b)", text))
+    normal = bool(re.search(r"(?:\bобычн(?:ая|ый|ое|ую|о)?\b|\bnormal\b|\bstandard\b|\bbaseline\b)", text))
+    return {
+        "interaction_mode": "full" if full and not semi else DEFAULT_RUN_SETTINGS["interaction_mode"],
+        "depth": "deep" if deep and not normal else DEFAULT_RUN_SETTINGS["depth"],
+    }
+
+
+def run_settings_from_args(request: str | None, interaction_mode: str | None, depth: str | None) -> dict[str, str]:
+    settings = parse_run_settings(request)
+    if interaction_mode is not None:
+        settings["interaction_mode"] = interaction_mode
+    if depth is not None:
+        settings["depth"] = depth
+    return settings
+
+
+def routing_intent(state: dict[str, Any]) -> dict[str, Any]:
+    """Expose preset intent to routing without binding or selecting a model."""
+    settings = resolved_run_settings(state)
+    return {"interaction_mode": settings["interaction_mode"], "depth": settings["depth"], "model_binding": None}
+
+
+def add_usage(target: dict[str, int], delta: dict[str, Any]) -> None:
+    for field in USAGE_FIELDS:
+        value = delta.get(field, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            fail(f"usage delta {field} must be a non-negative integer")
+        target[field] = target.get(field, 0) + value
+
+
+def current_intent_binding(state: dict[str, Any]) -> dict[str, str]:
+    intent = state.get("intent")
+    if not isinstance(intent, dict):
+        fail("current intent is missing")
+    document_ref = intent.get("document_ref")
+    document = next((item for item in state.get("documents", []) if item.get("id") == document_ref), None)
+    if document is None:
+        fail("current intent document is missing")
+    path = Path(document.get("path", ""))
+    if not path.exists() or path.is_symlink() or not path.is_file():
+        fail("current intent document is unavailable")
+    actual_hash = sha256_file(path)
+    if actual_hash != document.get("hash"):
+        fail("current intent document hash does not match the ledger")
+    expected_hash = intent.get("document_hash")
+    if expected_hash is not None and expected_hash != actual_hash:
+        fail("current intent document hash does not match intent binding")
+    return {"revision": str(intent.get("current_revision")), "document_ref": str(document_ref), "document_hash": actual_hash}
+
+
+def canonical_bytes(value: Any) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def safe_id(value: str, label: str = "id") -> str:
+    if not isinstance(value, str) or not ID_RE.fullmatch(value):
+        fail(f"invalid {label}: expected path-safe identifier")
+    return value
+
+
+def safe_root(path: str | Path, label: str) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate.is_symlink():
+        fail(f"{label} may not be a symlink")
+    result = candidate.resolve()
+    if result == Path(result.anchor):
+        fail(f"{label} may not be filesystem root")
+    return result
+
+
+def under(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def regular_non_symlink(path: Path) -> None:
+    if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+        fail(f"expected regular non-symlink file: {path}")
+
+
+def regular_directory(path: Path, label: str = "directory") -> None:
+    if path.is_symlink() or not path.is_dir():
+        fail(f"expected regular non-symlink {label}: {path}")
+
+
+def relative_path(value: str, label: str = "path") -> str:
+    if not isinstance(value, str) or not value or Path(value).is_absolute():
+        fail(f"invalid {label}: expected repository-relative path")
+    path = Path(value)
+    if ".." in path.parts:
+        fail(f"invalid {label}: path traversal is not allowed")
+    return path.as_posix()
+
+
+def read_json(path: Path, label: str = "JSON") -> Any:
+    regular_non_symlink(path)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"invalid {label} {path}: {exc}")
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+class Lock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.stream = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.stream = self.path.open("a+")
+        fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_args):
+        if self.stream is not None:
+            fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
+            self.stream.close()
+
+
+def schema_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "schemas" / "contracts.schema.json"
+
+
+def schema() -> dict[str, Any]:
+    try:
+        return json.loads(schema_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"schema unavailable or malformed: {exc}")
+
+
+def validate(value: Any, spec: dict[str, Any], root: dict[str, Any], path: str = "$", seen: set[str] | None = None) -> None:
+    """Validate the closed subset used by this package; unknown keywords fail closed."""
+    supported = {"$schema", "$id", "$defs", "title", "$ref", "type", "required", "properties", "additionalProperties", "items", "enum", "const", "pattern", "minLength", "minItems", "minimum", "minProperties"}
+    unknown = set(spec) - supported
+    if unknown:
+        fail(f"unsupported schema keyword(s) at {path}: {sorted(unknown)}")
+    if "$ref" in spec:
+        ref = spec["$ref"]
+        if not isinstance(ref, str) or not ref.startswith("#/$defs/"):
+            fail(f"unsupported schema ref at {path}: {ref}")
+        name = ref.rsplit("/", 1)[-1]
+        validate(value, root.get("$defs", {}).get(name, {}), root, path, seen)
+        return
+    if "const" in spec and value != spec["const"]:
+        fail(f"{path}: expected constant {spec['const']!r}")
+    if "enum" in spec and value not in spec["enum"]:
+        fail(f"{path}: value {value!r} is not in enum")
+    types = spec.get("type")
+    if types:
+        allowed = [types] if isinstance(types, str) else types
+        ok = any({"object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str), "integer": isinstance(value, int) and not isinstance(value, bool), "number": isinstance(value, (int, float)) and not isinstance(value, bool), "boolean": isinstance(value, bool), "null": value is None}.get(t, False) for t in allowed)
+        if not ok:
+            fail(f"{path}: wrong type")
+    if isinstance(value, str):
+        if len(value) < spec.get("minLength", 0):
+            fail(f"{path}: shorter than minLength")
+        if "pattern" in spec and not re.fullmatch(spec["pattern"], value):
+            fail(f"{path}: pattern mismatch")
+    if isinstance(value, (int, float)) and value < spec.get("minimum", value):
+        fail(f"{path}: below minimum")
+    if isinstance(value, list):
+        if len(value) < spec.get("minItems", 0):
+            fail(f"{path}: fewer than minItems")
+        if "items" in spec:
+            for index, item in enumerate(value):
+                validate(item, spec["items"], root, f"{path}[{index}]")
+    if isinstance(value, dict):
+        if len(value) < spec.get("minProperties", 0):
+            fail(f"{path}: fewer than minProperties")
+        for required in spec.get("required", []):
+            if required not in value:
+                fail(f"{path}: missing required field {required}")
+        properties = spec.get("properties", {})
+        if spec.get("additionalProperties") is False:
+            extras = set(value) - set(properties)
+            if extras:
+                fail(f"{path}: unknown field(s): {sorted(extras)}")
+        for key, child in properties.items():
+            if key in value:
+                validate(value[key], child, root, f"{path}.{key}")
+
+
+def validate_ledger(state: dict[str, Any]) -> None:
+    root = schema()
+    validate(state, root, root)
+    if state["run_id"] != Path(state["repository"]["control_root"]).name and state["run_id"] == "":
+        fail("run_id must be nonempty")
+    ids: set[str] = set()
+    for collection in ("documents", "requirements", "criteria", "contracts", "decisions", "tickets", "attempts", "issues", "findings", "reviews", "operations", "capabilities", "routes", "evidence", "invalidations"):
+        for item in state.get(collection, []):
+            if "id" in item:
+                if item["id"] in ids:
+                    fail(f"duplicate immutable ID: {item['id']}")
+                ids.add(item["id"])
+    ticket_ids = {item["id"] for item in state.get("tickets", [])}
+    criterion_ids = {item["id"] for item in state.get("criteria", [])}
+    requirement_ids = {item["id"] for item in state.get("requirements", [])}
+    document_ids = {item["id"] for item in state.get("documents", [])}
+    if state.get("intent"):
+        intent = state["intent"]
+        if intent["document_ref"] not in document_ids:
+            fail("intent references unknown document")
+        if intent.get("document_hash"):
+            document = next(item for item in state.get("documents", []) if item["id"] == intent["document_ref"])
+            if document.get("hash") != intent["document_hash"]:
+                fail("intent document_hash does not match document")
+    for requirement in state.get("requirements", []):
+        if any(ref not in criterion_ids for ref in requirement.get("criterion_refs", [])):
+            fail(f"requirement references unknown criterion: {requirement['id']}")
+    for criterion in state.get("criteria", []):
+        if any(ref not in requirement_ids for ref in criterion.get("requirement_refs", [])):
+            fail(f"criterion references unknown requirement: {criterion['id']}")
+    for ticket in state.get("tickets", []):
+        if any(ref not in criterion_ids for ref in ticket.get("criterion_refs", [])):
+            fail(f"ticket references unknown criterion: {ticket['id']}")
+    graph = {item["id"]: set(item.get("dependency_refs", [])) for item in state.get("tickets", [])}
+    if any(dep not in ticket_ids for deps in graph.values() for dep in deps):
+        fail("ticket dependency references unknown ticket")
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    def visit(node: str) -> None:
+        if node in visiting:
+            fail("ticket dependency graph contains a cycle")
+        if node in visited:
+            return
+        visiting.add(node)
+        for dep in graph[node]:
+            visit(dep)
+        visiting.remove(node)
+        visited.add(node)
+    for node in graph:
+        visit(node)
+    for attempt in state.get("attempts", []):
+        if attempt["epoch"] > state["owner"]["epoch"] + 1:
+            fail(f"attempt epoch is ahead of owner epoch: {attempt['id']}")
+    if state["lifecycle"]["control"] == "ACCEPTED":
+        if not any(a.get("verdict") == "PASS" for a in state.get("acceptance", [])):
+            fail("ACCEPTED requires a recorded G5 PASS")
+    for operation in state.get("operations", []):
+        if operation.get("state") == "applied" and not operation.get("receipt_ref"):
+            fail(f"applied operation lacks receipt: {operation['id']}")
+    all_ids = ids
+    for finding in state.get("findings", []):
+        if any(ref not in all_ids for ref in finding.get("affected_refs", [])):
+            fail(f"finding references unknown subject: {finding['id']}")
+    for invalidation in state.get("invalidations", []):
+        if invalidation.get("amendment_ref") not in all_ids:
+            # The amendment itself is an event ID, not a regular collection
+            # member; validate its shape while allowing it to be new.
+            safe_id(invalidation.get("amendment_ref"), "amendment_id")
+        if any(ref not in all_ids for ref in invalidation.get("consumer_refs", [])):
+            fail(f"invalidation references unknown consumer: {invalidation['id']}")
+    usage = state.get("usage")
+    if usage and usage.get("tokens") is None and not usage.get("token_reason"):
+        fail("usage with tokens=null requires token_reason")
+
+
+def paths(control_root: str | Path, run_id: str) -> dict[str, Path]:
+    root = safe_root(control_root, "control root")
+    safe_id(run_id, "run_id")
+    base = root / ".autopilot"
+    if base.is_symlink():
+        fail("canonical .autopilot namespace may not be a symlink")
+    run = base / "runs" / run_id
+    return {"root": root, "base": base, "run": run, "ledger": run / "ledger.json", "prev": run / "ledger.prev.json", "lock": base / "owner.lock", "objects": run / "objects", "packets": run / "packets", "docs": run / "docs", "scratch": base / "scratch" / run_id}
+
+
+def load_state(p: dict[str, Path]) -> tuple[dict[str, Any], bytes]:
+    regular_non_symlink(p["ledger"])
+    raw = p["ledger"].read_bytes()
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"current ledger is corrupt: {exc}; inspect ledger.prev.json/snapshots read-only")
+    validate_ledger(state)
+    return state, raw
+
+
+def verified_state_file(path: Path, expected_run_id: str) -> tuple[dict[str, Any], bytes] | None:
+    """Return only a canonical, schema-valid publication suitable for recovery."""
+    try:
+        regular_non_symlink(path)
+        raw = path.read_bytes()
+        state = json.loads(raw.decode("utf-8"))
+        validate_ledger(state)
+        if state.get("run_id") != expected_run_id or canonical_bytes(state) != raw:
+            return None
+        return state, raw
+    except (LedgerError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
+def recovery_candidates(p: dict[str, Path], run_id: str) -> list[tuple[dict[str, Any], bytes, Path]]:
+    candidates: list[tuple[dict[str, Any], bytes, Path]] = []
+    for candidate in (p["prev"],):
+        verified = verified_state_file(candidate, run_id)
+        if verified:
+            candidates.append((*verified, candidate))
+    snapshot_root = p["run"] / "snapshots"
+    if snapshot_root.exists():
+        if snapshot_root.is_symlink() or not snapshot_root.is_dir():
+            fail("recovery snapshot namespace is not a regular directory")
+        for candidate in snapshot_root.iterdir():
+            if candidate.suffix != ".json" or candidate.is_symlink():
+                continue
+            verified = verified_state_file(candidate, run_id)
+            if verified:
+                candidates.append((*verified, candidate))
+    return sorted(candidates, key=lambda item: (item[0].get("revision", -1), item[2].name), reverse=True)
+
+
+def snapshot_is_pinned(state: dict[str, Any]) -> bool:
+    return (
+        any(op.get("state") in ("prepared", "uncertain") for op in state.get("operations", []))
+        or state.get("lifecycle", {}).get("control") in ("RECOVERING", "ACCEPTED", "FAILED", "CANCELLED")
+    )
+
+
+def write_snapshot(p: dict[str, Path], state: dict[str, Any], kind: str) -> Path:
+    snapshot_root = p["run"] / "snapshots"
+    regular_directory(p["run"], "run directory")
+    if snapshot_root.exists() and (snapshot_root.is_symlink() or not snapshot_root.is_dir()):
+        fail("recovery snapshot namespace is not a regular directory")
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    safe_kind = re.sub(r"[^A-Za-z0-9._-]+", "-", kind).strip("-") or "checkpoint"
+    prefix = "pinned-" if snapshot_is_pinned(state) else ""
+    target = snapshot_root / f"{prefix}{state['revision']}-{safe_kind}.json"
+    atomic_write(target, canonical_bytes(state))
+    return target
+
+
+def prune_snapshots(p: dict[str, Path]) -> None:
+    snapshot_root = p["run"] / "snapshots"
+    if not snapshot_root.exists():
+        return
+    regular_directory(snapshot_root, "snapshot namespace")
+    unpinned = [path for path in snapshot_root.iterdir() if path.suffix == ".json" and not path.name.startswith("pinned-") and not path.is_symlink()]
+    unpinned.sort(key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+    for path in unpinned[8:]:
+        path.unlink()
+
+
+def publish(p: dict[str, Path], state: dict[str, Any], previous_raw: bytes | None, snapshot_kind: str | None = None) -> None:
+    validate_ledger(state)
+    if previous_raw is not None:
+        if not p["prev"].parent.exists():
+            fail("ledger parent missing before previous-publication backup")
+        atomic_write(p["prev"], previous_raw)
+    raw = canonical_bytes(state)
+    atomic_write(p["ledger"], raw)
+    if snapshot_kind:
+        write_snapshot(p, state, snapshot_kind)
+        prune_snapshots(p)
+
+
+def transaction(p: dict[str, Path], token: str, expected_revision: int | None, change: Callable[[dict[str, Any]], None], snapshot_kind: str | None = None) -> dict[str, Any]:
+    started = time.monotonic()
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if expected_revision is not None and state["revision"] != expected_revision:
+            fail(f"revision mismatch: expected {expected_revision}, current {state['revision']}")
+        next_state = copy.deepcopy(state)
+        change(next_state)
+        usage = next_state.setdefault("usage", default_usage())
+        usage.setdefault("counters", zero_usage())
+        usage.setdefault("trace", [])
+        usage.setdefault("shared_setup", zero_usage())
+        usage.setdefault("gate_costs", {f"G{i}": zero_usage() for i in range(7)})
+        delta = {field: 0 for field in USAGE_FIELDS}
+        delta["helper_calls"] = 1
+        delta["internal_publications"] = 1
+        delta["wall_time_ms"] = max(0, int((time.monotonic() - started) * 1000))
+        add_usage(usage["counters"], delta)
+        usage["trace"].append({"id": f"trace-{state['revision'] + 1}-helper", "kind": "helper_publication", "actor": "ledger-helper", "subject_ref": state.get("lifecycle", {}).get("next_action", {}).get("kind"), "delta": delta, "evidence_ref": None, "recorded_at": now()})
+        next_state["revision"] = state["revision"] + 1
+        next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        next_state["updated_at"] = now()
+        publish(p, next_state, previous_raw, snapshot_kind)
+        return next_state
+
+
+def object_store(p: dict[str, Path], raw: bytes) -> str:
+    digest = sha256_bytes(raw)
+    target = p["objects"] / digest
+    if p["objects"].exists() and (p["objects"].is_symlink() or not p["objects"].is_dir()):
+        fail("immutable object namespace is not a regular directory")
+    p["objects"].mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        regular_non_symlink(target)
+        if sha256_file(target) != digest:
+            fail(f"immutable object collision: {target}")
+    else:
+        atomic_write(target, raw)
+    return digest
+
+
+def inbox_file(p: dict[str, Path], attempt_id: str, candidate: Path) -> Path:
+    attempt_root = (p["scratch"] / safe_id(attempt_id, "attempt_id")).resolve()
+    candidate = candidate.expanduser().absolute()
+    if candidate.is_symlink():
+        fail("return inbox file must not be a symlink")
+    candidate = candidate.parent.resolve() / candidate.name
+    if not under(candidate, attempt_root):
+        fail("return path escapes the registered exact attempt inbox")
+    regular_non_symlink(candidate)
+    if candidate.stat().st_size > 4 * 1024 * 1024:
+        fail("return exceeds the 4 MiB contract bound")
+    return candidate
+
+
+def attempt_by_id(state: dict[str, Any], attempt_id: str) -> dict[str, Any]:
+    for attempt in state.get("attempts", []):
+        if attempt["id"] == attempt_id:
+            return attempt
+    fail(f"unknown attempt: {attempt_id}")
+
+
+def packet_identity(packet: dict[str, Any]) -> dict[str, Any]:
+    identity = packet.get("identity")
+    if not isinstance(identity, dict):
+        fail("packet/return identity is required")
+    return identity
+
+
+def validate_route_eligibility(route: dict[str, Any]) -> None:
+    if route.get("adequacy") != "CONFIRMED":
+        fail(f"route is not eligible for dispatch: adequacy={route.get('adequacy')}")
+    context_grade = route.get("context_grade")
+    if not isinstance(context_grade, str) or context_grade not in VALID_CONTEXT_GRADES:
+        fail(f"route is not eligible for dispatch: invalid context_grade={context_grade!r}")
+    fallback = route.get("fallback_cause")
+    if fallback is not None:
+        if fallback not in CAUSES:
+            fail(f"route is not eligible for dispatch: invalid fallback_cause={fallback!r}")
+        if not route.get("requested_binding") and not route.get("observed_binding"):
+            fail("route is not eligible for dispatch: fallback lacks requested/observed binding")
+        if context_grade in {"UNKNOWN", "REJECTED"}:
+            fail("route is not eligible for dispatch: fallback context is not usable")
+
+
+def repair_signature(contract: dict[str, Any]) -> str:
+    return sha256_bytes(canonical_bytes({key: contract.get(key) for key in ("cause", "finding_ref", "hypothesis", "expected_proof", "stopping_condition", "causal_change")}))
+
+
+def nonempty_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        fail(f"{label} must be a non-empty string")
+    return value
+
+
+def ids_from_records(records: list[dict[str, Any]], key: str, label: str) -> list[str]:
+    values: list[str] = []
+    for record in records:
+        value = record.get(key)
+        safe_id(value, label)
+        values.append(value)
+    if len(values) != len(set(values)):
+        fail(f"duplicate {label} records")
+    return values
+
+
+def stored_payload(p: dict[str, Path], ref: str | None, label: str) -> dict[str, Any]:
+    if not isinstance(ref, str) or not ref.startswith("objects/"):
+        fail(f"{label} is not an immutable object reference")
+    path = (p["run"] / ref).resolve()
+    if not under(path, p["objects"]):
+        fail(f"{label} escapes immutable object namespace")
+    return read_json(path, label)
+
+
+def validate_worker_return_semantics(payload: dict[str, Any], packet: dict[str, Any]) -> None:
+    acceptance = packet.get("acceptance", [])
+    checks = packet.get("verification", [])
+    criteria = payload.get("criteria", [])
+    returned_criteria = ids_from_records(criteria, "criterion_id", "worker criterion")
+    required_criteria = ids_from_records(acceptance, "criterion_id", "packet criterion")
+    if set(returned_criteria) != set(required_criteria):
+        fail("worker return criteria do not correspond exactly to the packet")
+    check_records = payload.get("checks", [])
+    returned_checks = ids_from_records(check_records, "check_id", "worker check")
+    required_checks = ids_from_records([item for item in checks if item.get("required", True)], "check_id", "packet check")
+    if not set(required_checks).issubset(returned_checks):
+        fail("worker return omits required packet checks")
+    if payload.get("status") == "DONE" and any(record.get("outcome") != "pass" for record in check_records if record.get("check_id") in required_checks):
+        fail("worker return has a failed or non-passing required check")
+    if payload.get("status") == "DONE" and any(record.get("outcome") != "satisfied" for record in criteria):
+        fail("worker return has an unsatisfied or unverifiable criterion")
+    for record in payload.get("files", []):
+        relative_path(record.get("path"), "worker file path")
+        if record.get("operation") == "rename":
+            relative_path(record.get("from"), "worker rename source")
+            relative_path(record.get("to"), "worker rename target")
+    issues = payload.get("issues", [])
+    if payload.get("status") == "DONE" and any(item.get("impact") == "blocking" for item in issues):
+        fail("DONE worker return contains a blocking issue")
+    if payload.get("status") == "DONE" and (not required_criteria or not required_checks):
+        fail("DONE worker return is not semantically complete")
+    if payload.get("status") in ("BLOCKED", "FAILED") and not payload.get("issues"):
+        fail(f"{payload['status']} worker return requires a typed issue")
+    if payload.get("status") == "HANDOFF" and not payload.get("handoff"):
+        fail("HANDOFF worker return requires a handoff object")
+
+
+def worker_return_write_set_violations(payload: dict[str, Any], lease: dict[str, Any]) -> list[dict[str, str]]:
+    """Return worker-declared paths/operations that exceed the current lease."""
+    zone = lease.get("zone", [])
+
+    def allowed(path: str, operation: str) -> bool:
+        for entry in zone:
+            zone_path = relative_path(entry.get("path"), "lease zone path").rstrip("/")
+            if (path == zone_path or path.startswith(zone_path + "/")) and operation in entry.get("operations", []):
+                return True
+        return False
+
+    violations: list[dict[str, str]] = []
+    for record in payload.get("files", []):
+        operation = record.get("operation")
+        paths = [(record.get("path"), operation)]
+        if operation == "rename":
+            paths.extend(((record.get("from"), operation), (record.get("to"), operation)))
+        for value, claimed_operation in paths:
+            if value is None:
+                continue
+            path = relative_path(value, "worker file path")
+            if not allowed(path, claimed_operation):
+                violations.append({"path": path, "operation": claimed_operation})
+    return violations
+
+
+def review_criterion_id(record: dict[str, Any]) -> str:
+    value = record.get("criterion_id", record.get("id"))
+    return safe_id(value, "review criterion")
+
+
+def validate_review_return_semantics(payload: dict[str, Any], packet: dict[str, Any]) -> None:
+    packet_criteria = packet.get("criteria", [])
+    required = [review_criterion_id(item) for item in packet_criteria]
+    if len(required) != len(set(required)):
+        fail("review packet has duplicate criteria")
+    coverage = payload.get("coverage", [])
+    coverage_ids = [review_criterion_id(item) for item in coverage]
+    if len(coverage_ids) != len(set(coverage_ids)) or set(coverage_ids) != set(required):
+        fail("review coverage must contain every packet criterion exactly once")
+    if not payload.get("checks"):
+        fail("review return requires non-empty independent checks")
+    check_ids = ids_from_records(payload["checks"], "check_id", "review check")
+    if any(not nonempty_string(item.get("evidence_ref"), "review check evidence_ref") for item in payload["checks"]):
+        fail("review checks require evidence references")
+    axes = packet.get("axes", [])
+    if axes:
+        checked_axes = {item.get("axis", item.get("check_id")) for item in payload["checks"]}
+        missing = set(axes) - checked_axes
+        if missing:
+            fail(f"review return omits required review-axis checks: {sorted(missing)}")
+    if not payload.get("context_refs"):
+        fail("review return requires non-empty context evidence")
+    if any(item.get("outcome") != "fulfilled" for item in coverage if payload.get("verdict") == "PASS"):
+        fail("review PASS contains a non-fulfilled criterion")
+    for finding in payload.get("findings", []):
+        if finding.get("impact") == "blocking" and payload.get("verdict") == "PASS":
+            fail("review PASS contains a blocking finding")
+    if not check_ids:
+        fail("review return has no usable checks")
+
+
+def validate_acceptance_return_semantics(payload: dict[str, Any], required_ids: list[str]) -> None:
+    outcomes = payload.get("outcomes", [])
+    actual = [safe_id(item.get("criterion_id"), "acceptance criterion") for item in outcomes]
+    if len(actual) != len(set(actual)) or set(actual) != set(required_ids):
+        fail("acceptance outcomes must correspond exactly to active criteria")
+    if not payload.get("checks"):
+        fail("acceptance PASS requires non-empty independent checks")
+    if any(not nonempty_string(item.get("evidence_ref"), "acceptance check evidence_ref") for item in payload.get("checks", [])):
+        fail("acceptance checks require evidence references")
+    if payload.get("verdict") == "PASS":
+        if any(item.get("outcome") != "fulfilled" for item in outcomes):
+            fail("acceptance PASS contains a non-fulfilled criterion")
+        if any(item.get("impact") == "blocking" for item in payload.get("findings", [])):
+            fail("acceptance PASS contains a blocking finding")
+
+
+def validate_standalone_contract(value: dict[str, Any], kind: str) -> None:
+    if kind == "worker_return":
+        identity = packet_identity(value)
+        if not HASH_RE.fullmatch(identity.get("packet_hash", "")) or not isinstance(identity.get("epoch"), int) or isinstance(identity.get("epoch"), bool):
+            fail("worker_return identity requires packet_hash and owner epoch")
+        checks = value.get("checks", [])
+        criteria = value.get("criteria", [])
+        ids_from_records(checks, "check_id", "worker check")
+        ids_from_records(criteria, "criterion_id", "worker criterion")
+        if value.get("status") == "DONE" and any(item.get("outcome") != "pass" for item in checks):
+            fail("DONE worker return requires all checks to pass")
+    elif kind == "review_return":
+        identity = packet_identity(value)
+        if not HASH_RE.fullmatch(identity.get("packet_hash", "")) or not isinstance(identity.get("epoch"), int) or isinstance(identity.get("epoch"), bool):
+            fail("review_return identity requires packet_hash and owner epoch")
+        coverage_ids = [review_criterion_id(item) for item in value.get("coverage", [])]
+        if len(coverage_ids) != len(set(coverage_ids)):
+            fail("review coverage contains duplicate criteria")
+        if value.get("verdict") == "PASS" and any(item.get("outcome") != "fulfilled" for item in value.get("coverage", [])):
+            fail("review PASS requires fulfilled coverage")
+    elif kind == "acceptance_return":
+        identity = packet_identity(value)
+        if not HASH_RE.fullmatch(identity.get("packet_hash", "")) or not isinstance(identity.get("epoch"), int) or isinstance(identity.get("epoch"), bool):
+            fail("acceptance_return identity requires packet_hash and owner epoch")
+        outcome_ids = [safe_id(item.get("criterion_id"), "acceptance criterion") for item in value.get("outcomes", [])]
+        if len(outcome_ids) != len(set(outcome_ids)):
+            fail("acceptance outcomes contain duplicate criteria")
+        if value.get("verdict") == "PASS" and any(item.get("outcome") != "fulfilled" for item in value.get("outcomes", [])):
+            fail("acceptance PASS requires fulfilled outcomes")
+
+
+def ingest_payload(p: dict[str, Path], state: dict[str, Any], attempt_id: str, payload_path: Path, expected_packet_hash: str | None = None, kind: str | None = None) -> tuple[dict[str, Any], str]:
+    payload_path = inbox_file(p, attempt_id, payload_path)
+    raw = payload_path.read_bytes()
+    payload = read_json(payload_path, "return")
+    identity = packet_identity(payload)
+    if identity.get("attempt_id") != attempt_id:
+        fail("return attempt_id does not match exact inbox attempt")
+    if expected_packet_hash and identity.get("packet_hash") != expected_packet_hash:
+        fail("return packet hash mismatch")
+    if identity.get("run_id") not in (None, state["run_id"]):
+        fail("return run_id mismatch")
+    if kind:
+        definition = {"worker": "worker_return", "review": "review_return", "acceptance": "acceptance_return"}.get(kind)
+        if definition:
+            root = schema()
+            validate(payload, root["$defs"][definition], root, "$.return")
+            if kind == "worker":
+                attempt = attempt_by_id(state, attempt_id)
+                packet = stored_payload(p, attempt.get("packet_ref"), "worker packet")
+                validate_worker_return_semantics(payload, packet)
+            elif kind == "review":
+                attempt = attempt_by_id(state, attempt_id)
+                packet = stored_payload(p, attempt.get("packet_ref"), "review packet")
+                validate_review_return_semantics(payload, packet)
+    digest = object_store(p, raw)
+    return payload, digest
+
+
+def append_issue(state: dict[str, Any], issue: dict[str, Any], *, source_ref: str | None = None, finding_ref: str | None = None) -> str:
+    issue_id = issue.get("id") if isinstance(issue.get("id"), str) and issue.get("id") else f"issue-{sha256_bytes(canonical_bytes(issue))[:16]}"
+    safe_id(issue_id, "issue_id")
+    if issue_id in {item.get("id") for item in state.get("issues", [])}:
+        issue_id = f"{issue_id}-{len(state.get('issues', [])) + 1}"
+    cause = issue.get("cause", "unknown")
+    if cause not in CAUSES:
+        cause = "unknown"
+    record = {"id": issue_id, "type": issue.get("type", "ingested_issue"), "cause": cause, "impact": issue.get("impact", "blocking"), "affected_refs": issue.get("affected_refs", []), "expected": issue.get("expected"), "actual": issue.get("actual"), "disposition": issue.get("disposition", "requires disposition"), "resolution_condition": issue.get("resolution_condition"), "owner": issue.get("owner"), "failure_signature": issue.get("failure_signature"), "finding_ref": finding_ref, "source_ref": source_ref, "intent_revision": state.get("intent", {}).get("current_revision"), "invalidated_by": []}
+    state.setdefault("issues", []).append(record)
+    return issue_id
+
+
+def append_review_findings(state: dict[str, Any], payload: dict[str, Any], source_ref: str, digest: str) -> list[str]:
+    refs: list[str] = []
+    for index, finding in enumerate(payload.get("findings", [])):
+        finding_id = f"finding-{digest[:12]}-{index + 1}"
+        record = {"id": finding_id, "axis": finding.get("axis", "unknown"), "impact": finding.get("impact", "advisory"), "claim": finding.get("claim", "ingested finding"), "expected": finding.get("expected", ""), "actual": finding.get("actual", ""), "evidence": finding.get("evidence", "return evidence"), "affected_refs": finding.get("affected_refs", []), "source_ref": source_ref, "intent_revision": state.get("intent", {}).get("current_revision"), "repair_contract_ref": None, "invalidated_by": []}
+        if finding_id in {item.get("id") for item in state.get("findings", [])}:
+            refs.append(finding_id)
+            continue
+        state.setdefault("findings", []).append(record)
+        refs.append(finding_id)
+        if record["impact"] == "blocking":
+            append_issue(state, {"type": "review_finding", "cause": "unknown", "impact": "blocking", "affected_refs": record["affected_refs"], "expected": record["expected"], "actual": record["actual"], "disposition": "requires repair or adjudication", "resolution_condition": "finding independently resolved"}, source_ref=source_ref, finding_ref=finding_id)
+    return refs
+
+
+def base_state(control_root: Path, run_id: str, repo_root: Path, token: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION, "run_id": run_id, "revision": 0, "previous_publication_hash": None,
+        "updated_at": now(), "skill_version": SKILL_VERSION, "policy_version": POLICY_VERSION,
+        "repository": {"control_root": str(control_root), "execution_root": str(repo_root), "common_dir": "", "initial_head": None, "branch": "", "checkout": str(repo_root), "inventory_ref": None, "instruction_refs": []},
+        "owner": {"token": token, "epoch": 0, "observed_session": None, "handoff_ref": None, "attestation_ref": None},
+        "run_settings": dict(DEFAULT_RUN_SETTINGS),
+        "usage": default_usage(),
+        "lifecycle": {"phase": "PREFLIGHT", "control": "ACTIVE", "reason": None, "issue_refs": [], "stop_target": None, "next_action": {"kind": "preflight", "subject_refs": [], "preconditions": [], "read_refs": ["phases/start.md"]}},
+    }
+
+
+def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    if not Path(args.repo_root).exists():
+        fail("execution root does not exist")
+    with Lock(p["lock"]):
+        if p["ledger"].exists():
+            fail("run already exists; use status/resume/recover instead of overwrite")
+        runs_root = p["base"] / "runs"
+        if runs_root.exists():
+            for other in sorted(runs_root.iterdir()):
+                other_ledger = other / "ledger.json"
+                if not other_ledger.exists() or other.name == args.run_id:
+                    continue
+                other_state = read_json(other_ledger, "existing run ledger")
+                validate_ledger(other_state)
+                if other_state["lifecycle"]["control"] not in ("ACCEPTED", "FAILED", "CANCELLED"):
+                    fail(f"another nonterminal run owns this repository: {other.name}")
+        p["run"].mkdir(parents=True, exist_ok=False)
+        state = base_state(p["root"], args.run_id, safe_root(args.repo_root, "execution root"), args.owner_token)
+        state["run_settings"] = run_settings_from_args(args.request, args.interaction_mode, args.depth)
+        validate_ledger(state)
+        atomic_write(p["ledger"], canonical_bytes(state))
+        result = copy.deepcopy(state)
+        result["display"] = run_settings_display(state["run_settings"])
+        return result
+
+
+def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    state, raw = load_state(p)
+    if args.brief:
+        lifecycle = state["lifecycle"]
+        usage = copy.deepcopy(state.get("usage", default_usage()))
+        binding = {"revision": state.get("intent", {}).get("current_revision"), "document_ref": state.get("intent", {}).get("document_ref"), "document_hash": state.get("intent", {}).get("document_hash")}
+        settings = resolved_run_settings(state)
+        brief = {"run_id": state["run_id"], "revision": state["revision"], "phase": lifecycle["phase"], "control": lifecycle["control"], "reason": lifecycle.get("reason"), "next_action": lifecycle["next_action"], "run_settings": settings, "preset_display": run_settings_display(settings), "issues": [i["id"] for i in state.get("issues", []) if i.get("impact") == "blocking"], "findings": [f["id"] for f in state.get("findings", [])], "reviews": [{"id": r.get("id"), "subject": r.get("subject_fingerprint"), "verdict": r.get("verdict"), "finding_refs": r.get("finding_refs", [])} for r in state.get("reviews", [])], "adjudications": [d.get("id") for d in state.get("decisions", []) if d.get("type") == "reviewer_adjudication"], "intent": binding, "consumer_invalidation_count": len(state.get("invalidations", [])), "usage": usage, "evidence_count": len(state.get("evidence", [])), "ledger_bytes": len(raw), "ledger_hash": sha256_bytes(raw)}
+        brief["usage"]["counters"]["brief_bytes"] = len(canonical_bytes(brief))
+        return brief
+    settings = resolved_run_settings(state)
+    return {"run_id": state["run_id"], "revision": state["revision"], "phase": state["lifecycle"]["phase"], "control": state["lifecycle"]["control"], "next_action": state["lifecycle"]["next_action"], "run_settings": settings, "preset_display": run_settings_display(settings), "ticket_counts": {s: sum(1 for t in state.get("tickets", []) if t.get("state") == s) for s in ("PLANNED", "READY", "RUNNING", "CANDIDATE", "REVIEW", "INTEGRATED", "BLOCKED", "STALE")}, "attempts": len(state.get("attempts", [])), "ledger_hash": sha256_bytes(raw)}
+
+
+def cmd_publish_usage(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    event_path = Path(args.event_file).expanduser().resolve()
+    event = read_json(event_path, "usage event")
+    root = schema()
+    validate(event, root["$defs"]["usage_event"], root, "$.usage_event")
+    raw = event_path.read_bytes()
+    event_ref = f"objects/{object_store(p, raw)}"
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        usage = state.setdefault("usage", default_usage())
+        usage.setdefault("counters", zero_usage()); usage.setdefault("trace", []); usage.setdefault("shared_setup", zero_usage()); usage.setdefault("gate_costs", {f"G{i}": zero_usage() for i in range(7)})
+        if event["id"] in {item.get("id") for item in usage["trace"]}:
+            fail("usage event ID already published")
+        delta = event["delta"]
+        add_usage(usage["counters"], delta)
+        scope = event.get("scope", "run")
+        if scope == "shared_setup":
+            add_usage(usage["shared_setup"], delta)
+        elif scope.startswith("G"):
+            add_usage(usage["gate_costs"].setdefault(scope, zero_usage()), delta)
+        token_reason = event.get("token_reason")
+        if event.get("tokens") is None:
+            usage["tokens"] = None
+            usage["token_reason"] = token_reason or "token_meter_unavailable"
+            usage["unknown_reason"] = usage["token_reason"]
+        else:
+            usage["tokens"] = event["tokens"]
+            usage["token_reason"] = token_reason
+            usage["unknown_reason"] = None
+        usage["trace"].append({"id": event["id"], "kind": event["kind"], "actor": event["actor"], "subject_ref": event.get("subject_ref"), "delta": delta, "evidence_ref": event_ref, "recorded_at": now()})
+        for item in event.get("evidence", []):
+            evidence_id = item["id"]
+            if evidence_id in {record.get("id") for record in state.get("evidence", [])}:
+                continue
+            state.setdefault("evidence", []).append({"id": evidence_id, "hash": item["hash"], "source": "usage_publication", "scenario": item.get("scenario"), "outcome": item["outcome"], "observer": item["observer"], "subject": event.get("subject_ref")})
+        state["revision"] += 1
+        state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        state["updated_at"] = now()
+        publish(p, state, previous_raw, "usage")
+    return {"published": True, "event_id": event["id"], "event_ref": event_ref, "scope": event.get("scope", "run"), "tokens": state["usage"].get("tokens"), "token_reason": state["usage"].get("token_reason"), "revision": state["revision"]}
+
+
+def cmd_render_view(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    state, raw = load_state(p)
+    source_hash = sha256_bytes(raw)
+    lifecycle = state["lifecycle"]
+    blocking = [item["id"] for item in state.get("issues", []) if item.get("impact") == "blocking"]
+    settings = resolved_run_settings(state)
+    lines = [f"# Autopilot {args.kind}", "", f"- Run: `{state['run_id']}`", f"- Source revision: `{state['revision']}`", f"- Source ledger SHA-256: `{source_hash}`", f"- Phase/control: `{lifecycle['phase']} × {lifecycle['control']}`", f"- {run_settings_display(settings)}", f"- Next action: `{lifecycle['next_action']['kind']}`"]
+    if blocking:
+        lines.extend(["", "## Blocking issues", "", *[f"- `{item}`" for item in blocking]])
+    if args.kind == "final-report":
+        acceptances = state.get("acceptance", [])
+        latest = acceptances[-1] if acceptances else None
+        lines.extend(["", "## Candidate and acceptance", "", f"- Candidate: `{(latest or {}).get('candidate_fingerprint', 'unknown')}`", f"- Intent revision: `{(latest or {}).get('intent_revision', 'unknown')}`", f"- Acceptance transport: `{(latest or {}).get('transport', 'not_recorded')}`", f"- Context grade: `{(latest or {}).get('context_grade', 'not_recorded')}`", "- Exclusions and unverifiable criteria remain blocking unless explicitly amended."])
+    output = p["run"] / "views" / f"{args.kind}.md"
+    atomic_write(output, ("<!-- generated: ledger.py; not authoritative state -->\n\n" + "\n".join(lines) + "\n").encode("utf-8"))
+    return {"generated": str(output), "source_revision": state["revision"], "source_hash": source_hash}
+
+
+def cmd_validate(args: argparse.Namespace) -> dict[str, Any]:
+    target = Path(args.file).expanduser().resolve()
+    value = read_json(target, "contract")
+    root = schema()
+    if args.kind == "ledger":
+        validate_ledger(value)
+    else:
+        defs = root.get("$defs", {})
+        if args.kind not in defs:
+            fail(f"unknown schema definition: {args.kind}")
+        validate(value, defs[args.kind], root, "$")
+        validate_standalone_contract(value, args.kind)
+    return {"valid": True, "kind": args.kind, "sha256": sha256_file(target)}
+
+
+def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
+            fail("terminal run is immutable; start a successor run")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        attempt = attempt_by_id(state, args.attempt_id)
+        payload, digest = ingest_payload(p, state, args.attempt_id, Path(args.return_file), attempt.get("packet_hash"), args.kind)
+        identity = packet_identity(payload)
+        if identity.get("epoch") not in (None, attempt["epoch"]):
+            fail("return epoch mismatch; stale payload remains historical evidence")
+        next_state = copy.deepcopy(state)
+        target = attempt_by_id(next_state, args.attempt_id)
+        target["state"] = "RETURNED"
+        target["return_ref"] = f"objects/{digest}"
+        target["finding_refs"] = append_review_findings(next_state, payload, args.attempt_id, digest)
+        write_set_violations = worker_return_write_set_violations(payload, attempt.get("lease", {})) if args.kind == "worker" else []
+        if write_set_violations:
+            issue_id = append_issue(next_state, {
+                "id": f"write-set-{digest[:12]}",
+                "type": "write_set_violation",
+                "cause": "ownership",
+                "impact": "blocking",
+                "affected_refs": [target.get("subject_ref"), args.attempt_id],
+                "expected": "worker return files remain within the active lease zone and allowed operations",
+                "actual": json.dumps(write_set_violations, sort_keys=True),
+                "disposition": "quarantine lease and reconcile actual checkout ownership before retry",
+                "resolution_condition": "actual write set audited and a fresh scoped attempt is authorized",
+            }, source_ref=args.attempt_id)
+            target["finding_refs"].append(issue_id)
+            target["lease"]["state"] = "quarantined"
+        if payload.get("status") in ("BLOCKED", "FAILED", "HANDOFF") or write_set_violations:
+            for issue in payload.get("issues", []):
+                issue_id = append_issue(next_state, issue, source_ref=args.attempt_id)
+                if issue_id not in target["finding_refs"]:
+                    target["finding_refs"].append(issue_id)
+            ticket = next((item for item in next_state.get("tickets", []) if item.get("id") == target.get("subject_ref")), None)
+            if ticket and ticket.get("state") not in ("CANCELLED", "STALE"):
+                ticket["state"] = "BLOCKED"
+            next_state["lifecycle"]["control"] = "BLOCKED"
+            next_state["lifecycle"]["reason"] = f"{args.kind}_{payload.get('status').lower()}"
+            next_state["lifecycle"]["issue_refs"] = sorted(set(next_state["lifecycle"].get("issue_refs", []) + target["finding_refs"]))
+            next_state["lifecycle"]["next_action"] = {"kind": "triage_or_repair", "subject_refs": [args.attempt_id], "preconditions": ["durable cause/finding contract", "no unchanged retry"], "read_refs": ["phases/execute.md", "references/routing.md"]}
+        if args.kind == "review":
+            review_id = f"REV-{digest[:16]}"
+            if review_id not in {item.get("id") for item in next_state.get("reviews", [])}:
+                review = {"id": review_id, "mandate": stored_payload(p, target.get("packet_ref"), "review packet").get("mandate", "review"), "subject_fingerprint": payload.get("subject_fingerprint", ""), "verdict": payload.get("verdict"), "return_ref": f"objects/{digest}", "context_refs": payload.get("context_refs", []), "finding_refs": target["finding_refs"], "intent_revision": next_state.get("intent", {}).get("current_revision"), "invalidated_by": []}
+                next_state.setdefault("reviews", []).append(review)
+            prior = [item for item in next_state.get("reviews", []) if item.get("subject_fingerprint") == payload.get("subject_fingerprint")]
+            verdicts = {item.get("verdict") for item in prior}
+            if len(verdicts) > 1:
+                disagreement = append_issue(next_state, {"id": f"disagreement-{digest[:12]}", "type": "reviewer_disagreement", "cause": "oracle", "impact": "blocking", "affected_refs": [target.get("subject_ref"), *[item.get("id") for item in prior]], "expected": "reviewers agree or adjudication is recorded", "actual": sorted(str(item) for item in verdicts), "disposition": "adjudication required", "resolution_condition": "durable adjudication decision"}, source_ref=review_id)
+                next_state["lifecycle"]["control"] = "BLOCKED"
+                next_state["lifecycle"]["reason"] = "reviewer_disagreement"
+                next_state["lifecycle"]["issue_refs"] = sorted(set(next_state["lifecycle"].get("issue_refs", []) + [disagreement]))
+                next_state["lifecycle"]["next_action"] = {"kind": "adjudicate_review_disagreement", "subject_refs": [item.get("id") for item in prior], "preconditions": ["read all reviewer findings", "record evidence-backed decision"], "read_refs": ["contracts/reviewer.md", "references/routing.md"]}
+            elif payload.get("verdict") in ("BLOCK", "UNVERIFIABLE"):
+                issue_id = append_issue(next_state, {"id": f"review-{digest[:12]}-block", "type": "review_verdict", "cause": "oracle", "impact": "blocking", "affected_refs": [target.get("subject_ref")], "expected": "PASS", "actual": payload.get("verdict"), "disposition": "repair or adjudication required", "resolution_condition": "new evidence or adjudication"}, source_ref=review_id)
+                next_state["lifecycle"]["control"] = "BLOCKED"
+                next_state["lifecycle"]["reason"] = "review_not_pass"
+                next_state["lifecycle"]["issue_refs"] = sorted(set(next_state["lifecycle"].get("issue_refs", []) + [issue_id]))
+        evidence = next_state.setdefault("evidence", [])
+        if not any(e.get("id") == f"ev-{digest[:16]}" for e in evidence):
+            evidence.append({"id": f"ev-{digest[:16]}", "hash": digest, "source": "validated_return", "scenario": args.kind, "outcome": "RETURNED", "observer": "ledger-helper", "subject": args.attempt_id})
+        add_usage(next_state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"return_bytes": len(canonical_bytes(payload))})
+        next_state["revision"] += 1
+        next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        next_state["updated_at"] = now()
+        publish(p, next_state, previous_raw)
+    return {"ingested": True, "attempt_id": args.attempt_id, "return_ref": f"objects/{digest}", "status": "BLOCKED" if write_set_violations else payload.get("status", payload.get("verdict")), "quarantined": bool(write_set_violations)}
+
+
+def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    packet_path = Path(args.packet).expanduser().resolve()
+    packet = read_json(packet_path, "worker/reviewer packet")
+    identity = packet_identity(packet)
+    if identity.get("ticket_id") != args.ticket_id or identity.get("attempt_id") != args.attempt_id:
+        fail("dispatch packet identity does not match ticket/attempt")
+    if identity.get("run_id") != args.run_id:
+        fail("dispatch packet identity does not match run")
+    packet_raw = packet_path.read_bytes()
+    packet_kind = packet.get("kind")
+    if packet_kind == "worker":
+        root = schema()
+        validate(packet, root["$defs"][f"{packet_kind}_packet"], root, "$.packet")
+        if packet.get("mode") == "repair":
+            repair = packet.get("repair")
+            if not isinstance(repair, dict):
+                fail("repair packet requires a durable repair contract")
+            validate(repair, root["$defs"]["repair_contract"], root, "$.packet.repair")
+    else:
+        fail("dispatch is only for worker packets; reviewer attempts use prepare-review")
+    packet_hash = object_store(p, packet_raw)
+    route = read_json(Path(args.route), "route") if args.route else None
+    if route is not None:
+        root = schema()
+        validate(route, root["$defs"]["route"], root, "$.route")
+        validate_route_eligibility(route)
+        if route.get("id") not in (None, args.route_id):
+            fail("route ID does not match dispatch route-id")
+    def change(state: dict[str, Any]) -> None:
+        ticket = next((t for t in state.get("tickets", []) if t.get("id") == args.ticket_id), None)
+        if ticket is None:
+            fail("dispatch references unknown ticket")
+        if ticket.get("state") != "READY":
+            fail(f"ticket is not READY: {ticket.get('state')}")
+        if route:
+            validate_route_eligibility(route)
+        if identity.get("epoch") != state["owner"]["epoch"]:
+            fail("dispatch packet epoch does not match current owner")
+        if any(a.get("id") == args.attempt_id for a in state.get("attempts", [])):
+            fail("attempt ID already exists")
+        if any(t.get("state") in ("RUNNING", "CANDIDATE", "REVIEW") and t.get("id") != args.ticket_id for t in state.get("tickets", [])):
+            fail("serial V1 product writer already active")
+        binding = current_intent_binding(state) if state.get("intent") else None
+        packet_intent = packet.get("intent_revision") or identity.get("intent_revision")
+        if binding and packet_intent and packet_intent != binding["revision"]:
+            fail("dispatch packet intent revision is stale")
+        if binding and packet.get("intent_document_hash") and packet.get("intent_document_hash") != binding["document_hash"]:
+            fail("dispatch packet intent document hash is stale")
+        repair = packet.get("repair")
+        if packet.get("mode") == "repair" and repair:
+            if repair.get("finding_ref") not in {item.get("id") for item in state.get("findings", [])} and repair.get("finding_ref") not in {item.get("id") for item in state.get("issues", [])}:
+                fail("repair contract references an unknown finding")
+            signature = repair_signature(repair)
+            prior = [attempt for attempt in state.get("attempts", []) if attempt.get("subject_ref") == args.ticket_id and attempt.get("repair_contract")]
+            if any(attempt.get("failure_signature") == signature or repair_signature(attempt["repair_contract"]) == signature for attempt in prior):
+                fail("unchanged repair retry rejected: no causally meaningful change")
+        for dependency in ticket.get("dependency_refs", []):
+            dep = next(t for t in state.get("tickets", []) if t["id"] == dependency)
+            if dep.get("state") != "INTEGRATED":
+                fail(f"dependency is not current INTEGRATED: {dependency}")
+        lease = {"id": args.lease_id, "state": "active", "zone": ticket.get("zone", [])}
+        attempt_record = {"id": args.attempt_id, "kind": packet.get("kind", "worker"), "mode": packet.get("mode", "implement"), "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": lease, "route_ref": args.route_id, "checkout": packet.get("workspace", {}).get("root"), "base_sha": packet.get("workspace", {}).get("expected_base"), "candidate_sha": None, "candidate_tree_sha": None, "return_ref": None, "finding_refs": []}
+        if binding:
+            attempt_record.update({"intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"]})
+        if repair:
+            attempt_record["repair_contract"] = repair
+            attempt_record["failure_signature"] = repair_signature(repair)
+        state.setdefault("attempts", []).append(attempt_record)
+        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": len(packet_raw), "spawn_calls": 1})
+        ticket["state"] = "RUNNING"
+        ticket["current_attempt"] = args.attempt_id
+        if route:
+            route_record = dict(route)
+            route_record.setdefault("id", args.route_id)
+            state.setdefault("routes", []).append(route_record)
+        state["lifecycle"]["next_action"] = {"kind": "await_worker_return", "subject_refs": [args.attempt_id], "preconditions": ["native child started", "return matches packet"], "read_refs": ["contracts/worker.md", "phases/execute.md"]}
+    result = transaction(p, args.owner_token, args.revision, change)
+    return {"prepared": True, "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": result["revision"]}
+
+
+def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    receipt = read_json(Path(args.commit_receipt), "Git candidate receipt")
+    if receipt.get("status") != "PASS" or not GIT_SHA_RE.fullmatch(receipt.get("commit_sha", "")) or not GIT_SHA_RE.fullmatch(receipt.get("tree_sha", "")):
+        fail("candidate requires PASS receipt with commit_sha and tree_sha")
+    def change(state: dict[str, Any]) -> None:
+        attempt = attempt_by_id(state, args.attempt_id)
+        if attempt["state"] != "RETURNED":
+            fail("candidate requires a validated RETURNED worker attempt")
+        if attempt.get("kind") != "worker":
+            fail("candidate requires a worker attempt")
+        if attempt.get("lease", {}).get("state") != "active":
+            fail("candidate requires an active, non-quarantined worker lease")
+        worker_return = stored_payload(p, attempt.get("return_ref"), "worker return")
+        if worker_return.get("status") != "DONE":
+            fail("only a semantically complete worker DONE return may become a candidate; BLOCKED/FAILED/HANDOFF are durable non-candidate outcomes")
+        if receipt.get("base_sha") and attempt.get("base_sha") and receipt["base_sha"] != attempt["base_sha"]:
+            fail("candidate base SHA mismatch")
+        operation = next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None)
+        if operation is None:
+            fail("candidate requires a durable prepared operation; call prepare-effect before the Git effect")
+        if operation.get("kind") != "candidate_commit":
+            fail("candidate requires a prepared candidate_commit operation")
+        if operation.get("state") != "prepared":
+            fail("candidate operation is not in prepared state")
+        if operation.get("intended_after") not in (None, receipt["commit_sha"]):
+            fail("candidate receipt does not match prepared operation")
+        attempt["candidate_sha"] = receipt["commit_sha"]
+        attempt["candidate_tree_sha"] = receipt["tree_sha"]
+        attempt["state"] = "RETURNED"
+        ticket = next((t for t in state.get("tickets", []) if t.get("id") == attempt.get("subject_ref")), None)
+        if ticket:
+            ticket["state"] = "CANDIDATE"
+        operation["state"] = "applied"
+        operation["target"] = receipt.get("checkout", operation.get("target", ""))
+        operation["expected_before"] = receipt.get("base_sha", operation.get("expected_before"))
+        operation["intended_after"] = receipt["commit_sha"]
+        operation["authority_ref"] = receipt.get("authority_ref", operation.get("authority_ref"))
+        operation["receipt_ref"] = receipt.get("receipt_ref") or f"external:{args.operation_id}"
+        state["lifecycle"]["next_action"] = {"kind": "review_change", "subject_refs": [args.attempt_id], "preconditions": ["candidate SHA frozen", "integrity baseline recorded"], "read_refs": ["contracts/reviewer.md", "references/safety.md"]}
+    result = transaction(p, args.owner_token, args.revision, change)
+    return {"candidate": receipt["commit_sha"], "revision": result["revision"], "next_action": result["lifecycle"]["next_action"]}
+
+
+def cmd_prepare_effect(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    def change(state: dict[str, Any]) -> None:
+        safe_id(args.operation_id, "operation_id")
+        if any(item.get("id") == args.operation_id for item in state.get("operations", [])):
+            fail("operation ID already exists")
+        state.setdefault("operations", []).append({"id": args.operation_id, "kind": args.kind, "target": args.target, "state": "prepared", "expected_before": args.expected_before, "intended_after": args.intended_after, "authority_ref": args.authority_ref, "receipt_ref": None})
+        state["lifecycle"]["next_action"] = {"kind": "apply_prepared_effect", "subject_refs": [args.operation_id], "preconditions": ["native approved effect", "same target and expected-before", "receipt or reconciliation evidence"], "read_refs": ["references/ledger.md", "references/safety.md"]}
+    result = transaction(p, args.owner_token, args.revision, change, "effect-prepared")
+    return {"prepared": True, "operation_id": args.operation_id, "revision": result["revision"], "state": "prepared"}
+
+
+def cmd_reconcile_effect(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    receipt = None
+    receipt_ref = None
+    if args.receipt:
+        receipt_path = Path(args.receipt).expanduser().resolve()
+        receipt = read_json(receipt_path, "effect receipt")
+        receipt_ref = f"objects/{object_store(p, receipt_path.read_bytes())}"
+    def change(state: dict[str, Any]) -> None:
+        operation = next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None)
+        if operation is None:
+            fail("unknown operation")
+        if operation.get("state") != "prepared":
+            fail("only a prepared operation can be reconciled")
+        if receipt:
+            if receipt.get("operation_id") not in (None, args.operation_id):
+                fail("effect receipt operation mismatch")
+            if receipt.get("target") not in (None, operation.get("target")):
+                fail("effect receipt target mismatch")
+            if operation.get("expected_before") and receipt.get("base_sha") not in (None, operation.get("expected_before")):
+                fail("effect receipt expected-before mismatch")
+            commit_sha = receipt.get("commit_sha")
+            if commit_sha:
+                if not GIT_SHA_RE.fullmatch(commit_sha):
+                    fail("effect receipt has invalid commit SHA")
+                target = Path(operation.get("target", ""))
+                regular_directory(target, "effect target")
+                try:
+                    actual_head = subprocess.run(["git", "-C", str(target), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+                    actual_tree = subprocess.run(["git", "-C", str(target), "rev-parse", "HEAD^{tree}"], check=True, capture_output=True, text=True).stdout.strip()
+                except (OSError, subprocess.CalledProcessError) as exc:
+                    fail(f"effect reconciliation cannot inspect Git target: {exc}")
+                if actual_head != commit_sha or (receipt.get("tree_sha") and actual_tree != receipt.get("tree_sha")):
+                    fail("effect receipt does not match actual Git target")
+        if args.result == "applied":
+            if not receipt:
+                fail("applied reconciliation requires an exact effect receipt")
+            operation["state"] = "applied"
+            operation["receipt_ref"] = receipt_ref
+            state["lifecycle"]["next_action"] = {"kind": "resume_after_effect_reconciliation", "subject_refs": [args.operation_id], "preconditions": ["re-read current ledger", "verify resulting subject"], "read_refs": ["phases/recover.md", "references/ledger.md"]}
+        elif args.result == "uncertain":
+            operation["state"] = "uncertain"
+            operation["receipt_ref"] = receipt_ref
+            state["lifecycle"]["control"] = "BLOCKED"
+            state["lifecycle"]["reason"] = "uncertain_effect_requires_authority_resolution"
+            state["lifecycle"]["next_action"] = {"kind": "reconcile_uncertain_effect", "subject_refs": [args.operation_id], "preconditions": ["inspect actual target", "do not repeat effect"], "read_refs": ["phases/recover.md", "references/safety.md"]}
+        else:
+            operation["state"] = "abandoned"
+            operation["receipt_ref"] = receipt_ref
+            state["lifecycle"]["next_action"] = {"kind": "decide_effect_retry", "subject_refs": [args.operation_id], "preconditions": ["same operation ID", "fresh authority and expected-before check"], "read_refs": ["references/safety.md"]}
+    result = transaction(p, args.owner_token, args.revision, change, "effect-reconciled")
+    return {"reconciled": True, "operation_id": args.operation_id, "state": next(item for item in result.get("operations", []) if item.get("id") == args.operation_id)["state"], "revision": result["revision"]}
+
+
+def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    packet_path = Path(args.packet).expanduser().resolve()
+    packet = read_json(packet_path, "review packet")
+    root = schema()
+    validate(packet, root["$defs"]["review_packet"], root, "$.packet")
+    identity = packet_identity(packet)
+    if identity.get("run_id") not in (None, args.run_id) or identity.get("attempt_id") != args.review_attempt_id:
+        fail("review packet identity does not match review attempt")
+    packet_hash = object_store(p, packet_path.read_bytes())
+    def change(state: dict[str, Any]) -> None:
+        ticket = next((t for t in state.get("tickets", []) if t.get("id") == args.ticket_id), None)
+        if ticket is None or ticket.get("state") not in ("CANDIDATE", "REVIEW"):
+            fail("review preparation requires a CANDIDATE or REVIEW ticket")
+        worker = next((a for a in state.get("attempts", []) if a.get("id") == ticket.get("current_attempt") and a.get("kind") == "worker"), None)
+        if worker is None or not worker.get("candidate_sha"):
+            fail("review preparation requires a frozen worker candidate")
+        if packet.get("subject_fingerprint") != worker.get("candidate_sha"):
+            fail("review packet subject is not the current candidate")
+        binding = current_intent_binding(state) if state.get("intent") else None
+        packet_intent = identity.get("intent_revision")
+        if binding and packet_intent and packet_intent != binding["revision"]:
+            fail("review packet intent revision is stale")
+        if binding and identity.get("intent_document_hash") and identity.get("intent_document_hash") != binding["document_hash"]:
+            fail("review packet intent document hash is stale")
+        if any(a.get("id") == args.review_attempt_id for a in state.get("attempts", [])):
+            fail("review attempt ID already exists")
+        attempt_record = {"id": args.review_attempt_id, "kind": "review", "mode": "change", "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": {"id": args.lease_id, "state": "active", "zone": []}, "route_ref": None, "checkout": None, "base_sha": worker.get("candidate_sha"), "candidate_sha": worker.get("candidate_sha"), "candidate_tree_sha": worker.get("candidate_tree_sha"), "return_ref": None, "finding_refs": []}
+        if binding:
+            attempt_record.update({"intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"]})
+        state.setdefault("attempts", []).append(attempt_record)
+        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": packet_path.stat().st_size, "spawn_calls": 1})
+        ticket["state"] = "REVIEW"
+        state["lifecycle"]["next_action"] = {"kind": "await_review_return", "subject_refs": [args.review_attempt_id], "preconditions": ["reviewer stopped", "integrity baseline unchanged", "strict packet/subject match"], "read_refs": ["contracts/reviewer.md", "phases/execute.md"]}
+    result = transaction(p, args.owner_token, args.revision, change)
+    return {"prepared": True, "attempt_id": args.review_attempt_id, "packet_hash": packet_hash, "revision": result["revision"]}
+
+
+def cmd_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    decision = read_json(Path(args.decision_file).expanduser().resolve(), "adjudication decision")
+    root = schema()
+    validate(decision, root["$defs"]["decision"], root, "$.decision")
+    if decision.get("type") != "reviewer_adjudication":
+        fail("adjudication decision type must be reviewer_adjudication")
+    if decision.get("decision") not in ("PASS", "BLOCK", "UNVERIFIABLE"):
+        fail("adjudication decision must be PASS, BLOCK, or UNVERIFIABLE")
+    if not decision.get("reason") or not decision.get("evidence_refs"):
+        fail("adjudication requires a reason and evidence references")
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        if decision["id"] in {item.get("id") for item in state.get("decisions", [])}:
+            fail("decision ID already exists")
+        review_ids = set(decision.get("supersedes", []))
+        reviews = [item for item in state.get("reviews", []) if item.get("id") in review_ids]
+        if review_ids and len(reviews) != len(review_ids):
+            fail("adjudication supersedes an unknown review")
+        if not reviews:
+            issue_refs = set(state.get("lifecycle", {}).get("issue_refs", []))
+            if not any(item.get("type") == "reviewer_disagreement" and item.get("id") in issue_refs for item in state.get("issues", [])):
+                fail("adjudication must name conflicting reviews in supersedes")
+        binding = current_intent_binding(state) if state.get("intent") else None
+        record = dict(decision)
+        record["introduced_revision"] = str(state["revision"] + 1)
+        record["intent_revision"] = binding["revision"] if binding else None
+        state.setdefault("decisions", []).append(record)
+        for issue in state.get("issues", []):
+            if issue.get("type") == "reviewer_disagreement" and (not review_ids or set(issue.get("affected_refs", [])) & review_ids):
+                issue["decision_ref"] = decision["id"]
+                issue["disposition"] = "resolved by adjudication" if decision["decision"] == "PASS" else "adjudicated BLOCK"
+        if decision["decision"] == "PASS":
+            state["lifecycle"]["control"] = "ACTIVE"
+            state["lifecycle"]["reason"] = "reviewer_disagreement_adjudicated"
+            state["lifecycle"]["next_action"] = {"kind": "continue_after_adjudication", "subject_refs": sorted(review_ids), "preconditions": ["re-read adjudication evidence", "candidate remains unchanged"], "read_refs": ["contracts/reviewer.md", "references/routing.md"]}
+        else:
+            state["lifecycle"]["control"] = "BLOCKED"
+            state["lifecycle"]["reason"] = "reviewer_disagreement_adjudicated_not_pass"
+            state["lifecycle"]["next_action"] = {"kind": "repair_or_user_decision", "subject_refs": sorted(review_ids), "preconditions": ["durable repair contract or new intent authority"], "read_refs": ["phases/execute.md", "phases/intent.md", "references/routing.md"]}
+        state["lifecycle"]["issue_refs"] = [ref for ref in state["lifecycle"].get("issue_refs", []) if not any(item.get("id") == ref and item.get("type") == "reviewer_disagreement" and decision["decision"] == "PASS" for item in state.get("issues", []))]
+        state["revision"] += 1
+        state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        state["updated_at"] = now()
+        publish(p, state, previous_raw, "adjudication")
+    return {"adjudicated": True, "decision_id": decision["id"], "decision": decision["decision"], "revision": state["revision"]}
+
+
+def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    integrity = read_json(Path(args.integrity_receipt), "integrity receipt")
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        attempt = attempt_by_id(state, args.attempt_id)
+        if attempt.get("kind") != "review" or attempt.get("mode") == "user_assisted":
+            fail("integration requires a separate immutable reviewer attempt")
+        existing_review = next((item for item in state.get("reviews", []) if item.get("id") == args.review_id), None)
+        if existing_review is not None:
+            ticket = next((t for t in state.get("tickets", []) if t.get("id") == attempt.get("subject_ref")), None)
+            worker = next((item for item in state.get("attempts", []) if item.get("id") == (ticket or {}).get("current_attempt") and item.get("kind") == "worker"), None)
+            if existing_review.get("verdict") != "PASS" or existing_review.get("subject_fingerprint") != attempt.get("candidate_sha"):
+                fail("existing integration review does not match this candidate")
+            if ticket is None or ticket.get("state") != "INTEGRATED" or worker is None or worker.get("candidate_sha") != attempt.get("candidate_sha"):
+                fail("existing integration state does not match this candidate")
+            if attempt.get("lease", {}).get("state") not in ("active", "released") or worker.get("lease", {}).get("state") not in ("active", "released"):
+                fail("existing integration has a non-releasable lease state")
+            if attempt.get("lease", {}).get("state") == "released" and worker.get("lease", {}).get("state") == "released":
+                return {"integrated": True, "idempotent": True, "revision": state["revision"]}
+            next_state = copy.deepcopy(state)
+            next_attempt = attempt_by_id(next_state, args.attempt_id)
+            next_worker = attempt_by_id(next_state, worker["id"])
+            next_attempt["lease"]["state"] = "released"
+            next_worker["lease"]["state"] = "released"
+            next_state["revision"] += 1
+            next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+            next_state["updated_at"] = now()
+            publish(p, next_state, previous_raw)
+            return {"integrated": True, "idempotent": True, "reconciled": True, "revision": next_state["revision"]}
+        if attempt.get("state") not in ("PREPARED", "RETURNED"):
+            fail("review attempt is not active")
+        packet = stored_payload(p, attempt.get("packet_ref"), "review packet")
+        review, digest = ingest_payload(p, state, args.attempt_id, Path(args.review_file), attempt.get("packet_hash"), "review")
+        if review.get("verdict") != "PASS":
+            fail("integration requires reviewer PASS; BLOCK/UNVERIFIABLE remains outside integration")
+        if integrity.get("status") != "PASS" or integrity.get("candidate_fingerprint") not in (None, attempt.get("candidate_sha")):
+            fail("independent integrity barrier did not PASS for candidate")
+        if integrity.get("ledger_hash") not in (None, sha256_file(p["ledger"])):
+            fail("authoritative ledger changed before review ingest")
+        subject = review.get("subject_fingerprint")
+        if subject != attempt.get("candidate_sha"):
+            fail("review subject is not this candidate")
+        if packet.get("subject_fingerprint") != attempt.get("candidate_sha"):
+            fail("review packet subject is not this candidate")
+        if not packet.get("mandate"):
+            fail("review packet lacks an explicit mandate")
+        if args.review_id in {item.get("id") for item in state.get("reviews", [])}:
+            fail("review ID already exists")
+        next_state = copy.deepcopy(state)
+        next_attempt = attempt_by_id(next_state, args.attempt_id)
+        next_attempt["return_ref"] = f"objects/{digest}"
+        next_attempt["finding_refs"] = append_review_findings(next_state, review, args.attempt_id, digest)
+        next_attempt["lease"]["state"] = "released"
+        next_attempt["state"] = "RETURNED"
+        ticket = next((t for t in next_state.get("tickets", []) if t.get("id") == next_attempt.get("subject_ref")), None)
+        if ticket:
+            worker = next((item for item in next_state.get("attempts", []) if item.get("id") == ticket.get("current_attempt") and item.get("kind") == "worker"), None)
+            if worker is None or worker.get("candidate_sha") != next_attempt.get("candidate_sha"):
+                fail("integration requires the linked worker candidate")
+            if worker.get("lease", {}).get("state") not in ("active", "released"):
+                fail("linked worker lease is not releasable")
+            worker["lease"]["state"] = "released"
+            ticket["state"] = "INTEGRATED"
+        review_id = args.review_id
+        next_state.setdefault("reviews", []).append({"id": review_id, "mandate": packet.get("mandate", "change"), "subject_fingerprint": subject, "verdict": "PASS", "return_ref": f"objects/{digest}", "context_refs": review.get("context_refs", []), "finding_refs": next_attempt["finding_refs"], "intent_revision": next_state.get("intent", {}).get("current_revision"), "invalidated_by": []})
+        next_state["revision"] += 1
+        next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        next_state["updated_at"] = now()
+        publish(p, next_state, previous_raw)
+    return {"integrated": True, "attempt_id": args.attempt_id, "review_ref": f"objects/{digest}", "revision": next_state["revision"]}
+
+
+def cmd_audit(args: argparse.Namespace) -> dict[str, Any]:
+    root = safe_root(args.root, "audit root")
+    regular_directory(root, "audit root")
+    baseline = read_json(Path(args.baseline), "baseline manifest")
+    declared = read_json(Path(args.declared), "declared write set")
+    zones = read_json(Path(args.zone), "lease zone")
+
+    def git_paths(*command: str) -> list[str]:
+        try:
+            proc = subprocess.run(["git", "-C", str(root), *command], check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            fail(f"write audit cannot inspect Git root: {exc}")
+        return [item for item in proc.stdout.decode("utf-8", "surrogateescape").split("\0") if item]
+
+    def status_paths() -> tuple[set[str], set[str]]:
+        tokens = git_paths("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        found: set[str] = set()
+        renamed: set[str] = set()
+        index = 0
+        while index < len(tokens):
+            record = tokens[index]
+            value = record[3:] if len(record) >= 3 else record
+            if value:
+                found.add(value)
+            if len(record) >= 2 and record[:2] in ("R ", " R", "RR", "C ", " C", "CC") and index + 1 < len(tokens):
+                renamed.add(tokens[index + 1])
+                found.add(tokens[index + 1])
+                index += 1
+            index += 1
+        return found, renamed
+
+    baseline_entries = baseline.get("files", baseline.get("paths", []))
+    baseline_map: dict[str, dict[str, Any] | None] = {}
+    for item in baseline_entries:
+        if isinstance(item, dict):
+            baseline_map[relative_path(item.get("path"), "baseline path")] = item
+        else:
+            baseline_map[relative_path(item, "baseline path")] = None
+    declared_paths = {relative_path(item.get("path"), "declared path") if isinstance(item, dict) else relative_path(item, "declared path") for item in declared}
+    zone_paths = [relative_path(item.get("path"), "zone path") for item in zones]
+
+    tracked = set(git_paths("ls-files", "-z"))
+    status, renamed = status_paths()
+    ignored = set(git_paths("ls-files", "--others", "--ignored", "--exclude-standard", "-z"))
+    actual: set[str] = tracked | status | ignored
+
+    def fingerprint(rel: str) -> dict[str, Any] | None:
+        path = root / rel
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISLNK(info.st_mode):
+            target = os.readlink(path)
+            resolved = (path.parent / target).resolve(strict=False)
+            return {"path": rel, "type": "symlink", "mode": mode, "target": target, "target_inside_root": under(resolved, root)}
+        if stat.S_ISREG(info.st_mode):
+            return {"path": rel, "type": "file", "mode": mode, "sha256": sha256_file(path)}
+        if stat.S_ISDIR(info.st_mode):
+            return {"path": rel, "type": "directory", "mode": mode}
+        return {"path": rel, "type": "other", "mode": mode}
+
+    fingerprints = {rel: fingerprint(rel) for rel in actual | set(baseline_map)}
+    changed: set[str] = set()
+    foreign_changes: set[str] = set()
+    for rel, current in fingerprints.items():
+        baseline_item = baseline_map.get(rel, "__missing__")
+        if baseline_item == "__missing__":
+            if current is not None:
+                changed.add(rel)
+            continue
+        if current is None:
+            changed.add(rel)
+            if baseline_item is not None:
+                foreign_changes.add(rel)
+            continue
+        if isinstance(baseline_item, dict):
+            comparable = {key: current.get(key) for key in ("type", "mode", "sha256", "target", "target_inside_root") if key in baseline_item}
+            if any(current.get(key) != value for key, value in comparable.items()):
+                changed.add(rel)
+                if rel not in declared_paths:
+                    foreign_changes.add(rel)
+    changed.update(renamed)
+    unsafe_paths: list[dict[str, Any]] = []
+    for rel, item in fingerprints.items():
+        if not item:
+            continue
+        if item.get("type") == "symlink" and not item.get("target_inside_root"):
+            unsafe_paths.append({"path": rel, "reason": "symlink target escapes audit root"})
+        if item.get("type") == "other":
+            unsafe_paths.append({"path": rel, "reason": "unsupported file type"})
+    changed_paths = sorted(changed)
+    undeclared = sorted(set(changed_paths) - declared_paths)
+    try:
+        root_real = root.resolve()
+    except OSError as exc:
+        fail(f"write audit cannot resolve root: {exc}")
+    def allowed(path: str) -> bool:
+        clean = path.rstrip("/")
+        return any(clean == zone or clean.startswith(zone.rstrip("/") + "/") for zone in zone_paths)
+    outside = sorted(path for path in changed_paths if not allowed(path))
+    return {"root": str(root_real), "actual_paths": sorted(actual), "changed_paths": changed_paths, "undeclared_paths": undeclared, "outside_zone": outside, "rename_endpoints": sorted(renamed), "foreign_changes": sorted(foreign_changes), "unsafe_paths": unsafe_paths, "fingerprints": fingerprints, "pass": not undeclared and not outside and not foreign_changes and not unsafe_paths}
+
+
+def check_integrity(baseline: dict[str, Any], state: dict[str, Any], current_raw: bytes, expected_subject: str | None = None) -> None:
+    if baseline.get("status") != "PASS":
+        fail("integrity barrier is not PASS")
+    if not baseline.get("ledger_hash"):
+        fail("integrity barrier lacks the frozen ledger hash")
+    if baseline["ledger_hash"] != sha256_bytes(current_raw):
+        fail("authoritative ledger changed during review")
+    if expected_subject and baseline.get("candidate_fingerprint") != expected_subject:
+        fail("integrity candidate fingerprint mismatch")
+    if baseline.get("candidate_sha") and not GIT_SHA_RE.fullmatch(baseline["candidate_sha"]):
+        fail("invalid baseline candidate SHA")
+
+
+def validate_manual_receipt(receipt: dict[str, Any], label: str) -> None:
+    if receipt.get("status") != "PASS":
+        fail(f"{label} is not PASS")
+    if not receipt.get("receipt_id"):
+        fail(f"{label} lacks receipt_id")
+    if not receipt.get("inventory_hashes") and label == "environment receipt":
+        fail("environment receipt lacks exported input inventory hashes")
+    if label == "environment receipt" and not receipt.get("boundary_probes"):
+        fail("environment receipt lacks nonsecret boundary probes")
+    if label == "environment receipt" and receipt.get("authoritative_absent") is not True:
+        fail("environment receipt does not attest scoped authoritative absence")
+    if label == "environment receipt" and not isinstance(receipt.get("topology"), dict):
+        fail("environment receipt lacks observable topology")
+    if label == "context receipt" and receipt.get("grade") != "MANUAL_ATTESTED_CLEAN":
+        fail("manual context receipt must be MANUAL_ATTESTED_CLEAN")
+    if label == "context receipt" and receipt.get("clean_input") is not True:
+        fail("context receipt lacks clean-input attestation")
+    if label == "context receipt" and receipt.get("contamination_absent") is not True:
+        fail("context receipt lacks contamination attestation")
+
+
+def verify_manual_inventory(receipt: dict[str, Any], handoff: dict[str, Any]) -> None:
+    bundle = Path(handoff.get("bundle_root", ""))
+    regular_directory(bundle, "handoff bundle")
+    manifest = read_json(bundle / "manifest.json", "handoff manifest")
+    manifest_files = {item.get("path"): item.get("sha256") for item in manifest.get("files", [])}
+    expected_manifest = handoff.get("manifest_ref", "").removeprefix("sha256:")
+    manifest_path = bundle / "manifest.json"
+    if expected_manifest and sha256_file(manifest_path) != expected_manifest:
+        fail("handoff manifest has drifted")
+    for item in receipt.get("inventory_hashes", []):
+        rel = relative_path(item.get("path"), "receipt inventory path")
+        expected = item.get("sha256")
+        if rel.startswith("g5-bundle/"):
+            actual_path = bundle / rel.removeprefix("g5-bundle/")
+            regular_non_symlink(actual_path)
+            if sha256_file(actual_path) != expected:
+                fail(f"environment inventory hash mismatch: {rel}")
+        elif rel.startswith("candidate-export/"):
+            export_rel = rel.removeprefix("candidate-export/")
+            if manifest_files.get(export_rel) != expected:
+                fail(f"candidate export inventory does not match manifest: {rel}")
+        else:
+            fail(f"environment inventory path is outside prepared bundle: {rel}")
+
+
+def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    packet_path = Path(args.packet).expanduser().resolve()
+    projection_path = Path(args.projection).expanduser().resolve()
+    packet = read_json(packet_path, "review packet")
+    projection = read_json(projection_path, "acceptance projection")
+    if not isinstance(packet, dict) or packet.get("kind") not in ("review", "acceptance"):
+        fail("handoff packet kind must be review or acceptance")
+    root = schema()
+    validate(packet, root["$defs"]["acceptance_packet" if packet.get("kind") == "acceptance" else "review_packet"], root, "$.packet")
+    if projection.get("kind") != "acceptance_projection":
+        fail("handoff projection kind must be acceptance_projection")
+    validate(projection, schema()["$defs"]["acceptance_projection"], schema(), "$.projection")
+    criteria = projection.get("criteria", [])
+    criterion_ids = [item.get("id") for item in criteria]
+    if not criteria or len(criterion_ids) != len(set(criterion_ids)) or any(not safe_id(str(i), "criterion_id") for i in criterion_ids):
+        fail("projection must contain each active criterion exactly once")
+    forbidden = {"worker_returns", "review_log", "repair_narrative", "commit_history", "self_rating", "tests_pass_summary", "credentials"}
+    leaked = forbidden.intersection(projection)
+    if leaked:
+        fail(f"projection leaks forbidden history/self-rating fields: {sorted(leaked)}")
+    with Lock(p["lock"]):
+        state, _ = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        binding = current_intent_binding(state)
+        if projection.get("intent_revision") != binding["revision"]:
+            fail("acceptance projection is not the current intent revision")
+        projection_ref = projection.get("intent_document_ref")
+        projection_hash = projection.get("intent_document_hash")
+        if projection_ref is not None and projection_ref != binding["document_ref"]:
+            fail("acceptance projection intent document ref is stale")
+        if projection_hash is not None and projection_hash != binding["document_hash"]:
+            fail("acceptance projection intent document hash is stale")
+        packet_identity_value = packet_identity(packet)
+        if packet_identity_value.get("intent_revision") not in (None, binding["revision"]):
+            fail("handoff packet intent revision is stale")
+        if packet_identity_value.get("intent_document_ref") not in (None, binding["document_ref"]):
+            fail("handoff packet intent document ref is stale")
+        if packet_identity_value.get("intent_document_hash") not in (None, binding["document_hash"]):
+            fail("handoff packet intent document hash is stale")
+        active_criteria = {item["id"] for item in state.get("criteria", []) if item.get("status") == "active"}
+        if set(criterion_ids) != active_criteria:
+            fail("acceptance projection criteria do not match current active criteria")
+        document = next((item for item in state.get("documents", []) if item.get("id") == binding["document_ref"]), None)
+        if document is None:
+            fail("current intent document is missing")
+        document_path = Path(document["path"])
+        if not document_path.exists() or sha256_file(document_path) != document.get("hash") or document.get("hash") != binding["document_hash"]:
+            fail("current intent document hash does not match the ledger")
+        candidate_attempt = next((item for item in state.get("attempts", []) if item.get("id") == args.attempt_id), None)
+        if candidate_attempt is None or not candidate_attempt.get("candidate_sha"):
+            fail("handoff requires a frozen candidate")
+        if projection.get("candidate_fingerprint") != candidate_attempt.get("candidate_sha"):
+            fail("handoff projection candidate does not match the frozen candidate")
+        if packet.get("subject_fingerprint") not in (None, candidate_attempt.get("candidate_sha")):
+            fail("handoff packet subject is not the frozen candidate")
+    export = safe_root(args.export_root, "export root")
+    bundle = safe_root(args.bundle_root, "bundle root")
+    if under(bundle, export) or under(export, bundle):
+        fail("bundle and export roots may not contain one another")
+    regular_directory(export, "export root")
+    if bundle.exists() and (bundle.is_symlink() or not bundle.is_dir()):
+        fail("bundle root is not a regular directory")
+    if not export.is_dir():
+        fail("export root does not exist")
+    bundle.mkdir(parents=True, exist_ok=True)
+    packet_hash = object_store(p, packet_path.read_bytes())
+    manifest: list[dict[str, Any]] = []
+    for path in sorted(export.rglob("*")):
+        rel = path.relative_to(export)
+        if any(part in {".git", ".autopilot", ".codex", ".agents", ".claude"} for part in rel.parts):
+            continue
+        if path.is_symlink():
+            fail(f"export contains symlink: {rel}")
+        if not path.is_file() or not stat.S_ISREG(path.stat().st_mode):
+            fail(f"export contains unsupported file type: {rel}")
+        if path.is_file():
+            data = path.read_bytes()
+            manifest.append({"path": rel.as_posix(), "sha256": sha256_bytes(data), "bytes": len(data), "mode": stat.S_IMODE(path.stat().st_mode)})
+    manifest_bytes = canonical_bytes({"candidate_fingerprint": projection.get("candidate_fingerprint"), "files": manifest})
+    atomic_write(bundle / "manifest.json", manifest_bytes)
+    atomic_write(bundle / "packet.json", canonical_bytes(packet))
+    atomic_write(bundle / "projection.json", canonical_bytes(projection))
+    checklist = "# Operator checklist\n\nTransfer only this bundle. Start a new clean reviewer session; do not fork/resume author context. Record the packet/export hashes and environment/context receipts before running checks. Return exact structured JSON.\n"
+    atomic_write(bundle / "operator-checklist.md", checklist.encode())
+    manifest_hash = sha256_bytes(manifest_bytes)
+    def change(state: dict[str, Any]) -> None:
+        attempt = attempt_by_id(state, args.attempt_id)
+        if attempt["epoch"] != state["owner"]["epoch"]:
+            fail("handoff attempt is stale")
+        if attempt.get("kind") not in ("review", "acceptance"):
+            fail("handoff requires a separate reviewer/acceptance attempt")
+        attempt["state"] = "PREPARED"
+        attempt["kind"] = "review"
+        attempt["mode"] = "user_assisted"
+        attempt["packet_ref"] = f"objects/{packet_hash}"
+        attempt["packet_hash"] = packet_hash
+        attempt["handoff"] = {"bundle_root": str(bundle), "manifest_ref": f"sha256:{manifest_hash}", "candidate_fingerprint": projection.get("candidate_fingerprint"), "intent_revision": projection.get("intent_revision"), "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"], "transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN"}
+        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"manual_handoffs": 1, "manual_setup": 1, "user_interventions": 1})
+        state["lifecycle"]["control"] = "BLOCKED"
+        state["lifecycle"]["reason"] = "manual_review_pending"
+        state["lifecycle"]["next_action"] = {"kind": "import_manual_review", "subject_refs": [args.attempt_id], "preconditions": ["environment receipt", "context receipt", "exact structured return", "integrity barrier"], "read_refs": ["phases/accept.md", "references/safety.md"]}
+    result = transaction(p, args.owner_token, args.revision, change)
+    return {"prepared": True, "bundle_root": str(bundle), "manifest_sha256": manifest_hash, "revision": result["revision"], "transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN"}
+
+
+def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    env = read_json(Path(args.environment_receipt), "environment receipt")
+    context = read_json(Path(args.context_receipt), "context receipt")
+    validate_manual_receipt(env, "environment receipt")
+    validate_manual_receipt(context, "context receipt")
+    return_path = Path(args.return_file).expanduser().resolve()
+    baseline_path = Path(args.integrity_receipt).expanduser().resolve()
+    baseline = read_json(baseline_path, "integrity receipt")
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        attempt = attempt_by_id(state, args.attempt_id)
+        if attempt.get("mode") != "user_assisted":
+            fail("manual import requires a user-assisted prepared attempt")
+        if attempt.get("kind") != "review":
+            fail("manual import requires a separate reviewer attempt")
+        binding = current_intent_binding(state)
+        if args.intent_revision != binding["revision"]:
+            fail("manual import intent revision is not current")
+        packet = stored_payload(p, attempt.get("packet_ref"), "acceptance packet")
+        root = schema()
+        validate(packet, root["$defs"]["acceptance_packet"], root, "$.acceptance_packet")
+        if context.get("packet_hash") != attempt.get("packet_hash"):
+            fail("context receipt packet hash does not match prepared handoff")
+        expected_manifest = (attempt.get("handoff") or {}).get("manifest_ref")
+        if expected_manifest and context.get("export_hash") != expected_manifest.removeprefix("sha256:"):
+            fail("context receipt export hash does not match prepared handoff")
+        verify_manual_inventory(env, attempt.get("handoff") or {})
+        payload, digest = ingest_payload(p, state, args.attempt_id, return_path, attempt.get("packet_hash"), "acceptance")
+        identity = packet_identity(payload)
+        if identity.get("intent_revision") != args.intent_revision:
+            fail("manual return intent revision mismatch")
+        if identity.get("intent_document_ref") not in (None, binding["document_ref"]):
+            fail("manual return intent document ref mismatch")
+        if identity.get("intent_document_hash") not in (None, binding["document_hash"]):
+            fail("manual return intent document hash mismatch")
+        if identity.get("epoch") not in (None, attempt.get("epoch")):
+            fail("manual return epoch mismatch")
+        candidate = args.candidate_fingerprint
+        if payload.get("candidate_fingerprint") != candidate:
+            fail("manual return candidate fingerprint mismatch")
+        if packet.get("subject_fingerprint") != candidate:
+            fail("manual acceptance packet subject is not the current candidate")
+        if payload.get("verdict") not in ("PASS", "BLOCK", "UNVERIFIABLE"):
+            fail("manual return has invalid verdict")
+        packet_required = [review_criterion_id(item) for item in packet.get("criteria", [])]
+        required = [x for x in args.required_criteria.split(",") if x]
+        if required != packet_required and set(required) != set(packet_required):
+            fail("required criteria argument does not match the prepared acceptance packet")
+        required = packet_required
+        check_integrity(baseline, state, p["ledger"].read_bytes(), candidate)
+        validate_acceptance_return_semantics(payload, required)
+        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"return_bytes": len(canonical_bytes(payload)), "manual_wait": 1})
+        existing_ref = f"objects/{digest}"
+        if any(item.get("return_ref") == existing_ref for item in state.get("acceptance", [])):
+            if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
+                return {"imported": True, "idempotent": True, "terminal": True, "verdict": payload.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False, "revision": state["revision"]}
+            if payload.get("verdict") == "PASS":
+                next_state = copy.deepcopy(state)
+                next_attempt = attempt_by_id(next_state, args.attempt_id)
+                next_attempt["lease"]["state"] = "released"
+                ticket = next((t for t in next_state.get("tickets", []) if t.get("id") == next_attempt.get("subject_ref")), None)
+                if ticket and ticket.get("state") == "REVIEW":
+                    ticket["state"] = "INTEGRATED"
+                next_state["revision"] += 1
+                next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+                next_state["updated_at"] = now()
+                publish(p, next_state, previous_raw)
+                return {"imported": True, "idempotent": True, "reconciled": True, "verdict": payload.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False, "revision": next_state["revision"]}
+            return {"imported": True, "idempotent": True, "verdict": payload.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False}
+        next_state = copy.deepcopy(state)
+        next_attempt = attempt_by_id(next_state, args.attempt_id)
+        next_attempt["state"] = "RETURNED"
+        next_attempt["return_ref"] = f"objects/{digest}"
+        if payload.get("verdict") == "PASS":
+            next_attempt["lease"]["state"] = "released"
+            ticket = next((t for t in next_state.get("tickets", []) if t.get("id") == next_attempt.get("subject_ref")), None)
+            if ticket and ticket.get("state") == "REVIEW":
+                ticket["state"] = "INTEGRATED"
+        acceptance = next_state.setdefault("acceptance", [])
+        acceptance.append({"round": len(acceptance) + 1, "intent_revision": args.intent_revision, "candidate_fingerprint": candidate, "verdict": payload.get("verdict"), "transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "setup_receipt_ref": f"objects/{object_store(p, canonical_bytes(env))}", "context_receipt_ref": f"objects/{object_store(p, canonical_bytes(context))}", "return_ref": f"objects/{digest}", "outcome_refs": []})
+        evidence = next_state.setdefault("evidence", [])
+        add_usage(next_state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"return_bytes": len(canonical_bytes(payload))})
+        evidence.append({"id": f"ev-{digest[:16]}", "hash": digest, "source": "manual_review_return", "scenario": "critical/G5", "outcome": payload.get("verdict"), "observer": "independent-reviewer", "subject": candidate})
+        if payload.get("verdict") == "PASS":
+            next_state["lifecycle"]["phase"] = "ACCEPT"
+            next_state["lifecycle"]["control"] = "ACTIVE"
+            next_state["lifecycle"]["reason"] = None
+            next_state["lifecycle"]["next_action"] = {"kind": "g6_final_record", "subject_refs": [args.attempt_id], "preconditions": ["current revisions unchanged", "no active leases/blockers"], "read_refs": ["phases/accept.md", "references/ledger.md"]}
+        else:
+            next_state["lifecycle"]["control"] = "BLOCKED"
+            next_state["lifecycle"]["reason"] = "manual_review_not_pass"
+        next_state["revision"] += 1
+        next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        next_state["updated_at"] = now()
+        publish(p, next_state, previous_raw)
+    return {"imported": True, "verdict": payload.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False}
+
+
+def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    source = Path(args.intent_file).expanduser().resolve()
+    regular_non_symlink(source)
+    raw = source.read_bytes()
+    digest = sha256_bytes(raw)
+    doc_dir = p["docs"] / safe_id(args.doc_id, "document_id")
+    doc_path = doc_dir / f"{safe_id(args.doc_version, 'document_version')}.md"
+    atomic_write(doc_path, raw)
+    doc_id = args.doc_id
+    def change(state: dict[str, Any]) -> None:
+        if not args.authority_ref:
+            fail("amendment requires explicit user authority reference")
+        old_binding = current_intent_binding(state)
+        documents = state.setdefault("documents", [])
+        if any(d.get("id") == doc_id and d.get("version") == args.doc_version for d in documents):
+            fail("document revision already exists")
+        if any(item.get("id") == args.amendment_id for item in state.get("invalidations", [])):
+            fail("amendment ID already exists")
+        documents.append({"id": doc_id, "version": args.doc_version, "path": str(doc_path), "hash": digest, "kind": "intent", "section_anchors": []})
+
+        collections = ("documents", "requirements", "criteria", "contracts", "decisions", "tickets", "attempts", "issues", "findings", "reviews", "acceptance", "operations", "capabilities", "routes", "evidence")
+        consumer_refs: list[str] = []
+        for collection in collections:
+            for item in state.get(collection, []):
+                if collection == "documents" and item.get("id") == doc_id:
+                    continue
+                if item.get("id"):
+                    consumer_refs.append(item["id"])
+                    if "invalidated_by" in item or collection in {"documents", "requirements", "criteria", "contracts", "decisions", "tickets", "attempts", "issues", "findings", "reviews", "acceptance", "operations", "capabilities", "routes", "evidence"}:
+                        item.setdefault("invalidated_by", []).append(args.amendment_id)
+        state.setdefault("invalidations", []).append({"id": f"invalidation-{args.amendment_id}", "amendment_ref": args.amendment_id, "intent_revision": args.intent_revision, "previous_intent_revision": old_binding["revision"], "previous_document_ref": old_binding["document_ref"], "previous_document_hash": old_binding["document_hash"], "affected_refs": [old_binding["document_ref"], doc_id], "consumer_refs": sorted(set(consumer_refs)), "recorded_at": now()})
+        state["intent"] = {"current_revision": args.intent_revision, "document_ref": doc_id, "document_hash": digest, "approved_amendments": [*state.get("intent", {}).get("approved_amendments", []), args.amendment_id], "acceptance_policy": state.get("intent", {}).get("acceptance_policy", "automatic"), "checkpoint_policy": state.get("intent", {}).get("checkpoint_policy", "gate"), "prior_accepted_refs": state.get("intent", {}).get("prior_accepted_refs", [])}
+        for ticket in state.get("tickets", []):
+            if ticket.get("state") not in ("CANCELLED", "STALE"):
+                ticket["state"] = "STALE"
+            ticket.setdefault("intent_revision", old_binding["revision"])
+        for attempt in state.get("attempts", []):
+            if attempt.get("state") in ("PREPARED", "DISPATCHED"):
+                attempt["lease"]["state"] = "quarantined"
+            attempt.setdefault("intent_revision", old_binding["revision"])
+        state["lifecycle"]["phase"] = "INTENT"
+        state["lifecycle"]["control"] = "ACTIVE"
+        state["lifecycle"]["reason"] = "user_amendment"
+        state["lifecycle"]["next_action"] = {"kind": "g1_recheck", "subject_refs": [args.amendment_id], "preconditions": ["affected work quiesced", "current intent hash verified"], "read_refs": ["phases/intent.md", "references/ledger.md"]}
+    result = transaction(p, args.owner_token, args.revision, change)
+    return {"amended": True, "document_hash": digest, "revision": result["revision"], "next_action": result["lifecycle"]["next_action"]}
+
+
+def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
+    def change(state: dict[str, Any]) -> None:
+        phase = args.phase or state["lifecycle"]["phase"]
+        control = args.control or state["lifecycle"]["control"]
+        if phase not in PHASES or control not in CONTROLS:
+            fail("invalid phase/control")
+        current_phase = state["lifecycle"]["phase"]
+        current_control = state["lifecycle"]["control"]
+        if current_control in ("ACCEPTED", "FAILED", "CANCELLED"):
+            fail("terminal run is immutable; start a successor run")
+        if control == "CANCELLED":
+            fail("direct CANCELLED bypass is forbidden; enter QUIESCING and use cancel --finalize")
+        if control == "QUIESCING" and current_control not in ("ACTIVE", "BLOCKED", "RECOVERING"):
+            fail(f"cannot enter QUIESCING from {current_control}")
+        if control == "PAUSED":
+            if current_control != "QUIESCING":
+                fail("PAUSED requires a prior QUIESCING transition")
+            active_attempts = [
+                attempt for attempt in state.get("attempts", [])
+                if attempt.get("state") in ("PREPARED", "DISPATCHED")
+            ]
+            active_leases = [
+                attempt for attempt in state.get("attempts", [])
+                if attempt.get("lease", {}).get("state") in ("active", "quarantined")
+            ]
+            unresolved_effects = [
+                operation for operation in state.get("operations", [])
+                if operation.get("state") in ("prepared", "uncertain")
+            ]
+            if active_attempts or active_leases or unresolved_effects:
+                fail("PAUSED requires stopped writers, released leases, and reconciled effects")
+        current_index = PHASES.index(current_phase)
+        requested_index = PHASES.index(phase)
+        if requested_index not in (current_index, current_index + 1):
+            fail(f"illegal phase jump: {current_phase} -> {phase}")
+        if control == "ACCEPTED" and not any(a.get("verdict") == "PASS" for a in state.get("acceptance", [])):
+            fail("G6 cannot mark ACCEPTED without G5 PASS")
+        state["lifecycle"]["phase"] = phase
+        state["lifecycle"]["control"] = control
+        state["lifecycle"]["reason"] = args.reason
+        state["lifecycle"]["next_action"] = {"kind": args.next_action, "subject_refs": [x for x in args.subject_refs.split(",") if x], "preconditions": [x for x in args.preconditions.split("|") if x], "read_refs": [x for x in args.read_refs.split(",") if x]}
+    result = transaction(paths(args.control_root, args.run_id), args.owner_token, args.revision, change, "gate")
+    return {"published": True, "revision": result["revision"], "phase": result["lifecycle"]["phase"], "control": result["lifecycle"]["control"]}
+
+
+def cmd_cancel(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    if not args.finalize:
+        def request(state: dict[str, Any]) -> None:
+            if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
+                fail("terminal run is immutable; start a successor run")
+            state["lifecycle"]["control"] = "QUIESCING"
+            state["lifecycle"]["reason"] = args.reason
+            state["lifecycle"]["stop_target"] = args.stop_target
+            state["lifecycle"]["next_action"] = {"kind": "stop_reconcile_then_cancel", "subject_refs": [], "preconditions": ["all known writers stopped", "leases and prepared effects reconciled"], "read_refs": ["phases/recover.md", "references/ledger.md"]}
+        result = transaction(p, args.owner_token, args.revision, request, "cancel-quiescing")
+        return {"quiescing": True, "revision": result["revision"], "control": "QUIESCING"}
+    evidence = read_json(Path(args.stop_evidence).expanduser().resolve(), "cancellation stop evidence")
+    if evidence.get("status") != "PASS" or evidence.get("writers_stopped") is not True or evidence.get("reconciled") is not True:
+        fail("cancellation finalization requires PASS stop/reconcile evidence")
+    def finalize(state: dict[str, Any]) -> None:
+        if state["lifecycle"]["control"] != "QUIESCING":
+            fail("cancellation finalization requires QUIESCING")
+        if any(op.get("state") in ("prepared", "uncertain") for op in state.get("operations", [])):
+            fail("cancellation requires all prepared effects reconciled")
+        for attempt in state.get("attempts", []):
+            if attempt.get("state") in ("PREPARED", "DISPATCHED"):
+                attempt["state"] = "INTERRUPTED"
+            if attempt.get("lease", {}).get("state") in ("active", "quarantined"):
+                attempt["lease"]["state"] = "released"
+        for ticket in state.get("tickets", []):
+            if ticket.get("state") not in ("INTEGRATED", "CANCELLED"):
+                ticket["state"] = "CANCELLED"
+        state["lifecycle"]["control"] = "CANCELLED"
+        state["lifecycle"]["reason"] = args.reason
+        state["lifecycle"]["next_action"] = {"kind": "terminal_cancelled", "subject_refs": [], "preconditions": [], "read_refs": ["phases/recover.md"]}
+    result = transaction(p, args.owner_token, args.revision, finalize, "cancel-terminal")
+    return {"cancelled": True, "revision": result["revision"], "control": "CANCELLED"}
+
+
+def cmd_recover(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    with Lock(p["lock"]):
+        try:
+            state, previous_raw = load_state(p)
+            recovered_from = None
+        except LedgerError as exc:
+            candidates = recovery_candidates(p, args.run_id)
+            if not candidates:
+                fail(f"current ledger is corrupt and no verified previous/snapshot exists: {exc}")
+            state, previous_raw, source = candidates[0]
+            recovered_from = str(source)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if not args.takeover and args.revision not in (state["revision"], state["revision"] + 1):
+            fail(f"recovery revision does not match verified checkpoint: {args.revision}")
+        if args.takeover:
+            if not args.new_owner_token:
+                fail("takeover requires a new owner token")
+            state["owner"]["epoch"] += 1
+            state["owner"]["token"] = args.new_owner_token
+            state["owner"]["attestation_ref"] = args.attestation_ref
+            for attempt in state.get("attempts", []):
+                if attempt.get("state") in ("PREPARED", "DISPATCHED"):
+                    attempt["lease"]["state"] = "quarantined"
+        state["lifecycle"]["control"] = "RECOVERING"
+        state["lifecycle"]["reason"] = args.reason
+        state["lifecycle"]["next_action"] = {"kind": "reconcile_actual_state", "subject_refs": [], "preconditions": ["writer stop/reuse guard", "Git/effect reconciliation"], "read_refs": ["phases/recover.md", "references/ledger.md"]}
+        state["revision"] = state["revision"] + 1
+        state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        state["updated_at"] = now()
+        publish(p, state, previous_raw, "recovery")
+        return {"recovering": True, "revision": state["revision"], "epoch": state["owner"]["epoch"], "control": "RECOVERING", "recovered_from": recovered_from}
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Codex Autopilot deterministic ledger/contract helper")
+    sub = parser.add_subparsers(dest="command", required=True)
+    init = sub.add_parser("init"); init.add_argument("--control-root", required=True); init.add_argument("--repo-root", required=True); init.add_argument("--run-id", required=True); init.add_argument("--owner-token", required=True); init.add_argument("--request", default=None, help="optional natural-language request used to resolve run presets"); init.add_argument("--interaction-mode", choices=["semi", "full"], default=None); init.add_argument("--depth", choices=["normal", "deep"], default=None)
+    status = sub.add_parser("status"); status.add_argument("--control-root", required=True); status.add_argument("--run-id", required=True); status.add_argument("--brief", action="store_true")
+    brief = sub.add_parser("brief"); brief.add_argument("--control-root", required=True); brief.add_argument("--run-id", required=True); brief.set_defaults(brief=True)
+    view = sub.add_parser("render-view"); view.add_argument("--control-root", required=True); view.add_argument("--run-id", required=True); view.add_argument("--kind", choices=["status", "final-report"], default="status")
+    valid = sub.add_parser("validate"); valid.add_argument("--file", required=True); valid.add_argument("--kind", default="ledger")
+    ingest = sub.add_parser("ingest-return"); ingest.add_argument("--control-root", required=True); ingest.add_argument("--run-id", required=True); ingest.add_argument("--owner-token", required=True); ingest.add_argument("--revision", type=int, required=True); ingest.add_argument("--attempt-id", required=True); ingest.add_argument("--return-file", required=True); ingest.add_argument("--kind", default="worker")
+    dispatch = sub.add_parser("dispatch"); dispatch.add_argument("--control-root", required=True); dispatch.add_argument("--run-id", required=True); dispatch.add_argument("--owner-token", required=True); dispatch.add_argument("--revision", type=int, required=True); dispatch.add_argument("--ticket-id", required=True); dispatch.add_argument("--attempt-id", required=True); dispatch.add_argument("--lease-id", required=True); dispatch.add_argument("--route-id", required=True); dispatch.add_argument("--packet", required=True); dispatch.add_argument("--route")
+    candidate = sub.add_parser("candidate"); candidate.add_argument("--control-root", required=True); candidate.add_argument("--run-id", required=True); candidate.add_argument("--owner-token", required=True); candidate.add_argument("--revision", type=int, required=True); candidate.add_argument("--attempt-id", required=True); candidate.add_argument("--commit-receipt", required=True); candidate.add_argument("--operation-id", required=True)
+    effect = sub.add_parser("prepare-effect"); effect.add_argument("--control-root", required=True); effect.add_argument("--run-id", required=True); effect.add_argument("--owner-token", required=True); effect.add_argument("--revision", type=int, required=True); effect.add_argument("--operation-id", required=True); effect.add_argument("--kind", required=True); effect.add_argument("--target", required=True); effect.add_argument("--expected-before", default=None); effect.add_argument("--intended-after", default=None); effect.add_argument("--authority-ref", required=True)
+    reconcile_effect = sub.add_parser("reconcile-effect"); reconcile_effect.add_argument("--control-root", required=True); reconcile_effect.add_argument("--run-id", required=True); reconcile_effect.add_argument("--owner-token", required=True); reconcile_effect.add_argument("--revision", type=int, required=True); reconcile_effect.add_argument("--operation-id", required=True); reconcile_effect.add_argument("--result", choices=["applied", "uncertain", "unchanged"], required=True); reconcile_effect.add_argument("--receipt")
+    review = sub.add_parser("prepare-review"); review.add_argument("--control-root", required=True); review.add_argument("--run-id", required=True); review.add_argument("--owner-token", required=True); review.add_argument("--revision", type=int, required=True); review.add_argument("--ticket-id", required=True); review.add_argument("--review-attempt-id", required=True); review.add_argument("--lease-id", required=True); review.add_argument("--packet", required=True)
+    adjudicate = sub.add_parser("adjudicate"); adjudicate.add_argument("--control-root", required=True); adjudicate.add_argument("--run-id", required=True); adjudicate.add_argument("--owner-token", required=True); adjudicate.add_argument("--revision", type=int, required=True); adjudicate.add_argument("--decision-file", required=True)
+    integrate = sub.add_parser("integrate"); integrate.add_argument("--control-root", required=True); integrate.add_argument("--run-id", required=True); integrate.add_argument("--owner-token", required=True); integrate.add_argument("--revision", type=int, required=True); integrate.add_argument("--attempt-id", required=True); integrate.add_argument("--review-file", required=True); integrate.add_argument("--integrity-receipt", required=True); integrate.add_argument("--review-id", required=True)
+    handoff = sub.add_parser("prepare-handoff"); handoff.add_argument("--control-root", required=True); handoff.add_argument("--run-id", required=True); handoff.add_argument("--owner-token", required=True); handoff.add_argument("--revision", type=int, required=True); handoff.add_argument("--attempt-id", required=True); handoff.add_argument("--packet", required=True); handoff.add_argument("--projection", required=True); handoff.add_argument("--export-root", required=True); handoff.add_argument("--bundle-root", required=True)
+    manual = sub.add_parser("import-manual"); manual.add_argument("--control-root", required=True); manual.add_argument("--run-id", required=True); manual.add_argument("--owner-token", required=True); manual.add_argument("--revision", type=int, required=True); manual.add_argument("--attempt-id", required=True); manual.add_argument("--return-file", required=True); manual.add_argument("--environment-receipt", required=True); manual.add_argument("--context-receipt", required=True); manual.add_argument("--integrity-receipt", required=True); manual.add_argument("--intent-revision", required=True); manual.add_argument("--candidate-fingerprint", required=True); manual.add_argument("--required-criteria", required=True)
+    audit = sub.add_parser("audit-write-set"); audit.add_argument("--root", required=True); audit.add_argument("--baseline", required=True); audit.add_argument("--declared", required=True); audit.add_argument("--zone", required=True)
+    gate = sub.add_parser("gate"); gate.add_argument("--control-root", required=True); gate.add_argument("--run-id", required=True); gate.add_argument("--owner-token", required=True); gate.add_argument("--revision", type=int, required=True); gate.add_argument("--phase"); gate.add_argument("--control"); gate.add_argument("--reason", default=None); gate.add_argument("--next-action", default="inspect"); gate.add_argument("--subject-refs", default=""); gate.add_argument("--preconditions", default=""); gate.add_argument("--read-refs", default="")
+    cancel = sub.add_parser("cancel"); cancel.add_argument("--control-root", required=True); cancel.add_argument("--run-id", required=True); cancel.add_argument("--owner-token", required=True); cancel.add_argument("--revision", type=int, required=True); cancel.add_argument("--reason", default="user_cancelled"); cancel.add_argument("--stop-target", default=None); cancel.add_argument("--finalize", action="store_true"); cancel.add_argument("--stop-evidence")
+    recover = sub.add_parser("recover"); recover.add_argument("--control-root", required=True); recover.add_argument("--run-id", required=True); recover.add_argument("--owner-token", required=True); recover.add_argument("--revision", type=int, required=True); recover.add_argument("--reason", default="recovery"); recover.add_argument("--takeover", action="store_true"); recover.add_argument("--new-owner-token", default=None); recover.add_argument("--attestation-ref", default=None)
+    amend = sub.add_parser("amend"); amend.add_argument("--control-root", required=True); amend.add_argument("--run-id", required=True); amend.add_argument("--owner-token", required=True); amend.add_argument("--revision", type=int, required=True); amend.add_argument("--intent-file", required=True); amend.add_argument("--doc-id", required=True); amend.add_argument("--doc-version", required=True); amend.add_argument("--intent-revision", required=True); amend.add_argument("--amendment-id", required=True); amend.add_argument("--authority-ref", required=True)
+    usage = sub.add_parser("publish-usage"); usage.add_argument("--control-root", required=True); usage.add_argument("--run-id", required=True); usage.add_argument("--owner-token", required=True); usage.add_argument("--revision", type=int, required=True); usage.add_argument("--event-file", required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "init": result = cmd_init(args)
+        elif args.command == "status": result = cmd_status(args)
+        elif args.command == "brief": result = cmd_status(args)
+        elif args.command == "render-view": result = cmd_render_view(args)
+        elif args.command == "validate": result = cmd_validate(args)
+        elif args.command == "ingest-return": result = cmd_ingest(args)
+        elif args.command == "dispatch": result = cmd_dispatch(args)
+        elif args.command == "candidate": result = cmd_candidate(args)
+        elif args.command == "prepare-effect": result = cmd_prepare_effect(args)
+        elif args.command == "reconcile-effect": result = cmd_reconcile_effect(args)
+        elif args.command == "prepare-review": result = cmd_prepare_review(args)
+        elif args.command == "adjudicate": result = cmd_adjudicate(args)
+        elif args.command == "integrate": result = cmd_integrate(args)
+        elif args.command == "prepare-handoff": result = cmd_prepare_handoff(args)
+        elif args.command == "import-manual": result = cmd_import_manual(args)
+        elif args.command == "audit-write-set": result = cmd_audit(args)
+        elif args.command == "gate": result = cmd_gate(args)
+        elif args.command == "cancel": result = cmd_cancel(args)
+        elif args.command == "recover": result = cmd_recover(args)
+        elif args.command == "amend": result = cmd_amend(args)
+        elif args.command == "publish-usage": result = cmd_publish_usage(args)
+        else: fail(f"unsupported command: {args.command}")
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    except LedgerError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError) as exc:
+        print(json.dumps({"ok": False, "error": f"safe helper failure: {exc}"}, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

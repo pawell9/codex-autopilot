@@ -1,0 +1,48 @@
+---
+name: codex-autopilot
+description: Run a scoped software change from current intent to an independently verified local Git result with durable gates and independent review.
+---
+
+# Codex Autopilot
+
+Run one scoped software change from the user's current intent to an independently verified local Git result. Invoke this skill explicitly for `start`, `resume`, `status`, `pause`, or `cancel`; an ordinary edit remains an ordinary edit.
+
+## Run presets
+
+At start, resolve two independent durable settings: interaction mode (`semi` / `full`) and depth (`normal` / `deep`). Defaults are `semi + normal`; obvious Russian or English phrases such as `полный автомат, глубокая` are accepted, while ambiguous wording falls back to defaults. The resolved values are stored in the authoritative run ledger as `run_settings`, survive pause/resume and recovery, and are projected by status/dashboard. Existing ledgers without this optional field resolve to the defaults without migration.
+
+`semi` is the baseline autonomous behavior: routine decisions proceed without per-ticket confirmation, while authority-sensitive, irreversible, credential, oracle, and existing safety gates remain. `full` removes only routine interaction friction and never weakens those gates. `deep` requests more thorough analysis, alternatives, acceptance wording, edge-case and failure-mode coverage; it is an orchestration hint only and does not select a model, add a reviewer, change a safety category, or create a lifecycle phase. Presets cannot be changed mid-run.
+
+## Entry contract
+
+The orchestrator owns the run ledger, canonical Markdown revisions, routing, packets, evidence, Git integration, and the final report. A bounded native worker owns product edits in one lease zone. An independent reviewer returns evidence and a verdict; it never repairs its own finding. The Python helper at `tools/ledger.py` is deterministic bookkeeping only: it does not call models, spawn agents, or decide substantive review outcomes.
+
+## Read-only dashboard
+
+`tools/dashboard.py` serves a local read-only projection of the selected current `.autopilot/runs/<run-id>/ledger.json`. It reloads that ledger on refresh/auto-refresh, exposes no state mutation endpoint, and does not create a second state store. Missing ledger facts are shown as `CONCERN`; lifecycle, routing, contracts, safety, Git, and G0–G6 remain authoritative.
+
+Read only the route needed for this invocation:
+
+- New run or environment recheck: `phases/start.md`.
+- Intent or amendment: `phases/intent.md`.
+- Design/G2: `phases/design.md`; plan/G3: `phases/plan.md`.
+- Execution, candidate, repair, routine review, and G4: `phases/execute.md`.
+- Pause, resume, cancellation, lost handles, or uncertain effects: `phases/recover.md`.
+- Verify/G5, manual critical review, import, acceptance, and G6: `phases/accept.md`.
+
+Read `references/ledger.md` before the first state mutation or any recovery question, `references/safety.md` before a project or Git effect, and `references/routing.md` when classifying a task or failure. New workers read `contracts/worker.md`; every reviewer reads the applicable heading in `contracts/reviewer.md`.
+
+## Hard guards
+
+1. Resolve the exact canonical `.autopilot` root and current owner epoch from the ledger. Never select state by nearest directory or by chat memory.
+2. Persist a valid prepared attempt before dispatch. A return is evidence, not a commit or integration receipt.
+3. Product writes belong to a worker lease. Audit the actual tracked, untracked, relevant ignored, type, rename, and symlink effects before candidate commit.
+4. Candidate Git commit precedes review. `INTEGRATED` requires the required independent PASS and a post-review integrity barrier.
+5. Final G5 is a fresh current-intent check. For V1 critical axes and every G5 round, use the user-assisted clean-input/session protocol in `phases/accept.md` and `references/safety.md`; setup/context receipts, exact structured return, and integrity checks are mandatory. User approval alone is never G5.
+6. Unknown authority, oracle, liveness, schema, or declared input-boundary evidence blocks only the dependent action and records an exact next action. Unobservable underlying host properties are residual trust, not silently promoted to `STRICT_FRESH`; never fill missing evidence with a green default.
+
+After compaction, resume, owner transfer, or doubt about the retained protocol, reread this entry, obtain a fresh `brief`, reread the current phase and its safety/recovery pointers, and only then perform a state-changing action. The summary and old conversation are hints, not authority.
+
+## Completion
+
+Choose exactly one route from the actual `phase × control`, leave `next_action` durable, and report the concrete result. Status-only inspection does not mutate product. Stop before release testing: E03-M, E01/E04b, E05–E09, and full release qualification remain separate checks.

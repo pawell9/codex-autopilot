@@ -1,0 +1,23 @@
+{
+  "identity": {
+    "run_id": "e03m-manual-g5-2026-09-13",
+    "attempt_id": "A-E03M-WORKER-1",
+    "ticket_id": "T-E03M-1",
+    "packet_hash": "6144fd4d66ff66ecd67543afbbf274021b3183b9ee1003228491f4c992adc6e8",
+    "epoch": 0,
+    "contract_refs": ["contract-e03m-acceptance-v1"]
+  },
+  "status": "DONE",
+  "result": "Updated the disposable candidate value to VALUE=42.",
+  "files": [{"path": "app.txt", "operation": "modify"}],
+  "checks": [
+    {"check_id": "worker-local-value", "outcome": "pass", "actual": "VALUE=42", "evidence_ref": "worker-local-value"}
+  ],
+  "criteria": [
+    {"criterion_id": "C-E03M-1", "outcome": "satisfied", "evidence_refs": ["worker-local-value"]}
+  ],
+  "issues": [],
+  "interface_delta": [],
+  "handoff": null,
+  "finding_resolution": []
+}

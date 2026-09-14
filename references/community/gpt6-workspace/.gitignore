@@ -1,0 +1,12 @@
+.env
+.env.*
+secrets/
+*.pem
+node_modules/
+__pycache__/
+.DS_Store
+report.json
+reports/tmp/
+carousel/
+calls/*.mp3
+calls/*.m4a
