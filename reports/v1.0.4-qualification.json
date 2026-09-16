@@ -1,0 +1,44 @@
+{
+  "release": "1.0.4",
+  "compatibility_floor": "1.0.0",
+  "schema_version": "1.0",
+  "verification_date": "2026-09-16",
+  "checks": {
+    "python_compile": "PASS",
+    "json_schema_parse": "PASS",
+    "lifecycle_model_parse": "PASS",
+    "unit_model_fault_and_e2e_tests": {
+      "status": "PASS",
+      "count": 58
+    },
+    "realistic_offline_lifecycle": {
+      "status": "PASS",
+      "terminal_phase": "ACCEPT",
+      "terminal_control": "ACCEPTED",
+      "terminal_revision": 48,
+      "design_publications": 3
+    },
+    "idea_scout_disposable_resume": {
+      "status": "PASS",
+      "source_ledger_sha256": "b67dfaebe64bbf80bf76d535bff2cf4b4eed12ee7030821f7bb6c59dddc8e0c9",
+      "source_v5_raw_sha256": "c0d235e71d7bed87b9da2141767ad17ad66fe9cd1070ff115ecb989cee3c1f33",
+      "requirements_publication_revision": 30,
+      "requirements_publication_hash": "a400d95c895023e429d48c447a0630fa6214e728eaf008946217ac0a1e17b692",
+      "v5_publication_revision": 31,
+      "v5_publication_hash": "6171a6f5b52e5549896c9168ddd54d1e169c6683d9fc648d500935c7f47fd8a4",
+      "g2_registration_revision": 32,
+      "g2_packet_hash": "144c0e0ced423ff025c6ee5146eaa3cc060dda7726d3b3b8094f40c5112b00b2",
+      "g3_registration_revision": 33,
+      "g3_packet_hash": "1d6052dcea611ab49f154c0d4d97c9a14725d4cc09656a6bdf1c503f9ebab496",
+      "historical_counts_preserved_after_publication": {
+        "attempts": 6,
+        "reviews": 6,
+        "findings": 19,
+        "issues": 26,
+        "evidence": 6
+      }
+    },
+    "git_diff_check": "PASS",
+    "package_smoke": "PASS"
+  }
+}

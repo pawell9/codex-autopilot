@@ -4,15 +4,15 @@ Read `contracts/worker.md`, `contracts/reviewer.md`, `references/ledger.md`, `re
 
 ## Ticket loop
 
-1. Materialize a READY ticket only when dependencies are reviewed/current `INTEGRATED`, the packet/contract hashes are current, the literal zone is non-overlapping, the lease is free, the oracle is available, and the route is resolved.
+1. Materialize a READY ticket with `ready-ticket` only when dependencies are reviewed/current `INTEGRATED`, packet/contract/criterion refs belong to the current publication, the literal zone is non-overlapping, the lease is free, the oracle is available, and the route is resolved.
 2. Generate the minimal immutable packet and hash. It must include identity, one observable goal, inline criteria, exact workspace/base, lease allow/deny, verification scenarios, risk, relevant pointers, and exact return target. Persist `PREPARED` before native spawn.
 3. Spawn one new bounded native worker for a new ticket. A repair attempt uses `mode=repair` and accepted findings. The worker may be `DEGRADED_CONTEXT` only under the worker eligibility rules; the orchestrator never edits product as fallback. Missing worker capability blocks execution.
 4. Worker verifies root, base, instructions, criteria, and zone before the first write. It returns `DONE`, `BLOCKED`, `FAILED`, or `HANDOFF` through the exact file inbox or message contract. A hard cutoff yields LOST/INTERRUPTED observation and recovery, never invented DONE.
-5. Ingest only a matching attempt/packet/contract/epoch return. Independently audit actual tracked, untracked, relevant ignored, type, rename, symlink, protected, and foreign changes. An undeclared effect quarantines the checkout and creates an ownership issue.
+5. Run read-only `validate-return` and ingest only a matching attempt/packet/contract/epoch/registration/subject return. Independently audit actual tracked, untracked, relevant ignored, type, rename, symlink, protected, and foreign changes. An undeclared effect quarantines the checkout and creates an ownership issue. Exact duplicate bytes are zero-effect; conflicting duplicates are rejected.
 6. Prepare the exact Git candidate effect. The orchestrator uses the normal approved Git boundary, never raw `.git` edits or a helper bypass. Verify base, intended tree, audited paths, hook effects, candidate SHA, clean index/worktree, and operation receipt. A nonempty candidate commit precedes review; a no-op keeps the existing SHA and requires evidence.
 7. Freeze the candidate and prepare a fresh `change` reviewer packet on the immutable SHA. Routine review uses the qualified export/barrier path. Elevated work adds the risk mandate; critical work adds a separate independent security/data/trust axis. Reviewers never receive worker self-rating or repair authority.
 8. Stop the reviewer, run the independent integrity barrier, and ingest its exact structured return. A subject/state/docs/evidence mismatch invalidates the verdict and quarantines the target. PASS on an altered or unverified subject is not PASS.
-9. On required PASS, mechanically verify integration and release the reservation; mark the ticket `INTEGRATED`. On a finding, preserve the immutable verdict and triage cause first. Semantic integration conflicts become worker integration-repair tickets. Do not batch away a blocking issue.
+9. On required PASS, mechanically verify integration and release the reservation; mark the ticket `INTEGRATED`. On a finding, preserve the immutable verdict, triage cause first, and use `authorize-repair` before repair dispatch. Semantic integration conflicts become worker integration-repair tickets. Do not batch away a blocking issue.
 
 ## Cause-first repair
 

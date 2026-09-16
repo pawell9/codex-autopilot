@@ -20,7 +20,17 @@ The setup receipt must identify the observable review-surface topology, accessib
 
 ## Import and acceptance
 
-Import through the validated file/message contract only. Require matching attempt/packet/subject/intent, environment and context receipts, every active criterion/axis outcome, independent checks/evidence, and a PASS verdict. Before publication, stop the reviewer and run the authoritative integrity barrier against candidate, run branch, ledger/docs/evidence baseline. Any mismatch, stale/tampered export, known authoritative or connector access, contaminated session, missing oracle, malformed return, or plain sign-off invalidates the result and keeps the run blocked. Unobservable host-layer properties do not become a hidden PASS claim and are reported as residual trust in the receipt/report.
+Import through the validated file/message contract only. Run state-bound
+`validate-return --kind acceptance`, then require matching attempt/packet/
+subject/intent, environment and context receipts, every active criterion/axis
+outcome, independent checks/evidence, and a PASS verdict. Before publication,
+stop the reviewer and run the authoritative integrity barrier against
+candidate, run branch, ledger/docs/evidence baseline. Any mismatch,
+stale/tampered export, known authoritative or connector access, contaminated
+session, missing oracle, malformed return, or plain sign-off invalidates the
+result and keeps the run blocked. Unobservable host-layer properties do not
+become a hidden PASS claim and are reported as residual trust in the
+receipt/report.
 
 All accepted findings in one G5 round form one dependency-ordered repair wave. Targeted re-reviews close its findings, then one fresh G5 runs on the common new candidate. A contract/intent amendment goes through its affected gates and gets a new projection. `UNVERIFIABLE`, partial, missing, or blocking outcomes cannot become PASS.
 

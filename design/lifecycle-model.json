@@ -1,0 +1,78 @@
+{
+  "model_version": "1.0.4",
+  "initial": "PREFLIGHT/ACTIVE",
+  "success_terminal": "ACCEPT/ACCEPTED",
+  "failure_terminals": [
+    "*/FAILED",
+    "*/CANCELLED"
+  ],
+  "run_transitions": [
+    {"id": "G0", "from": "PREFLIGHT/ACTIVE", "to": "INTENT/ACTIVE", "guard": "capabilities and authority reconciled"},
+    {"id": "G1", "from": "INTENT/ACTIVE", "to": "DESIGN/BLOCKED", "guard": "current intent is published; requirements may require explicit adoption"},
+    {"id": "REQ", "from": "DESIGN/BLOCKED", "to": "DESIGN/ACTIVE", "guard": "requirements/criteria publication is bound to current intent"},
+    {"id": "G2", "from": "DESIGN/ACTIVE", "to": "PLAN/ACTIVE", "guard": "current design publication has coverage PASS and no current blockers"},
+    {"id": "G3", "from": "PLAN/ACTIVE", "to": "EXECUTE/ACTIVE", "guard": "coverage and plan PASS apply to current publication; tickets PLANNED or READY"},
+    {"id": "G4", "from": "EXECUTE/ACTIVE", "to": "VERIFY/ACTIVE", "guard": "all current tickets INTEGRATED; leases/effects closed; no current blockers"},
+    {"id": "G5", "from": "VERIFY/ACTIVE", "to": "ACCEPT/ACTIVE", "guard": "fresh current-intent acceptance PASS on exact candidate"},
+    {"id": "G6", "from": "ACCEPT/ACTIVE", "to": "ACCEPT/ACCEPTED", "guard": "G5 remains current; no blockers, leases, or unresolved effects"},
+    {"id": "DESIGN_REPAIR", "from": "PLAN/BLOCKED", "to": "DESIGN/ACTIVE", "guard": "current publication requires revision and publication leases are closed"},
+    {"id": "EXECUTION_REPAIR_VERIFY", "from": "VERIFY/BLOCKED", "to": "EXECUTE/ACTIVE", "guard": "finding is classified as implementation repair"},
+    {"id": "EXECUTION_REPAIR_ACCEPT", "from": "ACCEPT/BLOCKED", "to": "EXECUTE/ACTIVE", "guard": "finding is classified as implementation repair"},
+    {"id": "CONTRACT_REPAIR", "from": "EXECUTE/BLOCKED", "to": "DESIGN/ACTIVE", "guard": "finding is classified as contract/design repair"},
+    {"id": "INTENT_REPAIR", "from": "DESIGN/BLOCKED", "to": "INTENT/ACTIVE", "guard": "finding is classified as intent repair"},
+    {"id": "PAUSE_REQUEST", "from": "*/ACTIVE", "to": "*/QUIESCING", "guard": "stop target persisted; dispatch frozen"},
+    {"id": "PAUSED", "from": "*/QUIESCING", "to": "*/PAUSED", "guard": "attempts stopped; leases released; effects reconciled"},
+    {"id": "RESUME_PAUSED", "from": "*/PAUSED", "to": "*/RECOVERING", "guard": "owner resumes explicitly"},
+    {"id": "RESUME_BLOCKED", "from": "*/BLOCKED", "to": "*/RECOVERING", "guard": "blocker is reported resolved"},
+    {"id": "RECOVER", "from": "*/RECOVERING", "to": "*/ACTIVE", "guard": "schema, owner, revisions, operations, and environment reconciled"},
+    {"id": "RECOVERY_BLOCK", "from": "*/RECOVERING", "to": "*/BLOCKED", "guard": "unresolved issue has exact evidence and next step"},
+    {"id": "FAIL", "from": "*/QUIESCING", "to": "*/FAILED", "guard": "attempts stopped; leases/effects closed; recovery impossible without guessing"},
+    {"id": "CANCEL", "from": "*/QUIESCING", "to": "*/CANCELLED", "guard": "attempts stopped; leases/effects closed"}
+  ],
+  "machines": {
+    "ticket": {
+      "initial": "PLANNED",
+      "terminal": ["INTEGRATED", "CANCELLED", "STALE"],
+      "transitions": [
+        ["PLANNED", "READY"], ["READY", "RUNNING"], ["RUNNING", "CANDIDATE"],
+        ["CANDIDATE", "REVIEW"], ["REVIEW", "INTEGRATED"], ["REVIEW", "REPAIR"],
+        ["REPAIR", "READY"], ["BLOCKED", "READY"], ["PLANNED", "BLOCKED"],
+        ["READY", "BLOCKED"], ["RUNNING", "BLOCKED"], ["CANDIDATE", "BLOCKED"],
+        ["REVIEW", "BLOCKED"], ["PLANNED", "STALE"], ["READY", "STALE"],
+        ["RUNNING", "STALE"], ["CANDIDATE", "STALE"], ["REVIEW", "STALE"],
+        ["INTEGRATED", "STALE"], ["BLOCKED", "CANCELLED"], ["PLANNED", "CANCELLED"]
+      ]
+    },
+    "attempt": {
+      "initial": "PREPARED",
+      "terminal": ["RETURNED", "LOST", "INTERRUPTED"],
+      "transitions": [["PREPARED", "DISPATCHED"], ["PREPARED", "INTERRUPTED"], ["DISPATCHED", "RETURNED"], ["DISPATCHED", "LOST"], ["DISPATCHED", "INTERRUPTED"]]
+    },
+    "lease": {
+      "initial": "active",
+      "terminal": ["released"],
+      "transitions": [["active", "released"], ["active", "quarantined"], ["quarantined", "released"]]
+    },
+    "operation": {
+      "initial": "prepared",
+      "terminal": ["applied", "abandoned"],
+      "transitions": [["prepared", "applied"], ["prepared", "abandoned"], ["prepared", "uncertain"], ["uncertain", "applied"], ["uncertain", "abandoned"]]
+    },
+    "publication": {
+      "initial": "PUBLISHED",
+      "terminal": ["SUPERSEDED", "INVALIDATED"],
+      "transitions": [["PUBLISHED", "SUPERSEDED"], ["PUBLISHED", "INVALIDATED"]]
+    },
+    "requirements_publication": {
+      "initial": "PUBLISHED",
+      "terminal": ["INVALIDATED"],
+      "transitions": [["PUBLISHED", "INVALIDATED"]]
+    },
+    "verdict": {
+      "initial": "PENDING",
+      "terminal": ["PASS", "BLOCK", "UNVERIFIABLE"],
+      "transitions": [["PENDING", "PASS"], ["PENDING", "BLOCK"], ["PENDING", "UNVERIFIABLE"]]
+    }
+  },
+  "required_success_edges": ["G0", "G1", "REQ", "G2", "G3", "G4", "G5", "G6"]
+}

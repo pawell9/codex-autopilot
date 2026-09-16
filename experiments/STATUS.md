@@ -1,6 +1,11 @@
 # Qualification status
 
-**CODEX-AUTOPILOT V1.0.0 — FROZEN / RELEASE READY.**
+**CODEX-AUTOPILOT V1.0.4 — VERIFIED LIFECYCLE PATCH RELEASE.**
+
+Current v1.0.4 evidence: the offline realistic lifecycle reaches revision 48
+at `ACCEPT/ACCEPTED`; the exact Idea Scout disposable resume publishes V5 at
+revision 31 and registers fresh G2/G3 attempts at revisions 32/33 without
+changing the audited source. See `../reports/v1.0.4-qualification.json`.
 
 The frozen baseline includes the latest real-world remediation fixes, durable
 presets, and 40-ticket scale qualification. Historical blocked checkpoints

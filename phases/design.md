@@ -10,6 +10,13 @@ The plan must anticipate independent evidence beyond worker tests: expected-valu
 
 ## G2 coverage request
 
+Before design publication, verify that every referenced requirement and
+criterion exists as a current structured record. A legacy run with a current
+intent but missing these collections must use an explicit, intent-bound
+`requirements_manifest` and `adopt-requirements`; never derive records from
+prose, remove non-empty `criterion_refs`, or edit the ledger. The resulting
+requirements publication becomes part of the design publication binding.
+
 When G1 is complete, publish the complete design-stage bundle before preparing
 the reviewer: design, interfaces/contracts, manifest, implementation plan,
 tickets, routes, and dependency bindings must all be immutable, hash-verified
@@ -30,7 +37,12 @@ coverage --reviewer-identity ... --reviewer-role ...`. This durable attempt
 records the exact bundle fingerprint, artifact/version refs, publication
 revision, intent binding, reviewer identity/role, and PREPARED state before the
 reviewer runs. Ingest the exact structured return through the normal review
-path; a PASS is then bound to that attempt and target.
+path; a PASS is then bound to that attempt and target. The packet distinguishes
+registration/source revision from immutable subject revision and
+attempt-created revision. Run `validate-return --kind review` against the
+exact attempt before the reviewer publishes its return. Coverage and plan are
+different logical mandates and cannot disagree merely because their verdicts
+differ.
 
 Prepare a fresh `coverage` reviewer packet on the current intent and proposed design. It contains no author defense, worker self-rating, or implementation history. The reviewer assesses every active requirement, omissions, silent narrowing, assumptions, interfaces, and oracle feasibility, then returns structured coverage and findings on the exact document revision. A PASS requires all active requirements assessed with no blocking gap.
 

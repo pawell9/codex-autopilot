@@ -14,10 +14,12 @@ Pause preserves worktree and changes. Cancel records the goal termination, prese
 2. Reconcile actual checkout HEAD/ref/index/worktree and operation targets against prepared evidence. A commit with missing receipt is accepted only when old HEAD, intended tree, operation trailer, and resulting SHA match; otherwise the operation is uncertain and is not repeated.
 3. For spawn loss, inspect registered handles/processes, attempt inbox, partial files, and writing activity. Stop confirmed writers. A user attestation may cover closure of the old session and its background writers only when corroborating observations do not conflict; it is recorded as evidence, not as runtime proof.
 4. Apply the reuse guard: runtime-confirmed stop of all writing activity, or the explicit attestation plus bounded process/checkout observations. `ps`, `lsof`, and file quiet are corroboration only. If the guard is unmet, keep the lease quarantined and set `agent_liveness_unknown` with the exact action to stop/confirm writers.
+   Record confirmed worker/reviewer loss with `terminate-attempt`; LOST or
+   INTERRUPTED and lease release/quarantine are one atomic publication.
 5. Audit foreign tracked/untracked/ignored changes, symlink targets, protected paths, and Git common-dir state. Preserve foreign fingerprints. Old-epoch returns are historical evidence until the current owner re-audits and accepts them by version/subject checks.
 6. Invalidate facts affected by build, permission, surface, repo, HEAD, instruction, toolchain, configuration, or contradictory observations. Set the earliest invalid gate and a precise `next_action`.
 
-Use `tools/ledger.py recover` for deterministic publication. If current JSON is corrupt, validate verified previous snapshots newest-first; do not overwrite the namespace with a guessed reconstruction. An unknown schema is a read-only migration diagnostic. If no safe recovery exists, remain `BLOCKED` or `FAILED` after all in-flight activity is stopped; a successor run needs an explicit new scope decision.
+Use `tools/ledger.py recover` for deterministic publication. If current JSON is corrupt, validate verified previous snapshots newest-first; do not overwrite the namespace with a guessed reconstruction. Use `diagnose` for an unknown schema; it is strictly read-only. If no safe recovery exists, remain `BLOCKED` or `FAILED` after all in-flight activity is stopped; a successor run needs an explicit new scope decision.
 
 ## Handoff and resume
 

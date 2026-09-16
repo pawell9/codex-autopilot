@@ -1,5 +1,35 @@
 # Changelog
 
+## [v1.0.4] — 2026-09-16
+
+Verified lifecycle-completeness patch release.
+
+- Added atomic, hash-addressed, owner/epoch/revision-fenced
+  `adopt-requirements` (`publish-requirements`) for explicit requirements and
+  criteria manifests. Legacy v1.0.0–v1.0.3 runs can now publish non-empty
+  `ticket.criterion_refs` without editing their ledger or prepared bundle.
+- Split packet registration, immutable subject, attempt creation, and return
+  source revisions. Added read-only `validate-return` state-bound preflight;
+  ingest now applies the same packet/attempt/subject/axis rules.
+- Made exact retries zero-effect for requirements/design publication,
+  dispatch, return ingest, prepared effects, candidate recording, and effect
+  reconciliation; conflicting retries remain rejected.
+- Released reviewer leases atomically on every accepted verdict, added
+  explicit LOST/INTERRUPTED attempt termination, ticket readiness, and
+  cause-bound repair authorization.
+- Scoped disagreement to the same review kind and mandate. Supersession now
+  fences the transitive review/finding/issue/evidence closure and preserves it
+  as immutable historical evidence.
+- Tightened G2–G6, ticket dependency, candidate/integration, and terminal
+  guards; stale fingerprints, unresolved effects, leases, or blockers cannot
+  satisfy a current gate.
+- Added durable runtime provenance without rewriting creation provenance:
+  creation version, schema version, last mutating helper, compatibility floor,
+  and applied migration IDs.
+- Added read-only unknown-schema diagnosis, corrected dashboard currentness,
+  a machine-readable lifecycle model with mutation/reachability tests, an
+  offline terminal-ACCEPTED qualification, and an exact Idea Scout V5 dry run.
+
 ## [v1.0.3] — 2026-09-16
 
 Patch release for the iterative immutable design-review lifecycle.

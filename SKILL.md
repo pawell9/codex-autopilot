@@ -37,6 +37,22 @@ Republish is rejected after successful design gates, leaving DESIGN, or
 entering execution. G2/G3 PASS is valid only for those current published
 artifacts and registered PASS reviews.
 
+For a legacy nonterminal run whose current intent is already authoritative but
+whose ledger has no structured requirements/criteria, do not edit JSON and do
+not weaken `ticket.criterion_refs`. Read `references/ledger.md`, construct or
+use the explicitly authorized `requirements_manifest`, and run
+`adopt-requirements` (`publish-requirements`). The manifest must bind the exact
+intent revision/document/hash and owner epoch. This migration publication is
+hash-addressed, atomic, idempotent for the same bytes, and recorded in
+`runtime_provenance`; conflicting records or bytes block.
+
+Before a worker/reviewer publishes its final return, run the read-only
+`validate-return` against the registered attempt. Structural validation alone
+does not establish ingestability. Preserve packet `source_revision` as its
+registration revision; publication/subject and attempt-created revisions are
+separate recorded bindings. Mixed coverage and plan verdicts are not reviewer
+disagreement.
+
 ## Read-only dashboard
 
 `tools/dashboard.py` serves a local read-only projection of the selected current `.autopilot/runs/<run-id>/ledger.json`. It reloads that ledger on refresh/auto-refresh, exposes no state mutation endpoint, and does not create a second state store. Missing ledger facts are shown as `CONCERN`; lifecycle, routing, contracts, safety, Git, and G0–G6 remain authoritative.
@@ -60,9 +76,10 @@ Read `references/ledger.md` before the first state mutation or any recovery ques
 4. Candidate Git commit precedes review. `INTEGRATED` requires the required independent PASS and a post-review integrity barrier.
 5. Final G5 is a fresh current-intent check. For V1 critical axes and every G5 round, use the user-assisted clean-input/session protocol in `phases/accept.md` and `references/safety.md`; setup/context receipts, exact structured return, and integrity checks are mandatory. User approval alone is never G5.
 6. Unknown authority, oracle, liveness, schema, or declared input-boundary evidence blocks only the dependent action and records an exact next action. Unobservable underlying host properties are residual trust, not silently promoted to `STRICT_FRESH`; never fill missing evidence with a green default.
+7. Materialize readiness with `ready-ticket`; dependencies must be current reviewed `INTEGRATED` outcomes. Enter repair only through `authorize-repair`. Close a lost/interrupted attempt through `terminate-attempt` with stop evidence and a released or quarantined lease.
 
 After compaction, resume, owner transfer, or doubt about the retained protocol, reread this entry, obtain a fresh `brief`, reread the current phase and its safety/recovery pointers, and only then perform a state-changing action. The summary and old conversation are hints, not authority.
 
 ## Completion
 
-Choose exactly one route from the actual `phase × control`, leave `next_action` durable, and report the concrete result. Status-only inspection does not mutate product. Stop before release testing: E03-M, E01/E04b, E05–E09, and full release qualification remain separate checks.
+Choose exactly one route from the actual `phase × control`, leave `next_action` durable, and report the concrete result. Status-only inspection does not mutate product. A release claim additionally requires the repository qualification suite, including the offline terminal-ACCEPTED lifecycle fixture; unit tests alone are insufficient.

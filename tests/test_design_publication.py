@@ -74,7 +74,7 @@ class DesignPublicationTests(unittest.TestCase):
         paths = ledger.paths(control, "design-run")
         state, _ = ledger.load_state(paths)
         attempt = next(item for item in state["attempts"] if item["id"] == attempt_id)
-        returned = {"identity": {"run_id": "design-run", "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": attempt["target_revision"], "intent_revision": "intent-v2"}, "subject_fingerprint": state["design_publication"]["publication_hash"], "verdict": verdict, "coverage": [{"criterion_id": "C-1", "outcome": "fulfilled" if verdict == "PASS" else "unverifiable", "evidence_refs": ["EV-review"]}], "checks": [{"check_id": "design-check", "axis": attempt["mode"], "outcome": "fulfilled" if verdict == "PASS" else "not_run", "actual": "fixture", "evidence_ref": "EV-review"}], "context_refs": ["clean-design-review"], "findings": []}
+        returned = {"identity": {"run_id": "design-run", "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": attempt["packet_source_revision"], "registration_revision": attempt["packet_registration_revision"], "subject_revision": attempt["subject_revision"], "intent_revision": "intent-v2"}, "subject_fingerprint": state["design_publication"]["publication_hash"], "verdict": verdict, "coverage": [{"criterion_id": "C-1", "outcome": "fulfilled" if verdict == "PASS" else "unverifiable", "evidence_refs": ["EV-review"]}], "checks": [{"check_id": "design-check", "axis": attempt["mode"], "outcome": "fulfilled" if verdict == "PASS" else "not_run", "actual": "fixture", "evidence_ref": "EV-review"}], "context_refs": ["clean-design-review"], "findings": []}
         inbox = paths["scratch"] / attempt_id / "return.json"
         write_json(inbox, returned)
         run("ingest-return", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(revision), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "review")
@@ -148,6 +148,19 @@ class DesignPublicationTests(unittest.TestCase):
             self.assertTrue(ledger.design_review_pass(state, "coverage"))
             self.assertEqual(2, len({item["subject_fingerprint"] for item in state["reviews"]}))
             run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "ACTIVE", "--next-action", "g2_pass")
+
+    def test_unverifiable_review_is_terminal_and_releases_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, _ = self.setup_g1(root); bundle = self.bundle(root, control)
+            self.publish(control, bundle)
+            packet = self.review_packet(root, control, "A-unverifiable", "coverage", source_revision=3)
+            self.prepare_review(control, packet, "A-unverifiable", "coverage", 3)
+            self.finish_review(root, control, "A-unverifiable", 4, verdict="UNVERIFIABLE")
+            state, _ = ledger.load_state(ledger.paths(control, "design-run"))
+            attempt = ledger.attempt_by_id(state, "A-unverifiable")
+            self.assertEqual("RETURNED", attempt["state"])
+            self.assertEqual("UNVERIFIABLE", attempt["review_result"])
+            self.assertEqual("released", attempt["lease"]["state"])
 
     def test_plan_block_returns_to_design_for_republish_but_execution_does_not(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -237,10 +250,52 @@ class DesignPublicationTests(unittest.TestCase):
     def test_legacy_ledger_without_publication_metadata_remains_valid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); control, _, _ = self.setup_g1(root); paths = ledger.paths(control, "design-run")
-            state, _ = ledger.load_state(paths); state["skill_version"] = "1.0.1"; state.pop("design_publication", None); ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            state, _ = ledger.load_state(paths); state["skill_version"] = "1.0.1"; state.pop("runtime_provenance", None); state.pop("design_publication", None); ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
             run("validate", "--file", str(paths["ledger"]), "--kind", "ledger")
             resumed = run("recover", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]))
             self.assertIn('"recovering": true', resumed.stdout)
+
+    def test_mixed_review_kinds_are_not_disagreement_and_state_preflight_matches_ingest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, _ = self.setup_g1(root); bundle = self.bundle(root, control)
+            self.publish(control, bundle)
+            paths = ledger.paths(control, "design-run")
+            packet = self.review_packet(root, control, "A-coverage-mixed", "coverage", source_revision=3)
+            self.prepare_review(control, packet, "A-coverage-mixed", "coverage", 3)
+            self.finish_review(root, control, "A-coverage-mixed", 4, verdict="PASS")
+            packet = self.review_packet(root, control, "A-plan-mixed", "plan", source_revision=5)
+            self.prepare_review(control, packet, "A-plan-mixed", "plan", 5)
+            state, _ = ledger.load_state(paths); attempt = next(item for item in state["attempts"] if item["id"] == "A-plan-mixed")
+            returned = {"identity": {"run_id": "design-run", "attempt_id": "A-plan-mixed", "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": attempt["packet_source_revision"], "registration_revision": attempt["packet_registration_revision"], "subject_revision": attempt["subject_revision"], "intent_revision": "intent-v2"}, "subject_fingerprint": state["design_publication"]["publication_hash"], "verdict": "BLOCK", "coverage": [{"criterion_id": "C-1", "outcome": "unverifiable", "evidence_refs": ["EV-plan"]}], "checks": [{"check_id": "plan-check", "axis": "wrong-axis", "outcome": "not_run", "actual": "blocked", "evidence_ref": "EV-plan"}], "context_refs": ["clean"], "findings": []}
+            inbox = paths["scratch"] / "A-plan-mixed" / "return.json"; write_json(inbox, returned)
+            original = paths["ledger"].read_bytes()
+            preflight = run("validate-return", "--control-root", str(control), "--run-id", "design-run", "--attempt-id", "A-plan-mixed", "--return-file", str(inbox), "--kind", "review", expect=2)
+            self.assertIn("axes do not exactly match", preflight.stderr); self.assertEqual(original, paths["ledger"].read_bytes())
+            returned["checks"][0]["axis"] = "plan"; write_json(inbox, returned)
+            run("validate-return", "--control-root", str(control), "--run-id", "design-run", "--attempt-id", "A-plan-mixed", "--return-file", str(inbox), "--kind", "review")
+            run("ingest-return", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", "6", "--attempt-id", "A-plan-mixed", "--return-file", str(inbox), "--kind", "review")
+            state, _ = ledger.load_state(paths)
+            self.assertFalse([item for item in state.get("issues", []) if item.get("type") == "reviewer_disagreement"])
+            self.assertEqual("review_not_pass", state["lifecycle"]["reason"])
+            self.assertEqual("released", ledger.attempt_by_id(state, "A-plan-mixed")["lease"]["state"])
+
+    def test_supersession_fences_findings_even_when_not_in_lifecycle_issue_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, _ = self.setup_g1(root); bundle = self.bundle(root, control); self.publish(control, bundle)
+            paths = ledger.paths(control, "design-run")
+            packet = self.review_packet(root, control, "A-finding", "coverage", source_revision=3); self.prepare_review(control, packet, "A-finding", "coverage", 3)
+            state, _ = ledger.load_state(paths); attempt = ledger.attempt_by_id(state, "A-finding")
+            returned = {"identity": {"run_id": "design-run", "attempt_id": "A-finding", "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": attempt["packet_source_revision"], "intent_revision": "intent-v2"}, "subject_fingerprint": state["design_publication"]["publication_hash"], "verdict": "BLOCK", "coverage": [{"criterion_id": "C-1", "outcome": "missing", "evidence_refs": ["EV"]}], "checks": [{"check_id": "coverage", "axis": "coverage", "outcome": "failed", "actual": "missing", "evidence_ref": "EV"}], "context_refs": ["clean"], "findings": [{"axis": "coverage", "impact": "blocking", "claim": "missing ownership", "expected": "owned", "actual": "missing", "evidence": "EV", "affected_refs": ["coverage"]}]}
+            inbox = paths["scratch"] / "A-finding" / "return.json"; write_json(inbox, returned)
+            run("ingest-return", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", "4", "--attempt-id", "A-finding", "--return-file", str(inbox), "--kind", "review")
+            state, _ = ledger.load_state(paths); state["lifecycle"]["issue_refs"] = [ref for ref in state["lifecycle"]["issue_refs"] if not ref.startswith("issue-")]; ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            value = json.loads(bundle.read_text(encoding="utf-8")); value["bundle_id"] = "B-design-v2"; value["version"] = "v2"; source = root / "D-design-v2.md"; source.write_text("# revised\n", encoding="utf-8"); value["documents"][0] = {**value["documents"][0], "id": "D-design-v2", "version": "v2", "source": str(source), "hash": ledger.sha256_file(source)}; revised = root / "revised.json"; write_json(revised, value)
+            self.publish(control, revised, revision=5)
+            final, _ = ledger.load_state(paths)
+            old_finding = final["findings"][0]
+            self.assertIn("B-design-v2", old_finding["invalidated_by"])
+            linked = [item for item in final["issues"] if item.get("finding_ref") == old_finding["id"]]
+            self.assertTrue(linked); self.assertTrue(all(item["impact"] == "advisory" for item in linked))
 
     def test_amendment_invalidates_design_binding_and_old_reviews(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

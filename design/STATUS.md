@@ -1,9 +1,15 @@
 # Design status
 
-**CODEX-AUTOPILOT V1.0.0 — FROZEN / RELEASE READY.**
+**CODEX-AUTOPILOT V1.0.4 — VERIFIED LIFECYCLE PATCH RELEASE.**
 
-The frozen baseline includes the latest real-world remediation fixes, durable
-presets, and 40-ticket scale qualification. This status file remains the
+The v1.0.4 state-machine audit and current release evidence are in
+[`../reports/v1.0.4-lifecycle-audit.md`](../reports/v1.0.4-lifecycle-audit.md),
+[`../reports/v1.0.4-qualification.json`](../reports/v1.0.4-qualification.json),
+and [`../RELEASE-v1.0.4.md`](../RELEASE-v1.0.4.md). The older V1 qualification
+text below remains historical provenance.
+
+The release includes the original remediation evidence, durable presets,
+40-ticket scale qualification, and the v1.0.4 terminal lifecycle qualification. This status file remains the
 design provenance record; the standalone usage guide is [`../README.md`](../README.md).
 
 ## Bounded run preset addendum — 2026-09-14

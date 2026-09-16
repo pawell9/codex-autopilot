@@ -57,6 +57,8 @@ def _find_attempt(state: dict[str, Any], attempt_id: str | None) -> dict[str, An
 def _candidate_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for attempt in state.get("attempts", []):
+        if attempt.get("invalidated_by"):
+            continue
         sha = attempt.get("candidate_sha")
         tree_sha = attempt.get("candidate_tree_sha")
         if sha or tree_sha:
@@ -99,7 +101,13 @@ def _project_gate_status(
     gate_index: int, current_index: int, control: str, state: dict[str, Any]
 ) -> tuple[str, str]:
     acceptances = state.get("acceptance", [])
-    if gate_index == 5 and any(item.get("verdict") == "PASS" for item in acceptances):
+    intent_revision = state.get("intent", {}).get("revision")
+    if gate_index == 5 and any(
+        item.get("verdict") == "PASS"
+        and item.get("intent_revision") == intent_revision
+        and not item.get("invalidated_by")
+        for item in acceptances
+    ):
         return "passed", "acceptance PASS"
     if gate_index == 6 and control == "ACCEPTED":
         return "passed", "lifecycle control ACCEPTED"
@@ -161,7 +169,7 @@ def project_ledger(state: dict[str, Any], ledger_path: Path, raw: bytes) -> dict
             "target_revision": attempt.get("target_revision"),
         }
         for attempt in state.get("attempts", [])
-        if attempt.get("mode") in ("coverage", "plan")
+        if attempt.get("mode") in ("coverage", "plan") and not attempt.get("invalidated_by")
     ]
     if phase in {"DESIGN", "PLAN"} and not design_publication:
         _add_concern(concerns, "design-publication-missing", "Для G2/G3 отсутствует canonical design publication; provisional artifacts не считаются опубликованными.")
@@ -207,7 +215,7 @@ def project_ledger(state: dict[str, Any], ledger_path: Path, raw: bytes) -> dict
             "affected_refs": issue.get("affected_refs", []),
         }
         for issue in state.get("issues", [])
-        if issue.get("impact") == "blocking"
+        if issue.get("impact") == "blocking" and not issue.get("invalidated_by")
     ]
     if control == "BLOCKED" and not blockers:
         _add_concern(
@@ -277,7 +285,17 @@ def project_ledger(state: dict[str, Any], ledger_path: Path, raw: bytes) -> dict
         },
         "active": active,
         "blockers": blockers,
-        "findings": state.get("findings", []),
+        "findings": [
+            {**item, "current": not bool(item.get("invalidated_by"))}
+            for item in state.get("findings", [])
+        ],
+        "requirements_publications": state.get("requirements_publications", []),
+        "version_provenance": state.get("runtime_provenance", {
+            "creation_skill_version": state.get("skill_version"),
+            "last_mutating_skill_version": state.get("skill_version"),
+            "current_schema_version": state.get("schema_version"),
+            "applied_migrations": [],
+        }),
         "adjudications": [item for item in state.get("decisions", []) if item.get("type") == "reviewer_adjudication"],
         "usage": state.get("usage", {"tokens": None, "token_reason": "token meter unavailable", "counters": {}, "shared_setup": {}, "gate_costs": {}, "trace": []}),
         "candidate": {"current": current_candidate, "all": candidates},

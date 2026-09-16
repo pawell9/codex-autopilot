@@ -64,7 +64,7 @@ class InitialIntentTests(unittest.TestCase):
             state, raw = ledger.load_state(paths)
             ledger.validate_ledger(state)
             run("validate", "--file", str(paths["ledger"]), "--kind", "ledger")
-            self.assertEqual("1.0.3", state["skill_version"])
+            self.assertEqual("1.0.4", state["skill_version"])
             self.assertEqual(1, state["revision"])
             self.assertEqual(ledger.sha256_bytes(initial_raw), state["previous_publication_hash"])
             self.assertEqual(initial_raw, paths["prev"].read_bytes())
@@ -113,6 +113,7 @@ class InitialIntentTests(unittest.TestCase):
             paths = ledger.paths(control, "run-bootstrap")
             legacy, _ = ledger.load_state(paths)
             legacy["skill_version"] = "1.0.0"
+            legacy.pop("runtime_provenance", None)
             legacy.pop("run_settings")
             ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(legacy))
             run(

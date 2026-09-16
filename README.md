@@ -6,7 +6,7 @@ orchestrator owns the durable ledger, routing, contracts, review flow, and
 Git integration; bounded workers implement ticket-sized changes, and
 independent reviewers verify them.
 
-**CODEX-AUTOPILOT V1.0.3 — PATCH RELEASE**
+**CODEX-AUTOPILOT V1.0.4 — VERIFIED LIFECYCLE PATCH RELEASE**
 
 ## Requirements
 
@@ -21,13 +21,15 @@ global Codex skills directory:
 
 ```bash
 install_dir="${CODEX_HOME:-$HOME/.codex}/skills/codex-autopilot"
-mkdir -p "$install_dir"/{agents,contracts,dashboard,phases,references,schemas,tools}
+mkdir -p "$install_dir"/{agents,contracts,dashboard,migration-manifests,phases,references,release-assets/v1.0.4,schemas,tools}
 cp SKILL.md "$install_dir/"
 cp agents/openai.yaml "$install_dir/agents/"
 cp contracts/reviewer.md contracts/worker.md "$install_dir/contracts/"
 cp dashboard/index.html "$install_dir/dashboard/"
+cp migration-manifests/*.json "$install_dir/migration-manifests/"
 cp phases/{accept,design,execute,intent,plan,recover,start}.md "$install_dir/phases/"
 cp references/{ledger,routing,safety}.md "$install_dir/references/"
+cp release-assets/v1.0.4/*.json "$install_dir/release-assets/v1.0.4/"
 cp schemas/contracts.schema.json "$install_dir/schemas/"
 cp tools/dashboard.py tools/ledger.py "$install_dir/tools/"
 ```
@@ -68,6 +70,22 @@ one ledger transaction. Reviewer attempts bind identity, role, artifact
 versions, epoch, and publication revision; G2/G3 cannot pass on provisional
 files. Same-byte retries recover safely after a crash, while conflicting or
 stale inputs leave canonical state unchanged.
+
+Legacy nonterminal runs that have intent prose but no structured
+`requirements[]`/`criteria[]` use `adopt-requirements` with an explicit
+schema-validated manifest. The command never infers records from prose. It
+binds the manifest to the exact intent document/revision, stores its bytes by
+SHA-256, publishes all records and their immutable publication record in one
+ledger revision, and records the migration in `runtime_provenance` while
+preserving the original `skill_version`. Exact lost-response retries are
+zero-effect; altered bytes, stale owner/epoch/revision, unknown references, or
+an incompatible existing publication are rejected.
+
+Use `validate-return` before a producer atomically renames its return into the
+registered inbox. This read-only state-bound check applies the same attempt,
+packet hash, epoch, intent, subject fingerprint, source/registration/subject
+revision, criteria, axis, and reference rules as ingest. Structural
+`validate --kind ...` remains intentionally context-free.
 
 ## Presets
 
@@ -127,8 +145,9 @@ and reaches `ACCEPTED` only through the required acceptance gates.
 - Usage meters may be unavailable and are reported as unknown/null. Host-layer
   properties that cannot be observed are recorded as residual trust, not
   presented as strict isolation proof.
-- Automatic edits to global/project instructions and legacy state migration
-  are not part of V1.
+- Automatic edits to global/project instructions are not part of V1. Legacy
+  schema `1.0` requirements/criteria adoption is supported only through an
+  explicit manifest; unknown schema versions remain read-only diagnostics.
 
 ## License and attribution
 
