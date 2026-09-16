@@ -6,13 +6,15 @@ Read `phases/start.md` first for a new run and `references/ledger.md` before pub
 
 Extract the user's current wording without silently normalizing away sources, edge cases, UX requirements, constraints, or exclusions. Record each active requirement with immutable ID, provenance pointer, current revision, and one or more observable criteria. Each criterion names an oracle owner, expected behavior, evidence shape, and whether it is live, negative, edge, or deterministic. Keep `deferred` and `dropped` items explicit with authority; absence is not a scope decision.
 
+For the first revision, call `tools/ledger.py publish-intent` after `init`. It copies non-empty UTF-8 Markdown into the run's immutable `docs/` namespace and publishes the document/hash binding plus the INTENT next action under the owner lock. It is resumable when identical bytes already exist from an interrupted attempt, rejects conflicting bytes, and refuses any second initial binding. Never use `amend` to bootstrap and never edit `ledger.json` directly.
+
 Read relevant prior accepted reports, contracts, and decisions as read-only successor context. Current user intent outranks prior memory. If a prior artifact is missing or its hash drifts, record UNKNOWN and resolve the gap; do not reconstruct it from chat or rewrite project instructions.
 
 Material ambiguity is a decision, not an implementation preference. Ask only when authority, product semantics, destructive/external effect, overlapping user changes, scope reduction, or a required oracle has more than one materially different outcome. Store the decision, evidence, affected IDs, introduced revision, and superseded refs. Reversible technical choices stay with the orchestrator and are not ritual approvals.
 
 ## Amendments
 
-An amendment creates a new canonical intent Markdown revision before updating ledger references. Preserve exact before/after product wording, user authority provenance, affected requirements/criteria/contracts, and invalidated gates. Quiesce affected work first. Old packets, returns, reviews, and integrated outcomes become historical evidence/STALE; they never silently satisfy the new intent. A terminal run amendment creates a successor run.
+After the initial binding exists, an amendment creates a new canonical intent Markdown revision before updating ledger references. Preserve exact before/after product wording, user authority provenance, affected requirements/criteria/contracts, and invalidated gates. Quiesce affected work first. Old packets, returns, reviews, and integrated outcomes become historical evidence/STALE; they never silently satisfy the new intent. A terminal run amendment creates a successor run.
 
 ## G1 checklist
 

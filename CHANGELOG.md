@@ -1,5 +1,19 @@
 # Changelog
 
+## [v1.0.1] — 2026-09-16
+
+Patch release for the first-intent bootstrap gap found during an Idea Scout V2
+production run.
+
+- Added the single-use, owner/revision-fenced `publish-intent` command.
+- Made initial intent publication validate the complete proposed ledger before
+  installing immutable Markdown, reject conflicting/second publications, and
+  safely resume a same-byte document left by interruption.
+- Preserved legacy-ledger defaults and the existing `amend`, gate, recovery,
+  review, and acceptance semantics.
+- Added regression coverage for the real init-to-intent path and its failure
+  and recovery cases.
+
 ## [v1.0.0] — 2026-09-14
 
 Frozen V1 release of `codex-autopilot`.

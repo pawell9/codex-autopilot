@@ -17,6 +17,8 @@ At start, resolve two independent durable settings: interaction mode (`semi` / `
 
 The orchestrator owns the run ledger, canonical Markdown revisions, routing, packets, evidence, Git integration, and the final report. A bounded native worker owns product edits in one lease zone. An independent reviewer returns evidence and a verdict; it never repairs its own finding. The Python helper at `tools/ledger.py` is deterministic bookkeeping only: it does not call models, spawn agents, or decide substantive review outcomes.
 
+For a new run, `init` creates revision 0 and `publish-intent` atomically binds the first canonical intent as revision 1 before G1 work continues. `publish-intent` is valid exactly once; use `amend` only after that binding exists. On resume, a nonterminal legacy or blocked run without `intent` publishes its existing authorized intent through this command instead of editing the ledger or starting a successor run.
+
 ## Read-only dashboard
 
 `tools/dashboard.py` serves a local read-only projection of the selected current `.autopilot/runs/<run-id>/ledger.json`. It reloads that ledger on refresh/auto-refresh, exposes no state mutation endpoint, and does not create a second state store. Missing ledger facts are shown as `CONCERN`; lifecycle, routing, contracts, safety, Git, and G0–G6 remain authoritative.

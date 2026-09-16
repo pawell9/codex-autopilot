@@ -6,7 +6,7 @@ orchestrator owns the durable ledger, routing, contracts, review flow, and
 Git integration; bounded workers implement ticket-sized changes, and
 independent reviewers verify them.
 
-**CODEX-AUTOPILOT V1.0.0 — FROZEN / RELEASE READY**
+**CODEX-AUTOPILOT V1.0.1 — PATCH RELEASE**
 
 ## Requirements
 
@@ -47,6 +47,13 @@ Use $codex-autopilot to start a scoped Git-backed software run for this task.
 
 An ordinary edit does not start an Autopilot run. `start`, `resume`, `status`,
 `pause`, and `cancel` are explicit skill routes.
+
+For a new run the helper first creates revision 0, then publishes the first
+canonical intent through the single-use `publish-intent` command. This keeps
+the document copy, hash binding, revision, and next action under the normal
+ledger lock; later intent changes use `amend`. A pre-v1.0.1 nonterminal run
+that stopped before its first intent should be resumed and bootstrapped in
+place, not replaced or hand-edited.
 
 ## Presets
 

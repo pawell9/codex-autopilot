@@ -1,6 +1,6 @@
 # Codex Autopilot — PROJECT BRIEF
 
-**Status:** CODEX-AUTOPILOT V1.0.0 — FROZEN / RELEASE READY
+**Status:** CODEX-AUTOPILOT V1.0.1 — PATCH RELEASE
 **Purpose:** starting context for research and design of a Codex-native Autopilot skill
 **Working project name:** `codex-autopilot`
 
@@ -410,9 +410,9 @@ Testing should evaluate both **quality** and **orchestration economics**:
 
 ## 16. Current design status
 
-The research/design objective is complete. V1.0.0 is frozen after the latest
-real-world remediation fixes, durable preset implementation, and 40-ticket
-scale qualification. The items below are intentionally unbound runtime
+The research/design objective is complete. V1.0.1 adds the qualified initial
+intent bootstrap fix to the frozen V1 baseline after a real production run
+exposed the gap. The items below are intentionally unbound runtime
 choices or post-V1 extensions, not unfinished release work.
 
 The following remain intentionally unbound or post-V1:
@@ -433,7 +433,7 @@ Do not treat previous sketches as locked requirements.
 ## 17. Immediate project objective
 
 The historical research/design objective described in this section has been
-completed and released as the frozen V1.0.0 package. The remaining material
+completed and released as the V1 package. The remaining material
 below records the original development intent and is retained as project
 provenance.
 

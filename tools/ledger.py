@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.0"
+SKILL_VERSION = "1.0.1"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -531,6 +531,39 @@ def object_store(p: dict[str, Path], raw: bytes) -> str:
     else:
         atomic_write(target, raw)
     return digest
+
+
+def canonical_document_path(p: dict[str, Path], document_id: str, document_version: str) -> Path:
+    """Resolve one immutable Markdown destination without permitting docs/ escape."""
+    safe_id(document_id, "document_id")
+    safe_id(document_version, "document_version")
+    docs_root = p["docs"].resolve()
+    if p["docs"].exists() and (p["docs"].is_symlink() or not p["docs"].is_dir()):
+        fail("canonical document namespace is not a regular directory")
+    destination = (p["docs"] / document_id / f"{document_version}.md").resolve()
+    if not under(destination, docs_root):
+        fail("canonical document path escapes the run document namespace")
+    return destination
+
+
+def intent_source_bytes(value: str) -> bytes:
+    candidate = Path(value).expanduser()
+    if candidate.is_symlink():
+        fail("intent source may not be a symlink")
+    source = candidate.resolve()
+    if not source.exists():
+        fail(f"intent source does not exist: {source}")
+    regular_non_symlink(source)
+    raw = source.read_bytes()
+    if len(raw) > 4 * 1024 * 1024:
+        fail("intent source exceeds the 4 MiB bound")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"intent source must be UTF-8 Markdown: {exc}")
+    if not text.strip():
+        fail("intent source must contain non-whitespace Markdown")
+    return raw
 
 
 def inbox_file(p: dict[str, Path], attempt_id: str, candidate: Path) -> Path:
@@ -1750,6 +1783,109 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
     return {"imported": True, "verdict": payload.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False}
 
 
+def cmd_publish_intent(args: argparse.Namespace) -> dict[str, Any]:
+    """Publish the one initial intent binding for an initialized run."""
+    p = paths(args.control_root, args.run_id)
+    raw = intent_source_bytes(args.intent_file)
+    digest = sha256_bytes(raw)
+    doc_id = safe_id(args.doc_id, "document_id")
+    doc_path = canonical_document_path(p, doc_id, args.doc_version)
+    intent_revision = nonempty_string(args.intent_revision, "intent_revision")
+    started = time.monotonic()
+
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        if state.get("intent") is not None:
+            fail("initial intent already exists; use amend for a new intent revision")
+        if any(document.get("kind") == "intent" for document in state.get("documents", [])):
+            fail("an intent document already exists without a current binding; recover or adjudicate it before bootstrap")
+        if state["lifecycle"]["phase"] not in ("PREFLIGHT", "INTENT"):
+            fail("initial intent may only be published from PREFLIGHT or INTENT")
+        current_control = state["lifecycle"]["control"]
+        if current_control not in ("ACTIVE", "BLOCKED", "RECOVERING"):
+            fail("initial intent requires an ACTIVE, BLOCKED, or RECOVERING run; resume/recover the run first")
+
+        next_state = copy.deepcopy(state)
+        next_state.setdefault("documents", []).append({
+            "id": doc_id,
+            "version": args.doc_version,
+            "path": str(doc_path),
+            "hash": digest,
+            "kind": "intent",
+            "section_anchors": [],
+        })
+        next_state["intent"] = {
+            "current_revision": intent_revision,
+            "document_ref": doc_id,
+            "document_hash": digest,
+            "approved_amendments": [],
+            "acceptance_policy": "automatic",
+            "checkpoint_policy": "gate",
+            "prior_accepted_refs": [],
+        }
+        blocking_refs = list(next_state["lifecycle"].get("issue_refs", []))
+        recovering = current_control == "RECOVERING" and not blocking_refs
+        next_state["lifecycle"]["phase"] = "INTENT"
+        next_state["lifecycle"]["control"] = "BLOCKED" if blocking_refs else ("RECOVERING" if recovering else "ACTIVE")
+        next_state["lifecycle"]["reason"] = "existing_blockers" if blocking_refs else ("initial_intent_published_during_recovery" if recovering else "initial_intent_published")
+        next_state["lifecycle"]["next_action"] = {
+            "kind": "resolve_blockers_before_g1" if blocking_refs else ("finish_recovery_then_g1" if recovering else "g1_build"),
+            "subject_refs": [doc_id, *blocking_refs],
+            "preconditions": ["current intent hash verified"],
+            "read_refs": ["phases/intent.md", "references/ledger.md"],
+        }
+
+        usage = next_state.setdefault("usage", default_usage())
+        usage.setdefault("counters", zero_usage())
+        usage.setdefault("trace", [])
+        usage.setdefault("shared_setup", zero_usage())
+        usage.setdefault("gate_costs", {f"G{i}": zero_usage() for i in range(7)})
+        delta = {field: 0 for field in USAGE_FIELDS}
+        delta["helper_calls"] = 1
+        delta["internal_publications"] = 1
+        delta["wall_time_ms"] = max(0, int((time.monotonic() - started) * 1000))
+        add_usage(usage["counters"], delta)
+        usage["trace"].append({
+            "id": f"trace-{state['revision'] + 1}-helper",
+            "kind": "helper_publication",
+            "actor": "ledger-helper",
+            "subject_ref": next_state["lifecycle"]["next_action"]["kind"],
+            "delta": delta,
+            "evidence_ref": None,
+            "recorded_at": now(),
+        })
+        next_state["revision"] = state["revision"] + 1
+        next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        next_state["updated_at"] = now()
+
+        # Validate every input and the complete proposed ledger before making
+        # the immutable document visible.  A same-byte orphan from a crash is
+        # reusable; conflicting bytes are never overwritten.
+        validate_ledger(next_state)
+        if doc_path.exists():
+            regular_non_symlink(doc_path)
+            if doc_path.read_bytes() != raw:
+                fail("canonical initial intent destination already exists with different bytes")
+        else:
+            atomic_write(doc_path, raw)
+        publish(p, next_state, previous_raw)
+
+    return {
+        "published": True,
+        "intent_revision": intent_revision,
+        "document_ref": doc_id,
+        "document_hash": digest,
+        "revision": next_state["revision"],
+        "phase": next_state["lifecycle"]["phase"],
+        "control": next_state["lifecycle"]["control"],
+        "next_action": next_state["lifecycle"]["next_action"],
+    }
+
+
 def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     source = Path(args.intent_file).expanduser().resolve()
@@ -1935,6 +2071,7 @@ def build_parser() -> argparse.ArgumentParser:
     gate = sub.add_parser("gate"); gate.add_argument("--control-root", required=True); gate.add_argument("--run-id", required=True); gate.add_argument("--owner-token", required=True); gate.add_argument("--revision", type=int, required=True); gate.add_argument("--phase"); gate.add_argument("--control"); gate.add_argument("--reason", default=None); gate.add_argument("--next-action", default="inspect"); gate.add_argument("--subject-refs", default=""); gate.add_argument("--preconditions", default=""); gate.add_argument("--read-refs", default="")
     cancel = sub.add_parser("cancel"); cancel.add_argument("--control-root", required=True); cancel.add_argument("--run-id", required=True); cancel.add_argument("--owner-token", required=True); cancel.add_argument("--revision", type=int, required=True); cancel.add_argument("--reason", default="user_cancelled"); cancel.add_argument("--stop-target", default=None); cancel.add_argument("--finalize", action="store_true"); cancel.add_argument("--stop-evidence")
     recover = sub.add_parser("recover"); recover.add_argument("--control-root", required=True); recover.add_argument("--run-id", required=True); recover.add_argument("--owner-token", required=True); recover.add_argument("--revision", type=int, required=True); recover.add_argument("--reason", default="recovery"); recover.add_argument("--takeover", action="store_true"); recover.add_argument("--new-owner-token", default=None); recover.add_argument("--attestation-ref", default=None)
+    initial_intent = sub.add_parser("publish-intent"); initial_intent.add_argument("--control-root", required=True); initial_intent.add_argument("--run-id", required=True); initial_intent.add_argument("--owner-token", required=True); initial_intent.add_argument("--revision", type=int, required=True); initial_intent.add_argument("--intent-file", required=True); initial_intent.add_argument("--doc-id", required=True); initial_intent.add_argument("--doc-version", required=True); initial_intent.add_argument("--intent-revision", required=True)
     amend = sub.add_parser("amend"); amend.add_argument("--control-root", required=True); amend.add_argument("--run-id", required=True); amend.add_argument("--owner-token", required=True); amend.add_argument("--revision", type=int, required=True); amend.add_argument("--intent-file", required=True); amend.add_argument("--doc-id", required=True); amend.add_argument("--doc-version", required=True); amend.add_argument("--intent-revision", required=True); amend.add_argument("--amendment-id", required=True); amend.add_argument("--authority-ref", required=True)
     usage = sub.add_parser("publish-usage"); usage.add_argument("--control-root", required=True); usage.add_argument("--run-id", required=True); usage.add_argument("--owner-token", required=True); usage.add_argument("--revision", type=int, required=True); usage.add_argument("--event-file", required=True)
     return parser
@@ -1962,6 +2099,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "gate": result = cmd_gate(args)
         elif args.command == "cancel": result = cmd_cancel(args)
         elif args.command == "recover": result = cmd_recover(args)
+        elif args.command == "publish-intent": result = cmd_publish_intent(args)
         elif args.command == "amend": result = cmd_amend(args)
         elif args.command == "publish-usage": result = cmd_publish_usage(args)
         else: fail(f"unsupported command: {args.command}")
