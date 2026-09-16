@@ -1,0 +1,41 @@
+{
+  "release": "1.0.5",
+  "date": "2026-09-16",
+  "qualified": true,
+  "production_run_used_as_test_base": false,
+  "helper_sha256": "ebd99e79af2591cbc34d428ffe1f0d05d3372e373a4c9ae03b415896060053c8",
+  "regression_suite": {
+    "command": "python3 -m unittest discover -s tests -v",
+    "result": "PASS",
+    "tests_run": 62,
+    "skipped": 1,
+    "skip_reason": "legacy production-checkpoint audit is opt-in; v1.0.5 qualification uses sanitized fixtures"
+  },
+  "exact_fixture": {
+    "run_id": "2026-09-16-idea-scout-v2",
+    "source_revision": 77,
+    "current_bundle": "idea-scout-v2-design-bundle-v12",
+    "subject_revision": 71,
+    "current_fingerprint": "cbbae2bf9b299676e84e8f64d804a85324e79ae868b6f59995cf652a3c06156d",
+    "historical_findings_preserved": 13,
+    "historical_blockers_after_migration": 0,
+    "double_run_revision_delta": 0,
+    "double_run_ledger_hash_changed": false,
+    "g2_g3_transition": "PASS",
+    "status_brief_dashboard": "PASS",
+    "negative_lineage_cases": "PASS"
+  },
+  "lifecycle_qualification": {
+    "command": "python3 experiments/v104_lifecycle_qualification.py",
+    "result": "PASS",
+    "terminal_phase": "ACCEPT",
+    "terminal_control": "ACCEPTED",
+    "terminal_revision": 48
+  },
+  "backward_compatibility": {
+    "schema": "1.0",
+    "creation_versions": ["1.0.0", "1.0.1", "1.0.2", "1.0.3", "1.0.4"],
+    "result": "PASS"
+  },
+  "runtime_package_manifest_parity": "PASS"
+}

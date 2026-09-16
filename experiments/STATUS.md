@@ -1,6 +1,10 @@
 # Qualification status
 
-**CODEX-AUTOPILOT V1.0.4 — VERIFIED LIFECYCLE PATCH RELEASE.**
+**CODEX-AUTOPILOT V1.0.5 — REVIEW CURRENTNESS PATCH RELEASE.**
+
+The v1.0.5 sanitized V12 regression is fully offline and does not read or
+modify the mounted Idea Scout production run. The older production-checkpoint
+audit is retained as opt-in historical evidence only.
 
 Current v1.0.4 evidence: the offline realistic lifecycle reaches revision 48
 at `ACCEPT/ACCEPTED`; the exact Idea Scout disposable resume publishes V5 at

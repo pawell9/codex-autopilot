@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -9,7 +10,10 @@ SOURCE = Path("/Users/pawell_9/Documents/Pet-project - поиск идей пр�
 
 
 class IdeaScoutResumeTests(unittest.TestCase):
-    @unittest.skipUnless(SOURCE.exists(), "Idea Scout audited checkpoint is not mounted")
+    @unittest.skipUnless(
+        os.environ.get("CODEX_AUTOPILOT_RUN_LEGACY_IDEA_SCOUT_AUDIT") == "1",
+        "legacy production-checkpoint audit is opt-in; normal tests use sanitized fixtures",
+    )
     def test_exact_v5_resume_on_disposable_copy(self):
         result = subprocess.run(["python3", str(ROOT / "experiments" / "idea_scout_v5_resume_dry_run.py")], cwd=ROOT, text=True, capture_output=True)
         if result.returncode:

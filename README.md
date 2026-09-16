@@ -6,7 +6,7 @@ orchestrator owns the durable ledger, routing, contracts, review flow, and
 Git integration; bounded workers implement ticket-sized changes, and
 independent reviewers verify them.
 
-**CODEX-AUTOPILOT V1.0.4 — VERIFIED LIFECYCLE PATCH RELEASE**
+**CODEX-AUTOPILOT V1.0.5 — REVIEW CURRENTNESS PATCH RELEASE**
 
 ## Requirements
 
@@ -80,6 +80,16 @@ ledger revision, and records the migration in `runtime_provenance` while
 preserving the original `skill_version`. Exact lost-response retries are
 zero-effect; altered bytes, stale owner/epoch/revision, unknown references, or
 an incompatible existing publication are rejected.
+
+Legacy runs whose historical design-review findings predate complete
+supersession fencing can use `migrate-review-currentness` after fresh current
+coverage and plan PASS returns have been registered and ingested. The
+owner/revision-fenced migration resolves each blocker through durable
+attempt/review bindings, subject revision/fingerprint, and
+`design_publication_history`. Proven historical records retain their IDs and
+content and receive only invalidation/provenance metadata. Missing or
+ambiguous lineage remains blocking. Repeating an applied migration is a
+zero-revision, zero-side-effect operation.
 
 Use `validate-return` before a producer atomically renames its return into the
 registered inbox. This read-only state-bound check applies the same attempt,

@@ -32,6 +32,13 @@ requires fresh reviews. No active writer/reviewer lease may remain, and this
 repair route is unavailable after successful design gates or execution begins.
 The transaction's next action is the only route to G2.
 
+For a legacy ledger created before complete consumer fencing, do not edit the
+ledger or replay reviews. After both current-publication coverage and plan
+PASS returns are durably ingested, use `migrate-review-currentness` at the
+current owner/revision fence. Only findings whose source attempt/review binds
+unambiguously to a superseded publication become historical. Current,
+missing-lineage, and ambiguous-lineage findings remain blockers.
+
 Register the coverage reviewer with `prepare-design-review --review-kind
 coverage --reviewer-identity ... --reviewer-role ...`. This durable attempt
 records the exact bundle fingerprint, artifact/version refs, publication

@@ -1,5 +1,26 @@
 # Changelog
 
+## [v1.0.5] — 2026-09-16
+
+Review-currentness and legacy-ledger migration patch release.
+
+- Added owner/revision-fenced `migrate-review-currentness` for legacy active
+  `review_finding` blockers after fresh current G2 coverage and G3 plan PASS
+  returns are registered and ingested.
+- Added canonical lineage resolution through attempt/review records, subject
+  refs/revisions/fingerprints, return-object bindings, and immutable design
+  publication history; names and legacy `affected_refs` are never sufficient
+  evidence.
+- Preserved issue, finding, review, attempt, evidence, publication, verdict,
+  and return content while adding only currentness/invalidation and hash-bound
+  migration provenance. Missing, conflicting, or ambiguous lineage remains a
+  current blocker with an exact reported reason.
+- Made exact migration retries semantic no-ops and tightened current G2/G3
+  PASS selection against invalidated reviews.
+- Corrected status, brief, and dashboard currentness coverage with a
+  sanitized revision-77 V12 regression fixture, negative lineage cases, gate
+  transition checks, lifecycle qualification, and legacy compatibility tests.
+
 ## [v1.0.4] — 2026-09-16
 
 Verified lifecycle-completeness patch release.

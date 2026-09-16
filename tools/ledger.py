@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.4"
+SKILL_VERSION = "1.0.5"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 COMPATIBILITY_FLOOR = "1.0.0"
@@ -1218,7 +1218,12 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         brief["usage"]["counters"]["brief_bytes"] = len(canonical_bytes(brief))
         return brief
     settings = resolved_run_settings(state)
-    return {"run_id": state["run_id"], "revision": state["revision"], "phase": state["lifecycle"]["phase"], "control": state["lifecycle"]["control"], "next_action": state["lifecycle"]["next_action"], "run_settings": settings, "preset_display": run_settings_display(settings), "ticket_counts": {s: sum(1 for t in state.get("tickets", []) if t.get("state") == s) for s in ("PLANNED", "READY", "RUNNING", "CANDIDATE", "REVIEW", "INTEGRATED", "BLOCKED", "STALE")}, "attempts": len(state.get("attempts", [])), "ledger_hash": sha256_bytes(raw)}
+    current_blockers = [
+        item["id"] for item in state.get("issues", [])
+        if item.get("impact") == "blocking" and not item.get("invalidated_by")
+    ]
+    current_findings = [item for item in state.get("findings", []) if not item.get("invalidated_by")]
+    return {"run_id": state["run_id"], "revision": state["revision"], "phase": state["lifecycle"]["phase"], "control": state["lifecycle"]["control"], "next_action": state["lifecycle"]["next_action"], "run_settings": settings, "preset_display": run_settings_display(settings), "ticket_counts": {s: sum(1 for t in state.get("tickets", []) if t.get("state") == s) for s in ("PLANNED", "READY", "RUNNING", "CANDIDATE", "REVIEW", "INTEGRATED", "BLOCKED", "STALE")}, "attempts": len(state.get("attempts", [])), "blockers": current_blockers, "finding_counts": {"current": len(current_findings), "historical": len(state.get("findings", [])) - len(current_findings), "total": len(state.get("findings", []))}, "ledger_hash": sha256_bytes(raw)}
 
 
 def cmd_publish_usage(args: argparse.Namespace) -> dict[str, Any]:
@@ -2718,6 +2723,335 @@ def supersede_design_publication(next_state: dict[str, Any], previous: dict[str,
         next_state["lifecycle"]["reason"] = "revised_design_published"
 
 
+def fresh_current_design_passes(state: dict[str, Any], review_kind: str) -> list[dict[str, str]]:
+    """Return PASS review/attempt pairs that prove current registered ingestion."""
+    publication = current_design_publication(state)
+    pairs: list[dict[str, str]] = []
+    for review in state.get("reviews", []):
+        if (
+            review.get("review_kind") != review_kind
+            or review.get("verdict") != "PASS"
+            or review.get("subject_fingerprint") != publication.get("publication_hash")
+            or review.get("intent_revision") != publication.get("intent_revision")
+            or review.get("target_revision") != publication.get("published_revision")
+            or review.get("invalidated_by")
+        ):
+            continue
+        attempts = [
+            attempt for attempt in state.get("attempts", [])
+            if attempt.get("kind") == "review"
+            and attempt.get("mode") == review_kind
+            and attempt.get("state") == "RETURNED"
+            and attempt.get("review_result") == "PASS"
+            and attempt.get("subject_ref") == publication.get("id")
+            and attempt.get("subject_fingerprint") == publication.get("publication_hash")
+            and attempt.get("subject_revision") == publication.get("published_revision")
+            and attempt.get("target_revision") == publication.get("published_revision")
+            and attempt.get("intent_revision") == publication.get("intent_revision")
+            and attempt.get("return_ref") == review.get("return_ref")
+            and attempt.get("packet_hash")
+            and attempt.get("lease", {}).get("state") == "released"
+            and not attempt.get("invalidated_by")
+        ]
+        for attempt in attempts:
+            pairs.append({"review_id": review["id"], "attempt_id": attempt["id"]})
+    return pairs
+
+
+def _publication_lineage_bindings(record: dict[str, Any]) -> dict[str, Any]:
+    revisions = {
+        value for value in (record.get("subject_revision"), record.get("target_revision"))
+        if value is not None
+    }
+    return {
+        "subject_ref": record.get("subject_ref"),
+        "subject_fingerprint": record.get("subject_fingerprint"),
+        "revisions": sorted(revisions),
+    }
+
+
+def resolve_review_finding_lineage(state: dict[str, Any], issue: dict[str, Any]) -> dict[str, Any]:
+    """Resolve an issue to one publication without using names as evidence."""
+    if issue.get("type") != "review_finding":
+        return {"status": "not_review_finding", "reason": "issue type is not review_finding"}
+    finding = next(
+        (item for item in state.get("findings", []) if item.get("id") == issue.get("finding_ref")),
+        None,
+    )
+    if finding is None:
+        return {"status": "unresolved", "reason": "missing finding_ref target"}
+
+    source_ids = []
+    for source_id in (issue.get("source_ref"), finding.get("source_ref")):
+        if source_id and source_id not in source_ids:
+            source_ids.append(source_id)
+    records: list[dict[str, Any]] = []
+    source_record_ids: set[str] = set()
+    for source_id in source_ids:
+        matches = [
+            item for collection in ("attempts", "reviews")
+            for item in state.get(collection, []) if item.get("id") == source_id
+        ]
+        if len(matches) != 1:
+            reason = "source_ref does not resolve to one attempt/review" if not matches else "source_ref resolves ambiguously"
+            return {"status": "unresolved", "reason": reason, "source_ref": source_id}
+        records.append(matches[0])
+        source_record_ids.add(source_id)
+
+    if not records:
+        return {"status": "unresolved", "reason": "finding has no durable attempt/review source"}
+
+    # A return object is the canonical bridge between an attempt and its review.
+    return_refs = {item.get("return_ref") for item in records if item.get("return_ref")}
+    for collection in ("attempts", "reviews"):
+        for item in state.get(collection, []):
+            linked_by_return = item.get("return_ref") in return_refs if item.get("return_ref") else False
+            linked_by_finding = finding["id"] in item.get("finding_refs", [])
+            if linked_by_return or linked_by_finding:
+                if item.get("id") not in source_record_ids:
+                    records.append(item)
+                    source_record_ids.add(item["id"])
+
+    histories = design_publication_history(state)
+    candidates = list(histories)
+    binding_count = 0
+    binding_summary: list[dict[str, Any]] = []
+    for record in records:
+        bindings = _publication_lineage_bindings(record)
+        if len(bindings["revisions"]) > 1:
+            return {
+                "status": "unresolved",
+                "reason": "source record has conflicting subject/target revisions",
+                "source_ref": record.get("id"),
+            }
+        used: dict[str, Any] = {"record_id": record.get("id")}
+        if bindings["subject_ref"]:
+            candidates = [item for item in candidates if item.get("id") == bindings["subject_ref"]]
+            used["subject_ref"] = bindings["subject_ref"]
+            binding_count += 1
+        if bindings["subject_fingerprint"]:
+            candidates = [item for item in candidates if item.get("publication_hash") == bindings["subject_fingerprint"]]
+            used["subject_fingerprint"] = bindings["subject_fingerprint"]
+            binding_count += 1
+        if bindings["revisions"]:
+            revision = bindings["revisions"][0]
+            candidates = [item for item in candidates if item.get("published_revision") == revision]
+            used["subject_revision"] = revision
+            binding_count += 1
+        if len(used) > 1:
+            binding_summary.append(used)
+
+    if binding_count == 0:
+        return {"status": "unresolved", "reason": "source records contain no canonical publication bindings"}
+    unique = {item.get("id"): item for item in candidates if item.get("id")}
+    if not unique:
+        return {
+            "status": "unresolved",
+            "reason": "canonical source bindings match no design publication history record",
+            "bindings": binding_summary,
+        }
+    if len(unique) != 1:
+        return {
+            "status": "ambiguous",
+            "reason": "canonical source bindings match multiple design publications",
+            "candidate_publication_ids": sorted(unique),
+            "bindings": binding_summary,
+        }
+    publication = next(iter(unique.values()))
+    current = state.get("design_publication", {})
+    if publication.get("id") == current.get("id"):
+        lineage_status = "current"
+        reason = "finding is bound to the current design publication"
+    elif publication.get("status") in ("SUPERSEDED", "INVALIDATED") or publication.get("superseded_by") or publication.get("invalidated_by"):
+        lineage_status = "superseded"
+        reason = "finding is bound to a non-current superseded/invalidated publication"
+    else:
+        lineage_status = "unresolved"
+        reason = "matched publication is non-current but lacks supersession/invalidation evidence"
+    return {
+        "status": lineage_status,
+        "reason": reason,
+        "publication_id": publication.get("id"),
+        "publication_fingerprint": publication.get("publication_hash"),
+        "publication_revision": publication.get("published_revision"),
+        "finding_id": finding["id"],
+        "source_record_ids": sorted(source_record_ids),
+        "bindings": binding_summary,
+    }
+
+
+def _append_invalidation(record: dict[str, Any], marker: str) -> None:
+    if marker not in record.setdefault("invalidated_by", []):
+        record["invalidated_by"].append(marker)
+
+
+def _apply_review_currentness_resolution(
+    state: dict[str, Any], issue: dict[str, Any], resolution: dict[str, Any], marker: str
+) -> list[str]:
+    """Fence one proven historical closure while retaining every source record."""
+    changed: list[str] = []
+    ids = {issue["id"], resolution["finding_id"], *resolution["source_record_ids"]}
+    source_attempt_ids = {
+        item["id"] for item in state.get("attempts", []) if item.get("id") in ids
+    }
+    for evidence in state.get("evidence", []):
+        if evidence.get("subject") in source_attempt_ids:
+            ids.add(evidence["id"])
+    for collection in ("issues", "findings", "attempts", "reviews", "evidence"):
+        for record in state.get(collection, []):
+            if record.get("id") in ids and marker not in record.get("invalidated_by", []):
+                _append_invalidation(record, marker)
+                changed.append(record["id"])
+    return sorted(changed)
+
+
+def cmd_migrate_review_currentness(args: argparse.Namespace) -> dict[str, Any]:
+    """Fence provably historical legacy review findings without rewriting them."""
+    p = paths(args.control_root, args.run_id)
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
+            fail("terminal run is immutable; start a successor run")
+        publication = current_design_publication(state)
+        marker = f"review-currentness-{publication['publication_hash']}"
+        provenance = state.get("runtime_provenance", {})
+        prior = next(
+            (item for item in provenance.get("applied_migrations", []) if item.get("id") == marker),
+            None,
+        )
+        if prior is not None:
+            report = stored_payload(p, prior.get("object_ref"), "review currentness migration report")
+            if sha256_bytes(canonical_bytes(report)) != prior.get("manifest_hash"):
+                fail("stored review currentness migration report hash mismatch")
+            return {
+                "migrated": True,
+                "idempotent": True,
+                "migration_id": marker,
+                "revision": state["revision"],
+                "report": report,
+            }
+
+        passes = {
+            kind: fresh_current_design_passes(state, kind)
+            for kind in ("coverage", "plan")
+        }
+        missing_passes = [kind for kind, pairs in passes.items() if not pairs]
+        if missing_passes:
+            fail(
+                "review currentness migration requires fresh registered and ingested current PASS: "
+                + ", ".join(missing_passes)
+            )
+
+        next_state = copy.deepcopy(state)
+        outcomes: list[dict[str, Any]] = []
+        changed_ids: set[str] = set()
+        active_findings = [
+            item for item in next_state.get("issues", [])
+            if item.get("type") == "review_finding"
+            and item.get("impact") == "blocking"
+            and not item.get("invalidated_by")
+        ]
+        for issue in active_findings:
+            resolution = resolve_review_finding_lineage(next_state, issue)
+            outcome = {"issue_id": issue["id"], **resolution}
+            if resolution.get("status") == "superseded":
+                changed = _apply_review_currentness_resolution(next_state, issue, resolution, marker)
+                changed_ids.update(changed)
+                outcome["action"] = "invalidated_as_historical"
+                outcome["changed_record_ids"] = changed
+            else:
+                outcome["action"] = "preserved_as_current_blocker"
+            outcomes.append(outcome)
+
+        if not changed_ids:
+            return {
+                "migrated": False,
+                "idempotent": True,
+                "no_effect": True,
+                "migration_id": marker,
+                "revision": state["revision"],
+                "outcomes": outcomes,
+            }
+
+        current_blocker_ids = [
+            item["id"] for item in next_state.get("issues", [])
+            if item.get("impact") == "blocking" and not item.get("invalidated_by")
+        ]
+        next_state["lifecycle"]["issue_refs"] = [
+            ref for ref in next_state["lifecycle"].get("issue_refs", []) if ref in current_blocker_ids
+        ]
+        if next_state["lifecycle"].get("control") == "BLOCKED" and not current_blocker_ids:
+            next_state["lifecycle"]["control"] = "ACTIVE"
+            next_state["lifecycle"]["reason"] = "review_currentness_migrated"
+            next_state["lifecycle"]["next_action"] = {
+                "kind": "advance_g2_g3",
+                "subject_refs": [publication["id"]],
+                "preconditions": ["current coverage PASS", "current plan PASS", "no current blocking issues"],
+                "read_refs": ["phases/design.md", "references/ledger.md"],
+            }
+
+        report = {
+            "kind": "review_currentness_migration",
+            "migration_id": marker,
+            "run_id": state["run_id"],
+            "source_revision": state["revision"],
+            "applied_revision": state["revision"] + 1,
+            "current_publication": {
+                "id": publication["id"],
+                "publication_hash": publication["publication_hash"],
+                "published_revision": publication["published_revision"],
+            },
+            "fresh_passes": passes,
+            "outcomes": outcomes,
+            "changed_record_ids": sorted(changed_ids),
+            "remaining_current_blocker_ids": current_blocker_ids,
+        }
+        report_raw = canonical_bytes(report)
+        report_hash = object_store(p, report_raw)
+        runtime = ensure_runtime_provenance(next_state)
+        runtime["applied_migrations"].append({
+            "id": marker,
+            "helper_version": SKILL_VERSION,
+            "applied_revision": state["revision"] + 1,
+            "manifest_hash": report_hash,
+            "object_ref": f"objects/{report_hash}",
+        })
+        usage = next_state.setdefault("usage", default_usage())
+        usage.setdefault("counters", zero_usage())
+        usage.setdefault("trace", [])
+        usage.setdefault("shared_setup", zero_usage())
+        usage.setdefault("gate_costs", {f"G{i}": zero_usage() for i in range(7)})
+        delta = {field: 0 for field in USAGE_FIELDS}
+        delta["helper_calls"] = 1
+        delta["internal_publications"] = 1
+        add_usage(usage["counters"], delta)
+        usage["trace"].append({
+            "id": f"trace-{state['revision'] + 1}-helper",
+            "kind": "helper_publication",
+            "actor": "ledger-helper",
+            "subject_ref": marker,
+            "delta": delta,
+            "evidence_ref": f"objects/{report_hash}",
+            "recorded_at": now(),
+        })
+        next_state["revision"] = state["revision"] + 1
+        next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        next_state["updated_at"] = now()
+        publish(p, next_state, previous_raw, "review-currentness-migration")
+        return {
+            "migrated": True,
+            "idempotent": False,
+            "migration_id": marker,
+            "revision": next_state["revision"],
+            "report_hash": report_hash,
+            "report": report,
+        }
+
+
 def design_review_pass(state: dict[str, Any], review_kind: str) -> bool:
     publication = current_design_publication(state)
     return any(
@@ -2726,6 +3060,7 @@ def design_review_pass(state: dict[str, Any], review_kind: str) -> bool:
         and review.get("subject_fingerprint") == publication.get("publication_hash")
         and review.get("intent_revision") == publication.get("intent_revision")
         and review.get("target_revision") == publication.get("published_revision")
+        and not review.get("invalidated_by")
         for review in state.get("reviews", [])
     )
 
@@ -3127,6 +3462,7 @@ def build_parser() -> argparse.ArgumentParser:
     recover = sub.add_parser("recover"); recover.add_argument("--control-root", required=True); recover.add_argument("--run-id", required=True); recover.add_argument("--owner-token", required=True); recover.add_argument("--revision", type=int, required=True); recover.add_argument("--reason", default="recovery"); recover.add_argument("--takeover", action="store_true"); recover.add_argument("--new-owner-token", default=None); recover.add_argument("--attestation-ref", default=None)
     initial_intent = sub.add_parser("publish-intent"); initial_intent.add_argument("--control-root", required=True); initial_intent.add_argument("--run-id", required=True); initial_intent.add_argument("--owner-token", required=True); initial_intent.add_argument("--revision", type=int, required=True); initial_intent.add_argument("--intent-file", required=True); initial_intent.add_argument("--doc-id", required=True); initial_intent.add_argument("--doc-version", required=True); initial_intent.add_argument("--intent-revision", required=True)
     requirements = sub.add_parser("adopt-requirements", aliases=["publish-requirements"]); requirements.add_argument("--control-root", required=True); requirements.add_argument("--run-id", required=True); requirements.add_argument("--owner-token", required=True); requirements.add_argument("--revision", type=int, required=True); requirements.add_argument("--manifest", required=True)
+    currentness = sub.add_parser("migrate-review-currentness"); currentness.add_argument("--control-root", required=True); currentness.add_argument("--run-id", required=True); currentness.add_argument("--owner-token", required=True); currentness.add_argument("--revision", type=int, required=True)
     design = sub.add_parser("publish-design-bundle", aliases=["publish-design"]); design.add_argument("--control-root", required=True); design.add_argument("--run-id", required=True); design.add_argument("--owner-token", required=True); design.add_argument("--revision", type=int, required=True); design.add_argument("--bundle", required=True)
     amend = sub.add_parser("amend"); amend.add_argument("--control-root", required=True); amend.add_argument("--run-id", required=True); amend.add_argument("--owner-token", required=True); amend.add_argument("--revision", type=int, required=True); amend.add_argument("--intent-file", required=True); amend.add_argument("--doc-id", required=True); amend.add_argument("--doc-version", required=True); amend.add_argument("--intent-revision", required=True); amend.add_argument("--amendment-id", required=True); amend.add_argument("--authority-ref", required=True)
     usage = sub.add_parser("publish-usage"); usage.add_argument("--control-root", required=True); usage.add_argument("--run-id", required=True); usage.add_argument("--owner-token", required=True); usage.add_argument("--revision", type=int, required=True); usage.add_argument("--event-file", required=True)
@@ -3163,6 +3499,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "recover": result = cmd_recover(args)
         elif args.command == "publish-intent": result = cmd_publish_intent(args)
         elif args.command in ("adopt-requirements", "publish-requirements"): result = cmd_adopt_requirements(args)
+        elif args.command == "migrate-review-currentness": result = cmd_migrate_review_currentness(args)
         elif args.command in ("publish-design-bundle", "publish-design"): result = cmd_publish_design_bundle(args)
         elif args.command == "amend": result = cmd_amend(args)
         elif args.command == "publish-usage": result = cmd_publish_usage(args)

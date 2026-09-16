@@ -21,11 +21,30 @@ Required records are `repository/owner`, `lifecycle.next_action`, `documents/int
 
 For every mutation, the helper acquires the fixed advisory owner lock, rereads the current ledger, checks owner token/epoch and expected revision, validates the entire proposed snapshot and semantic invariants, and writes the prior valid bytes to `ledger.prev.json`. It then writes a same-directory temporary file, flushes/fsyncs, atomically replaces `ledger.json`, and syncs the directory. If the previous backup fails, no new publication is accepted. Orphan temporary files/objects are harmless and never authority. A same-byte unreferenced initial-intent document may be adopted by a retry after interruption; conflicting bytes block rather than overwrite. Generated view failure does not roll back state.
 
-`ready-ticket` atomically materializes dependency/current-publication readiness. `dispatch` publishes the route, lease, packet ref/hash, and `PREPARED` attempt before spawn. `terminate-attempt` records LOST/INTERRUPTED plus stop evidence and releases or quarantines its lease. After G1, `adopt-requirements` may publish an explicit legacy requirements/criteria manifest, and `publish-design-bundle` publishes the complete design bundle. `prepare-design-review` registers coverage or plan identity and immutable subject bindings. `validate-return` is a read-only state-bound preflight; accepted review returns release their lease in the same ingest transaction. `candidate` consumes the ingested worker return and Git operation receipt. `authorize-repair` binds a blocking finding to a changed repair contract. `integrate` accepts exact review evidence and integrity PASS, resolves the authorized repair finding, and publishes current integration. `publish-intent`, `gate`, `amend`, and `recover` are compound intent commands. `diagnose`, `brief`, and `status` are bounded reads.
+`ready-ticket` atomically materializes dependency/current-publication readiness. `dispatch` publishes the route, lease, packet ref/hash, and `PREPARED` attempt before spawn. `terminate-attempt` records LOST/INTERRUPTED plus stop evidence and releases or quarantines its lease. After G1, `adopt-requirements` may publish an explicit legacy requirements/criteria manifest, `migrate-review-currentness` may fence provably superseded legacy findings after fresh current G2/G3 PASS ingestion, and `publish-design-bundle` publishes the complete design bundle. `prepare-design-review` registers coverage or plan identity and immutable subject bindings. `validate-return` is a read-only state-bound preflight; accepted review returns release their lease in the same ingest transaction. `candidate` consumes the ingested worker return and Git operation receipt. `authorize-repair` binds a blocking finding to a changed repair contract. `integrate` accepts exact review evidence and integrity PASS, resolves the authorized repair finding, and publishes current integration. `publish-intent`, `gate`, `amend`, and `recover` are compound intent commands. `diagnose`, `brief`, and `status` are bounded reads.
 
 `init` publishes revision 0 without intent. `publish-intent` is the single-use bootstrap transaction: from PREFLIGHT/INTENT and ACTIVE/BLOCKED/RECOVERING it validates non-empty UTF-8 Markdown, owner/revision, destination, complete next ledger, and absence of any prior intent binding before installing immutable bytes and publishing the INTENT revision. Existing blocking issue refs remain blocking; a recovering run remains `RECOVERING` until reconciliation completes. Once intent exists, only `amend` may publish a later intent revision.
 
 `adopt-requirements` is the schema-1.0 compatibility publication for a nonterminal, pre-execution run. Its explicit manifest contains complete requirement↔criterion links and criterion oracles and binds the current intent revision/document/hash and owner epoch. The helper validates uniqueness, cross-links, provenance refs, status, and conflicts; stores exact bytes as `objects/<sha256>`; and atomically appends requirements, criteria, the requirements publication, and a migration record. It never infers prose. An exact retry is zero-effect; same ID with different bytes/records, active leases, prepared effects, stale fencing, or execution entry is rejected.
+
+`migrate-review-currentness` is the schema-1.0 compatibility operation for
+legacy design-review blockers that escaped publication supersession fencing.
+It requires a nonterminal run, exact owner token and current revision, plus a
+fresh registered/ingested PASS pair for both coverage and plan on the current
+publication fingerprint and subject revision. For each active blocking
+`review_finding`, it follows issue/finding source refs to exact attempts or
+reviews, joins attempt/review records through their immutable return object,
+and intersects subject ref, subject fingerprint, and subject/target revision
+against `design_publication_history`. Attempt, review, issue, or finding names
+and legacy `affected_refs` do not prove lineage. A unique current match stays
+blocking; a unique superseded/invalidated match receives only
+`invalidated_by` currentness metadata across its issue/finding/source/evidence
+closure. No content is deleted, adjudicated, or rewritten. Missing,
+conflicting, and multiple matches stay blocking and are reported precisely.
+The exact report is stored by SHA-256 and referenced from
+`runtime_provenance.applied_migrations`. A second run for the same current
+publication returns that report without changing the revision, usage, or any
+record.
 
 `publish-design-bundle` is the single publication boundary after G1. It requires
 DESIGN phase, current intent revision/document hash, all required design-stage
@@ -67,8 +86,8 @@ The helper does not call models, spawn agents, hold a daemon loop, parse prose, 
   issue/evidence closure; old records remain immutable but advisory.
 - A prepared effect with unknown result is reconciled by identity/base/tree/receipt evidence before any repeat. No exactly-once promise exists.
 - G2/G3 gate PASS requires a current `PUBLISHED` design bundle and matching
-  PASS coverage/plan review records; provisional or unpublished artifacts never
-  satisfy either gate.
+  non-invalidated PASS coverage/plan review records; provisional, historical,
+  invalidated, or unpublished artifacts never satisfy either gate.
 
 ## Objects, docs, views, and inboxes
 

@@ -46,6 +46,16 @@ intent revision/document/hash and owner epoch. This migration publication is
 hash-addressed, atomic, idempotent for the same bytes, and recorded in
 `runtime_provenance`; conflicting records or bytes block.
 
+For a legacy nonterminal run with fresh, ingested PASS coverage and plan
+reviews for the current design publication but active historical
+`review_finding` issues, do not edit JSON or replay reviews. Run
+`migrate-review-currentness` with the current owner token and ledger revision.
+It follows durable attempt/review → subject revision/fingerprint → publication
+history lineage. Record names and unversioned `affected_refs` are never proof.
+Only unambiguously superseded chains receive invalidation/provenance metadata;
+current, missing, or ambiguous lineage stays blocking. An already applied
+migration is a semantic no-op.
+
 Before a worker/reviewer publishes its final return, run the read-only
 `validate-return` against the registered attempt. Structural validation alone
 does not establish ingestability. Preserve packet `source_revision` as its

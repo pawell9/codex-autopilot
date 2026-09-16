@@ -1,6 +1,10 @@
 # Design status
 
-**CODEX-AUTOPILOT V1.0.4 — VERIFIED LIFECYCLE PATCH RELEASE.**
+**CODEX-AUTOPILOT V1.0.5 — REVIEW CURRENTNESS PATCH RELEASE.**
+
+v1.0.5 adds a bounded compatibility migration for provably superseded legacy
+design-review findings. Historical records remain audit-visible; only
+currentness metadata changes, and unresolved lineage remains blocking.
 
 The v1.0.4 state-machine audit and current release evidence are in
 [`../reports/v1.0.4-lifecycle-audit.md`](../reports/v1.0.4-lifecycle-audit.md),
