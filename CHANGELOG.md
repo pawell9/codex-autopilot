@@ -1,5 +1,18 @@
 # Changelog
 
+## [v1.0.3] — 2026-09-16
+
+Patch release for the iterative immutable design-review lifecycle.
+
+- Added append-only `design_publication_history` with current-publication
+  projection and `supersedes`/consumer fencing metadata.
+- Added the bounded BLOCK/UNVERIFIABLE DESIGN repair cycle, including PLAN →
+  DESIGN recovery, released-lease checks, fresh-review requirements, and
+  stale-review gate isolation.
+- Preserved v1.0.2 single-publication ledgers, orphan adoption, amendment
+  invalidation, and same-byte idempotent recovery.
+- Added synthetic V2 → BLOCK → V3 qualification coverage.
+
 ## [v1.0.2] — 2026-09-16
 
 Patch release for the post-G1 design publication/reviewer-registration gap.

@@ -149,6 +149,7 @@ def project_ledger(state: dict[str, Any], ledger_path: Path, raw: bytes) -> dict
         _add_concern(concerns, "tickets-missing", "В ledger отсутствует коллекция tickets; список tickets недоступен.")
 
     design_publication = state.get("design_publication")
+    design_publication_history = state.get("design_publication_history", [])
     design_review_attempts = [
         {
             "id": attempt.get("id"),
@@ -267,6 +268,7 @@ def project_ledger(state: dict[str, Any], ledger_path: Path, raw: bytes) -> dict
         "gates": gates,
         "tickets": tickets,
         "design_publication": design_publication,
+        "design_publication_history": design_publication_history,
         "design_review_attempts": design_review_attempts,
         "ticket_counts": {
             status: sum(1 for ticket in tickets if ticket.get("status") == status)

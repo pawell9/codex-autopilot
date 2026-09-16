@@ -28,8 +28,14 @@ are idempotent; conflicting bundles or canonical documents are rejected. Then
 register each independent G2 coverage or G3 plan review with
 `prepare-design-review`, including reviewer identity and role. The attempt
 binds the bundle fingerprint, artifact versions, intent revision, and
-publication revision before dispatch. G2/G3 PASS is valid only for those
-current published artifacts and registered PASS reviews.
+publication revision before dispatch. A current publication with a
+BLOCK/UNVERIFIABLE coverage or plan review may be revised only in the
+nonterminal DESIGN repair cycle. The new immutable publication is appended to
+`design_publication_history`, the old publication and its review evidence
+remain historical, and the new fingerprint requires fresh G2/G3 attempts.
+Republish is rejected after successful design gates, leaving DESIGN, or
+entering execution. G2/G3 PASS is valid only for those current published
+artifacts and registered PASS reviews.
 
 ## Read-only dashboard
 

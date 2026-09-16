@@ -70,11 +70,11 @@ class DesignPublicationTests(unittest.TestCase):
     def prepare_review(self, control: Path, packet: Path, attempt_id: str, kind: str, revision: int) -> None:
         run("prepare-design-review", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(revision), "--review-attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--packet", str(packet), "--review-kind", kind, "--reviewer-identity", "reviewer@example.invalid", "--reviewer-role", "independent-design-reviewer")
 
-    def finish_review(self, root: Path, control: Path, attempt_id: str, revision: int) -> None:
+    def finish_review(self, root: Path, control: Path, attempt_id: str, revision: int, *, verdict: str = "PASS") -> None:
         paths = ledger.paths(control, "design-run")
         state, _ = ledger.load_state(paths)
         attempt = next(item for item in state["attempts"] if item["id"] == attempt_id)
-        returned = {"identity": {"run_id": "design-run", "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": attempt["target_revision"], "intent_revision": "intent-v2"}, "subject_fingerprint": state["design_publication"]["publication_hash"], "verdict": "PASS", "coverage": [{"criterion_id": "C-1", "outcome": "fulfilled", "evidence_refs": ["EV-review"]}], "checks": [{"check_id": "design-check", "axis": attempt["mode"], "outcome": "fulfilled", "actual": "fixture", "evidence_ref": "EV-review"}], "context_refs": ["clean-design-review"], "findings": []}
+        returned = {"identity": {"run_id": "design-run", "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": attempt["target_revision"], "intent_revision": "intent-v2"}, "subject_fingerprint": state["design_publication"]["publication_hash"], "verdict": verdict, "coverage": [{"criterion_id": "C-1", "outcome": "fulfilled" if verdict == "PASS" else "unverifiable", "evidence_refs": ["EV-review"]}], "checks": [{"check_id": "design-check", "axis": attempt["mode"], "outcome": "fulfilled" if verdict == "PASS" else "not_run", "actual": "fixture", "evidence_ref": "EV-review"}], "context_refs": ["clean-design-review"], "findings": []}
         inbox = paths["scratch"] / attempt_id / "return.json"
         write_json(inbox, returned)
         run("ingest-return", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(revision), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "review")
@@ -102,6 +102,80 @@ class DesignPublicationTests(unittest.TestCase):
             self.assertEqual("PLAN", final["lifecycle"]["phase"])
             self.assertEqual({"coverage", "plan"}, {item["review_kind"] for item in final["reviews"]})
             self.assertTrue(all(item["reviewer_identity"] and item["reviewer_role"] for item in final["reviews"]))
+
+    def test_blocked_design_review_can_publish_revised_immutable_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, _ = self.setup_g1(root); bundle_v2 = self.bundle(root, control)
+            self.publish(control, bundle_v2)
+            paths = ledger.paths(control, "design-run")
+            packet = self.review_packet(root, control, "A-v2-coverage", "coverage", source_revision=3)
+            self.prepare_review(control, packet, "A-v2-coverage", "coverage", 3)
+            self.finish_review(root, control, "A-v2-coverage", 4, verdict="BLOCK")
+            blocked, _ = ledger.load_state(paths)
+            self.assertEqual("BLOCKED", blocked["lifecycle"]["control"])
+            self.assertEqual("released", next(a for a in blocked["attempts"] if a["id"] == "A-v2-coverage")["lease"]["state"])
+
+            value = json.loads(bundle_v2.read_text(encoding="utf-8"))
+            value["bundle_id"] = "B-design-v3"
+            value["version"] = "v3"
+            revised_source = root / "D-design-v3.md"
+            revised_source.write_text("# D-design-v3\n\nrevised design\n", encoding="utf-8")
+            value["documents"][0] = {**value["documents"][0], "id": "D-design-v3", "version": "v3", "source": str(revised_source), "hash": ledger.sha256_file(revised_source)}
+            bundle_v3 = root / "B-design-v3.json"; write_json(bundle_v3, value)
+            published = json.loads(self.publish(control, bundle_v3, revision=5).stdout)
+            self.assertFalse(published["idempotent"])
+            self.assertEqual(6, published["revision"])
+
+            state, _ = ledger.load_state(paths)
+            history = state["design_publication_history"]
+            self.assertEqual(["B-design-v1", "B-design-v3"], [item["id"] for item in history])
+            self.assertEqual("SUPERSEDED", history[0]["status"])
+            self.assertEqual("B-design-v3", history[0]["superseded_by"])
+            self.assertEqual("PUBLISHED", state["design_publication"]["status"])
+            self.assertEqual("B-design-v3", state["design_publication"]["id"])
+            self.assertEqual("ACTIVE", state["lifecycle"]["control"])
+            self.assertEqual("BLOCK", state["reviews"][0]["verdict"])
+            self.assertFalse([issue for issue in state.get("issues", []) if issue.get("impact") == "blocking"])
+            retry = json.loads(self.publish(control, bundle_v3, revision=5).stdout)
+            self.assertTrue(retry["idempotent"])
+            self.assertEqual(2, len(ledger.load_state(paths)[0]["design_publication_history"]))
+
+            fresh_packet = self.review_packet(root, control, "A-v3-coverage", "coverage", source_revision=6)
+            self.prepare_review(control, fresh_packet, "A-v3-coverage", "coverage", 6)
+            self.finish_review(root, control, "A-v3-coverage", 7)
+            state, _ = ledger.load_state(paths)
+            self.assertEqual("B-design-v3", state["design_publication"]["id"])
+            self.assertTrue(ledger.design_review_pass(state, "coverage"))
+            self.assertEqual(2, len({item["subject_fingerprint"] for item in state["reviews"]}))
+            run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "ACTIVE", "--next-action", "g2_pass")
+
+    def test_plan_block_returns_to_design_for_republish_but_execution_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, _ = self.setup_g1(root); bundle_v2 = self.bundle(root, control)
+            self.publish(control, bundle_v2)
+            packet = self.review_packet(root, control, "A-coverage", "coverage", source_revision=3)
+            self.prepare_review(control, packet, "A-coverage", "coverage", 3); self.finish_review(root, control, "A-coverage", 4)
+            paths = ledger.paths(control, "design-run"); state, _ = ledger.load_state(paths)
+            run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "PLAN", "--control", "BLOCKED", "--reason", "plan_review_block", "--next-action", "plan-review")
+            state, _ = ledger.load_state(paths)
+            packet = self.review_packet(root, control, "A-plan-block", "plan", source_revision=state["revision"])
+            self.prepare_review(control, packet, "A-plan-block", "plan", state["revision"])
+            self.finish_review(root, control, "A-plan-block", state["revision"] + 1, verdict="BLOCK")
+            state, _ = ledger.load_state(paths)
+            run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "BLOCKED", "--reason", "design_revision_required", "--next-action", "publish-design-bundle")
+            state, _ = ledger.load_state(paths)
+            self.assertEqual("DESIGN", state["lifecycle"]["phase"])
+            value = json.loads(bundle_v2.read_text(encoding="utf-8")); value["bundle_id"] = "B-design-v3"; value["version"] = "v3"
+            revised_source = root / "D-design-v3.md"; revised_source.write_text("# revised\n", encoding="utf-8")
+            value["documents"][0] = {**value["documents"][0], "id": "D-design-v3", "version": "v3", "source": str(revised_source), "hash": ledger.sha256_file(revised_source)}
+            bundle_v3 = root / "B-design-v3.json"; write_json(bundle_v3, value)
+            self.publish(control, bundle_v3, revision=state["revision"])
+            state, _ = ledger.load_state(paths)
+            state["lifecycle"]["phase"] = "EXECUTE"; state["lifecycle"]["control"] = "BLOCKED"; state["lifecycle"]["reason"] = "implementation_block"
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            value["bundle_id"] = "B-design-v4"; value["version"] = "v4"; bundle_v4 = root / "B-design-v4.json"; write_json(bundle_v4, value)
+            rejected = self.publish(control, bundle_v4, revision=state["revision"], expect=2)
+            self.assertIn("DESIGN", rejected.stderr)
 
     def test_failure_safety_and_conflict_rejection(self) -> None:
         cases = ("missing", "malformed", "stale", "wrong-owner", "wrong-epoch", "traversal", "partial", "canonical-conflict")

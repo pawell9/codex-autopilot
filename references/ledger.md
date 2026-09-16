@@ -34,6 +34,16 @@ the ledger is unchanged on every rejected input. Existing same-byte documents
 are adopted, same-byte publication retries are idempotent, and conflicting
 bundle/document bytes are never overwritten. `amend` marks the publication and
 its consumers invalidated, so old design reviews cannot satisfy the new intent.
+After a current coverage or plan review returns BLOCK/UNVERIFIABLE, a
+nonterminal DESIGN run may publish a new bundle version when all
+owner/epoch/revision/intent and lease fences still match. The old publication
+is retained in append-only `design_publication_history` with `SUPERSEDED`
+status and consumer refs; the new record is appended and becomes the current
+projection. Reviews, findings, and evidence retain their exact historical
+fingerprints, while G2/G3 only accept PASS reviews matching the new current
+fingerprint. A PLAN review repair may explicitly return to DESIGN while
+blocked; republish is rejected after a successful design gate or once
+execution has begun.
 
 The helper does not call models, spawn agents, hold a daemon loop, parse prose, or make substantive review decisions. It may validate a receipt from an approved native Git operation; it must not bypass approval by becoming an opaque shell wrapper.
 
@@ -59,6 +69,6 @@ An attempt inbox is exact, regular, non-symlink, bounded, and registered before 
 
 `ledger.prev.json` is the last valid publication. Recovery snapshots are selected copies at gates and before dangerous effects; retain the last eight unpinned snapshots plus pinned unresolved-operation/recovery/terminal-acceptance snapshots. Never prune referenced evidence/docs/packets or unresolved receipts, and never prune during corrupt-state diagnosis.
 
-Owner takeover and checkout reuse are separate. Increment epoch only after planned handoff or explicit user attestation of old session and background-writer closure, plus available corroborating observations. Quarantine leases until all known writing activity is stopped and bounded process/checkout observations agree. Epoch does not stop processes. Then audit actual state, invalidate affected facts/gates, and publish the earliest safe next action. A crash after design documents are installed but before the ledger publication leaves only an orphan; resume retries the same bundle and adopts same bytes or reports a conflict. A crash after publication but before reviewer registration leaves a valid published bundle with the durable `prepare_g2_coverage_review` next action; resume registers the review against that exact revision. An unknown schema is read-only migration diagnosis.
+Owner takeover and checkout reuse are separate. Increment epoch only after planned handoff or explicit user attestation of old session and background-writer closure, plus available corroborating observations. Quarantine leases until all known writing activity is stopped and bounded process/checkout observations agree. Epoch does not stop processes. Then audit actual state, invalidate affected facts/gates, and publish the earliest safe next action. A crash after design documents are installed but before the ledger publication leaves only an orphan; resume retries the same bundle and adopts same bytes or reports a conflict. A crash after a revised publication commits but the response is lost, retrying the exact same bytes adopts the current publication without appending duplicate history. A crash after publication but before reviewer registration leaves a valid published bundle with the durable `prepare_g2_coverage_review` next action; resume registers the review against that exact revision. An unknown schema is read-only migration diagnosis.
 
 **Completion:** each publication is lock-protected, revision/epoch-checked, schema/semantic-valid, atomically durable, and reconstructible from files plus Git; every uncertain effect has a quarantine/next action rather than a duplicate execution.

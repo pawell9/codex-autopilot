@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.2"
+SKILL_VERSION = "1.0.3"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -330,10 +330,22 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
                     fail(f"duplicate immutable ID: {item['id']}")
                 ids.add(item["id"])
     publication = state.get("design_publication")
+    history = state.get("design_publication_history", [])
+    history_ids: set[str] = set()
+    for historical in history:
+        if historical["id"] in history_ids or historical["id"] in ids:
+            fail(f"duplicate immutable design publication ID: {historical['id']}")
+        history_ids.add(historical["id"])
+        ids.add(historical["id"])
     if publication:
-        if publication["id"] in ids:
+        if publication["id"] in ids and publication["id"] not in history_ids:
             fail(f"duplicate immutable ID: {publication['id']}")
-        ids.add(publication["id"])
+        if publication["id"] in history_ids:
+            latest = history[-1] if history else None
+            if latest is None or latest != publication:
+                fail("current design publication does not match the latest history item")
+        else:
+            ids.add(publication["id"])
     ticket_ids = {item["id"] for item in state.get("tickets", [])}
     criterion_ids = {item["id"] for item in state.get("criteria", [])}
     requirement_ids = {item["id"] for item in state.get("requirements", [])}
@@ -366,6 +378,32 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
                 path = Path(document["path"])
                 if verify_files and (not path.exists() or path.is_symlink() or not path.is_file() or sha256_file(path) != document["hash"]):
                     fail(f"published design document is unavailable or drifted: {document['id']}")
+    for historical in history:
+        if historical["bundle_ref"] != f"objects/{historical['publication_hash']}":
+            fail(f"design publication history bundle reference does not match its fingerprint: {historical['id']}")
+        refs = set(historical["document_refs"])
+        if not refs or not refs.issubset(document_ids):
+            fail("design publication history references an unknown document")
+        if not set(historical["contract_refs"]).issubset({item["id"] for item in state.get("contracts", [])}):
+            fail("design publication history references an unknown contract")
+        if not set(historical["ticket_refs"]).issubset({item["id"] for item in state.get("tickets", [])}):
+            fail("design publication history references an unknown ticket")
+        if not set(historical["route_refs"]).issubset({item["id"] for item in state.get("routes", [])}):
+            fail("design publication history references an unknown route")
+        if verify_files:
+            for document in state.get("documents", []):
+                if document["id"] in refs:
+                    path = Path(document["path"])
+                    if not path.exists() or path.is_symlink() or not path.is_file() or sha256_file(path) != document["hash"]:
+                        fail(f"historical design document is unavailable or drifted: {document['id']}")
+    publication_records = history or ([publication] if publication else [])
+    for record in publication_records:
+        if record["bundle_ref"] != f"objects/{record['publication_hash']}":
+            fail(f"design publication bundle reference does not match its fingerprint: {record['id']}")
+        if verify_files:
+            object_path = Path(state["repository"]["control_root"]) / ".autopilot" / "runs" / state["run_id"] / record["bundle_ref"]
+            if not object_path.exists() or object_path.is_symlink() or not object_path.is_file() or sha256_file(object_path) != record["publication_hash"]:
+                fail(f"design publication bundle object is unavailable or drifted: {record['id']}")
     for requirement in state.get("requirements", []):
         if any(ref not in criterion_ids for ref in requirement.get("criterion_refs", [])):
             fail(f"requirement references unknown criterion: {requirement['id']}")
@@ -970,7 +1008,7 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         usage = copy.deepcopy(state.get("usage", default_usage()))
         binding = {"revision": state.get("intent", {}).get("current_revision"), "document_ref": state.get("intent", {}).get("document_ref"), "document_hash": state.get("intent", {}).get("document_hash")}
         settings = resolved_run_settings(state)
-        brief = {"run_id": state["run_id"], "revision": state["revision"], "phase": lifecycle["phase"], "control": lifecycle["control"], "reason": lifecycle.get("reason"), "next_action": lifecycle["next_action"], "run_settings": settings, "preset_display": run_settings_display(settings), "issues": [i["id"] for i in state.get("issues", []) if i.get("impact") == "blocking"], "findings": [f["id"] for f in state.get("findings", [])], "reviews": [{"id": r.get("id"), "subject": r.get("subject_fingerprint"), "verdict": r.get("verdict"), "review_kind": r.get("review_kind"), "reviewer_identity": r.get("reviewer_identity"), "reviewer_role": r.get("reviewer_role"), "finding_refs": r.get("finding_refs", [])} for r in state.get("reviews", [])], "design_publication": state.get("design_publication"), "design_review_attempts": [{"id": a.get("id"), "kind": a.get("mode"), "state": a.get("state"), "result": a.get("review_result"), "reviewer_identity": a.get("reviewer_identity"), "reviewer_role": a.get("reviewer_role")} for a in state.get("attempts", []) if a.get("mode") in ("coverage", "plan")], "adjudications": [d.get("id") for d in state.get("decisions", []) if d.get("type") == "reviewer_adjudication"], "intent": binding, "consumer_invalidation_count": len(state.get("invalidations", [])), "usage": usage, "evidence_count": len(state.get("evidence", [])), "ledger_bytes": len(raw), "ledger_hash": sha256_bytes(raw)}
+        brief = {"run_id": state["run_id"], "revision": state["revision"], "phase": lifecycle["phase"], "control": lifecycle["control"], "reason": lifecycle.get("reason"), "next_action": lifecycle["next_action"], "run_settings": settings, "preset_display": run_settings_display(settings), "issues": [i["id"] for i in state.get("issues", []) if i.get("impact") == "blocking"], "findings": [f["id"] for f in state.get("findings", [])], "reviews": [{"id": r.get("id"), "subject": r.get("subject_fingerprint"), "verdict": r.get("verdict"), "review_kind": r.get("review_kind"), "reviewer_identity": r.get("reviewer_identity"), "reviewer_role": r.get("reviewer_role"), "finding_refs": r.get("finding_refs", [])} for r in state.get("reviews", [])], "design_publication": state.get("design_publication"), "design_publication_history": state.get("design_publication_history", []), "design_review_attempts": [{"id": a.get("id"), "kind": a.get("mode"), "state": a.get("state"), "result": a.get("review_result"), "reviewer_identity": a.get("reviewer_identity"), "reviewer_role": a.get("reviewer_role")} for a in state.get("attempts", []) if a.get("mode") in ("coverage", "plan")], "adjudications": [d.get("id") for d in state.get("decisions", []) if d.get("type") == "reviewer_adjudication"], "intent": binding, "consumer_invalidation_count": len(state.get("invalidations", [])), "usage": usage, "evidence_count": len(state.get("evidence", [])), "ledger_bytes": len(raw), "ledger_hash": sha256_bytes(raw)}
         brief["usage"]["counters"]["brief_bytes"] = len(canonical_bytes(brief))
         return brief
     settings = resolved_run_settings(state)
@@ -1087,6 +1125,10 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         target["return_ref"] = f"objects/{digest}"
         if args.kind == "review" and target.get("mode") in ("coverage", "plan"):
             target["review_result"] = payload.get("verdict")
+            # A returned design reviewer has stopped writing.  Release its
+            # lease so a BLOCK/UNVERIFIABLE result can enter the repair cycle.
+            if target.get("lease", {}).get("state") == "active":
+                target["lease"]["state"] = "released"
         target["finding_refs"] = append_review_findings(next_state, payload, args.attempt_id, digest)
         write_set_violations = worker_return_write_set_violations(payload, attempt.get("lease", {})) if args.kind == "worker" else []
         if write_set_violations:
@@ -1123,7 +1165,7 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
             prior = [item for item in next_state.get("reviews", []) if item.get("subject_fingerprint") == payload.get("subject_fingerprint")]
             verdicts = {item.get("verdict") for item in prior}
             if len(verdicts) > 1:
-                disagreement = append_issue(next_state, {"id": f"disagreement-{digest[:12]}", "type": "reviewer_disagreement", "cause": "oracle", "impact": "blocking", "affected_refs": [target.get("subject_ref"), *[item.get("id") for item in prior]], "expected": "reviewers agree or adjudication is recorded", "actual": sorted(str(item) for item in verdicts), "disposition": "adjudication required", "resolution_condition": "durable adjudication decision"}, source_ref=review_id)
+                disagreement = append_issue(next_state, {"id": f"disagreement-{digest[:12]}", "type": "reviewer_disagreement", "cause": "oracle", "impact": "blocking", "affected_refs": [target.get("subject_ref"), *[item.get("id") for item in prior]], "expected": "reviewers agree or adjudication is recorded", "actual": json.dumps(sorted(str(item) for item in verdicts)), "disposition": "adjudication required", "resolution_condition": "durable adjudication decision"}, source_ref=review_id)
                 next_state["lifecycle"]["control"] = "BLOCKED"
                 next_state["lifecycle"]["reason"] = "reviewer_disagreement"
                 next_state["lifecycle"]["issue_refs"] = sorted(set(next_state["lifecycle"].get("issue_refs", []) + [disagreement]))
@@ -1389,8 +1431,8 @@ def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
     packet_hash = object_store(p, packet_path.read_bytes())
 
     def change(state: dict[str, Any]) -> None:
-        if state["lifecycle"]["phase"] != "DESIGN":
-            fail("design review preparation requires DESIGN phase")
+        if state["lifecycle"]["phase"] != "DESIGN" and not (args.review_kind == "plan" and state["lifecycle"]["phase"] == "PLAN"):
+            fail("design review preparation requires DESIGN phase (or PLAN for a plan review)")
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
             fail("terminal run is immutable; start a successor run")
         publication = current_design_publication(state)
@@ -2046,6 +2088,90 @@ def current_design_publication(state: dict[str, Any]) -> dict[str, Any]:
     return publication
 
 
+def design_publication_history(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return publication history, presenting a legacy current record as item one."""
+    history = state.get("design_publication_history")
+    if isinstance(history, list) and history:
+        return history
+    publication = state.get("design_publication")
+    return [copy.deepcopy(publication)] if isinstance(publication, dict) else []
+
+
+def design_publication_requires_revision(state: dict[str, Any], publication: dict[str, Any]) -> bool:
+    fingerprint = publication.get("publication_hash")
+    publication_id = publication.get("id")
+    blocked_reviews = {
+        "BLOCK", "UNVERIFIABLE"
+    }
+    if any(
+        review.get("subject_fingerprint") == fingerprint
+        and review.get("verdict") in blocked_reviews
+        and review.get("review_kind") in ("coverage", "plan")
+        for review in state.get("reviews", [])
+    ):
+        return True
+    if any(
+        attempt.get("subject_ref") == publication_id
+        and attempt.get("subject_fingerprint") == fingerprint
+        and attempt.get("review_result") in blocked_reviews
+        and attempt.get("mode") in ("coverage", "plan")
+        for attempt in state.get("attempts", [])
+    ):
+        return True
+    return state.get("lifecycle", {}).get("control") == "BLOCKED" and state.get("lifecycle", {}).get("reason") in {
+        "review_not_pass", "design_review_blocked", "design_review_unverifiable", "design_revision_required"
+    }
+
+
+def active_publication_leases(state: dict[str, Any]) -> list[str]:
+    return [
+        attempt.get("id", "unknown")
+        for attempt in state.get("attempts", [])
+        if attempt.get("state") in ("PREPARED", "DISPATCHED")
+        or attempt.get("lease", {}).get("state") in ("active", "quarantined")
+    ]
+
+
+def publication_consumer_refs(state: dict[str, Any], publication: dict[str, Any]) -> list[str]:
+    subjects = {publication.get("id"), *publication.get("document_refs", []), *publication.get("contract_refs", []), *publication.get("ticket_refs", []), *publication.get("route_refs", [])}
+    refs = set(item for item in subjects if item)
+    for collection in ("attempts", "reviews", "findings", "evidence"):
+        for item in state.get(collection, []):
+            if item.get("subject_ref") in subjects or item.get("subject") in subjects or item.get("subject_fingerprint") == publication.get("publication_hash") or item.get("source_ref") in subjects:
+                if item.get("id"):
+                    refs.add(item["id"])
+    return sorted(refs)
+
+
+def supersede_design_publication(next_state: dict[str, Any], previous: dict[str, Any], replacement_id: str) -> None:
+    """Keep old publication/review bytes intact while fencing their consumers."""
+    old_id = previous["id"]
+    history = next_state.setdefault("design_publication_history", [])
+    old_history = next((item for item in history if item.get("id") == old_id), None)
+    if old_history is None:
+        old_history = copy.deepcopy(previous)
+        history.append(old_history)
+    old_history["status"] = "SUPERSEDED"
+    old_history["superseded_by"] = replacement_id
+    if replacement_id not in old_history.setdefault("invalidated_by", []):
+        old_history["invalidated_by"].append(replacement_id)
+    consumers = publication_consumer_refs(next_state, previous)
+    old_history["consumer_refs"] = consumers
+    for issue in next_state.get("issues", []):
+        if issue.get("id") in next_state.get("lifecycle", {}).get("issue_refs", []) and (
+            issue.get("type") in ("review_verdict", "review_finding") or old_id in issue.get("affected_refs", []) or issue.get("source_ref") in consumers
+        ):
+            issue["impact"] = "advisory"
+            issue["disposition"] = "historical evidence; superseded by revised design publication"
+    next_state["lifecycle"]["issue_refs"] = [
+        ref for ref in next_state["lifecycle"].get("issue_refs", [])
+        if next((item for item in next_state.get("issues", []) if item.get("id") == ref), {}).get("impact") == "blocking"
+    ]
+    if next_state["lifecycle"].get("control") == "BLOCKED" and not any(item.get("impact") == "blocking" for item in next_state.get("issues", [])):
+        next_state["lifecycle"]["control"] = "ACTIVE"
+        next_state["lifecycle"]["reason"] = "revised_design_published"
+
+
 def design_review_pass(state: dict[str, Any], review_kind: str) -> bool:
     publication = current_design_publication(state)
     return any(
@@ -2073,6 +2199,12 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
         state, previous_raw = load_state(p)
         if state["owner"]["token"] != args.owner_token:
             fail("owner token mismatch; stale orchestrator is fenced")
+        existing = state.get("design_publication")
+        # A response can be lost after the ledger commit.  If the exact
+        # immutable publication is already current, adopting it is safe even
+        # when the caller retries with the pre-commit revision.
+        if existing and existing.get("status") == "PUBLISHED" and existing.get("publication_hash") == bundle_hash and existing.get("id") == bundle["bundle_id"]:
+            return {"published": True, "idempotent": True, "bundle_id": bundle["bundle_id"], "publication_hash": bundle_hash, "revision": state["revision"], "next_action": state["lifecycle"]["next_action"]}
         if state["revision"] != args.revision:
             fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
@@ -2084,11 +2216,16 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
             fail("design bundle epoch does not match current owner")
         if (bundle["intent_revision"], bundle["intent_document_ref"], bundle["intent_document_hash"]) != (binding["revision"], binding["document_ref"], binding["document_hash"]):
             fail("design bundle is bound to a stale intent")
-        existing = state.get("design_publication")
         if existing:
-            if existing.get("publication_hash") != bundle_hash:
-                fail("conflicting design bundle is already published")
-            return {"published": True, "idempotent": True, "bundle_id": bundle["bundle_id"], "publication_hash": bundle_hash, "revision": state["revision"], "next_action": state["lifecycle"]["next_action"]}
+            if state["lifecycle"]["phase"] != "DESIGN":
+                fail("design republish is only legal during DESIGN")
+            if not design_publication_requires_revision(state, existing):
+                fail("conflicting design bundle is already published; current publication does not have an eligible BLOCK/UNVERIFIABLE repair transition")
+            active = active_publication_leases(state)
+            if active:
+                fail(f"design republish requires stopped writers/reviewers and released leases: {', '.join(active)}")
+            if bundle["version"] == existing.get("version"):
+                fail("revised design publication requires a new bundle version")
 
         collections = {collection: {item.get("id"): item for item in state.get(collection, [])} for collection in ("documents", "contracts", "tickets", "routes")}
         occupied = {item.get("id") for collection in state.values() if isinstance(collection, list) for item in collection if isinstance(item, dict) and item.get("id")}
@@ -2102,6 +2239,9 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
                 if record["id"] in occupied and (existing_record is None or existing_record != record and collection_name != "documents"):
                     fail(f"design bundle ID conflicts with an existing immutable ID: {record['id']}")
         next_state = copy.deepcopy(state)
+        prior_publication = copy.deepcopy(existing) if existing else None
+        if prior_publication:
+            supersede_design_publication(next_state, prior_publication, bundle["bundle_id"])
         next_state.setdefault("documents", [])
         for document in bundle["documents"]:
             canonical = {"id": document["id"], "version": document["version"], "path": str(canonical_document_path(p, document["id"], document["version"])), "hash": document["hash"], "kind": document["kind"], "section_anchors": document.get("section_anchors", [])}
@@ -2131,12 +2271,16 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
                 fail(f"design ticket references an unknown dependency: {ticket['id']}")
 
         document_refs = [item["id"] for item in bundle["documents"]]
-        next_state["design_publication"] = {
+        new_publication = {
             "id": bundle["bundle_id"], "version": bundle["version"], "status": "PUBLISHED", "owner_epoch": state["owner"]["epoch"],
             "intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"],
             "publication_hash": bundle_hash, "bundle_ref": f"objects/{bundle_hash}", "published_revision": state["revision"] + 1,
             "document_refs": document_refs, "contract_refs": [item["id"] for item in bundle["contracts"]], "ticket_refs": [item["id"] for item in bundle["tickets"]], "route_refs": [item["id"] for item in bundle["routes"]],
         }
+        if prior_publication:
+            new_publication["supersedes"] = [prior_publication["id"]]
+        next_state["design_publication"] = new_publication
+        next_state.setdefault("design_publication_history", []).append(copy.deepcopy(new_publication))
         if state["lifecycle"]["control"] == "BLOCKED" and state["lifecycle"].get("reason") in ("missing_design_publication", "design_publication_required", "design_artifacts_unpublished", "publication_gap"):
             publication_blockers = set(state["lifecycle"].get("issue_refs", []))
             unrelated_blockers = [issue for issue in state.get("issues", []) if issue.get("id") in publication_blockers and issue.get("type") not in ("design_publication_gap", "missing_design_publication")]
@@ -2206,9 +2350,17 @@ def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
                     if "invalidated_by" in item or collection in {"documents", "requirements", "criteria", "contracts", "decisions", "tickets", "attempts", "issues", "findings", "reviews", "acceptance", "operations", "capabilities", "routes", "evidence"}:
                         item.setdefault("invalidated_by", []).append(args.amendment_id)
         if state.get("design_publication"):
-            state["design_publication"].setdefault("invalidated_by", []).append(args.amendment_id)
-            state["design_publication"]["status"] = "INVALIDATED"
-            consumer_refs.append(state["design_publication"]["id"])
+            current_publication = state["design_publication"]
+            history = state.setdefault("design_publication_history", [])
+            if not any(item.get("id") == current_publication.get("id") for item in history):
+                history.append(copy.deepcopy(current_publication))
+            for publication in history:
+                if publication.get("id") == current_publication.get("id"):
+                    publication.setdefault("invalidated_by", []).append(args.amendment_id)
+                    publication["status"] = "INVALIDATED"
+            current_publication.setdefault("invalidated_by", []).append(args.amendment_id)
+            current_publication["status"] = "INVALIDATED"
+            consumer_refs.append(current_publication["id"])
         state.setdefault("invalidations", []).append({"id": f"invalidation-{args.amendment_id}", "amendment_ref": args.amendment_id, "intent_revision": args.intent_revision, "previous_intent_revision": old_binding["revision"], "previous_document_ref": old_binding["document_ref"], "previous_document_hash": old_binding["document_hash"], "affected_refs": [old_binding["document_ref"], doc_id], "consumer_refs": sorted(set(consumer_refs)), "recorded_at": now()})
         state["intent"] = {"current_revision": args.intent_revision, "document_ref": doc_id, "document_hash": digest, "approved_amendments": [*state.get("intent", {}).get("approved_amendments", []), args.amendment_id], "acceptance_policy": state.get("intent", {}).get("acceptance_policy", "automatic"), "checkpoint_policy": state.get("intent", {}).get("checkpoint_policy", "gate"), "prior_accepted_refs": state.get("intent", {}).get("prior_accepted_refs", [])}
         for ticket in state.get("tickets", []):
@@ -2269,7 +2421,16 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
                 fail("G3 cannot pass without a PASS plan review of the published design bundle")
         current_index = PHASES.index(current_phase)
         requested_index = PHASES.index(phase)
-        if requested_index not in (current_index, current_index + 1):
+        design_repair_return = (
+            phase == "DESIGN"
+            and current_phase == "PLAN"
+            and current_control == "BLOCKED"
+            and isinstance(state.get("design_publication"), dict)
+            and design_publication_requires_revision(state, state["design_publication"])
+        )
+        if design_repair_return and active_publication_leases(state):
+            fail("DESIGN repair transition requires stopped writers/reviewers and released leases")
+        if requested_index not in (current_index, current_index + 1) and not design_repair_return:
             fail(f"illegal phase jump: {current_phase} -> {phase}")
         if control == "ACCEPTED" and not any(a.get("verdict") == "PASS" for a in state.get("acceptance", [])):
             fail("G6 cannot mark ACCEPTED without G5 PASS")

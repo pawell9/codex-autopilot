@@ -19,6 +19,12 @@ publication revision. A crash after design publication but before registration
 leaves the bundle durable and the next action explicitly at reviewer
 registration; resume/retry registers the same target or rejects a conflict.
 
+If the plan review returns BLOCK/UNVERIFIABLE, stop and release the reviewer
+lease, then use the explicit blocked PLAN → DESIGN repair transition. A revised
+immutable design publication is append-only and invalidates the prior
+publication's consumers; the new publication must receive fresh coverage and
+plan reviews before G2/G3 can pass.
+
 Plan review is required for elevated/critical work and can be combined with G2 only on an unchanged compact artifact with separate outcomes. The plan is ready when:
 
 - the DAG is acyclic and each ticket has a current criterion/oracle owner;

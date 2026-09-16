@@ -17,7 +17,13 @@ documents or ledger records in one `publish-design-bundle` transaction. The
 bundle is bound to the current intent revision and owner epoch. A same-byte
 retry adopts an orphaned canonical document after a crash; a conflicting byte,
 missing source, traversal path, stale revision, or partial bundle leaves the
-ledger unchanged. The transaction's next action is the only route to G2.
+ledger unchanged. If coverage or plan review returns BLOCK/UNVERIFIABLE, a
+nonterminal run may return to DESIGN and publish a new bundle version. The
+prior publication remains in append-only `design_publication_history` with its
+review evidence and consumer fencing; the new publication becomes current and
+requires fresh reviews. No active writer/reviewer lease may remain, and this
+repair route is unavailable after successful design gates or execution begins.
+The transaction's next action is the only route to G2.
 
 Register the coverage reviewer with `prepare-design-review --review-kind
 coverage --reviewer-identity ... --reviewer-role ...`. This durable attempt
