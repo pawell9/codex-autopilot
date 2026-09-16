@@ -19,6 +19,18 @@ The orchestrator owns the run ledger, canonical Markdown revisions, routing, pac
 
 For a new run, `init` creates revision 0 and `publish-intent` atomically binds the first canonical intent as revision 1 before G1 work continues. `publish-intent` is valid exactly once; use `amend` only after that binding exists. On resume, a nonterminal legacy or blocked run without `intent` publishes its existing authorized intent through this command instead of editing the ledger or starting a successor run.
 
+After G1, publish a complete `design_bundle` containing the versioned design,
+interfaces/contracts, manifest, implementation plan, tickets, routes, and
+dependency bindings with `tools/ledger.py publish-design-bundle`. The
+owner/epoch/revision-fenced transaction validates every source and the complete
+proposed ledger before making any canonical binding visible. Same-byte retries
+are idempotent; conflicting bundles or canonical documents are rejected. Then
+register each independent G2 coverage or G3 plan review with
+`prepare-design-review`, including reviewer identity and role. The attempt
+binds the bundle fingerprint, artifact versions, intent revision, and
+publication revision before dispatch. G2/G3 PASS is valid only for those
+current published artifacts and registered PASS reviews.
+
 ## Read-only dashboard
 
 `tools/dashboard.py` serves a local read-only projection of the selected current `.autopilot/runs/<run-id>/ledger.json`. It reloads that ledger on refresh/auto-refresh, exposes no state mutation endpoint, and does not create a second state store. Missing ledger facts are shown as `CONCERN`; lifecycle, routing, contracts, safety, Git, and G0–G6 remain authoritative.

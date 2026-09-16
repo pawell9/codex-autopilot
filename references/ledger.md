@@ -21,9 +21,19 @@ Required records are `repository/owner`, `lifecycle.next_action`, `documents/int
 
 For every mutation, the helper acquires the fixed advisory owner lock, rereads the current ledger, checks owner token/epoch and expected revision, validates the entire proposed snapshot and semantic invariants, and writes the prior valid bytes to `ledger.prev.json`. It then writes a same-directory temporary file, flushes/fsyncs, atomically replaces `ledger.json`, and syncs the directory. If the previous backup fails, no new publication is accepted. Orphan temporary files/objects are harmless and never authority. A same-byte unreferenced initial-intent document may be adopted by a retry after interruption; conflicting bytes block rather than overwrite. Generated view failure does not roll back state.
 
-`dispatch` publishes a valid READY check, route, lease, packet ref/hash, and `PREPARED` attempt before spawn. `candidate` ingests a matching worker return, records handle/stop/write audit, and accepts an orchestrator-supplied Git receipt before freezing a candidate and preparing review. `integrate` ingests exact review evidence, verifies integrity and PASS, then publishes current integration and next action. `publish-intent`, `gate`, `amend`, and `recover` are compound intent commands. `brief` and `status` are bounded reads.
+`dispatch` publishes a valid READY check, route, lease, packet ref/hash, and `PREPARED` attempt before spawn. After G1, `publish-design-bundle` validates and publishes the complete design-stage artifact/record bundle under the same lock, binds it to current intent, and records its immutable publication fingerprint/revision. `prepare-design-review` then registers a coverage or plan reviewer with identity, role, target artifact versions, epoch, and publication revision before dispatch; the normal review ingest records the result. `candidate` ingests a matching worker return, records handle/stop/write audit, and accepts an orchestrator-supplied Git receipt before freezing a candidate and preparing review. `integrate` ingests exact review evidence, verifies integrity and PASS, then publishes current integration and next action. `publish-intent`, `gate`, `amend`, and `recover` are compound intent commands. `brief` and `status` are bounded reads.
 
 `init` publishes revision 0 without intent. `publish-intent` is the single-use bootstrap transaction: from PREFLIGHT/INTENT and ACTIVE/BLOCKED/RECOVERING it validates non-empty UTF-8 Markdown, owner/revision, destination, complete next ledger, and absence of any prior intent binding before installing immutable bytes and publishing the INTENT revision. Existing blocking issue refs remain blocking; a recovering run remains `RECOVERING` until reconciliation completes. Once intent exists, only `amend` may publish a later intent revision.
+
+`publish-design-bundle` is the single publication boundary after G1. It requires
+DESIGN phase, current intent revision/document hash, all required design-stage
+artifact kinds, valid structured contracts/tickets/routes, an acyclic dependency
+graph, and regular non-symlink UTF-8 sources with matching hashes. The helper
+validates the complete proposed snapshot before installing canonical documents;
+the ledger is unchanged on every rejected input. Existing same-byte documents
+are adopted, same-byte publication retries are idempotent, and conflicting
+bundle/document bytes are never overwritten. `amend` marks the publication and
+its consumers invalidated, so old design reviews cannot satisfy the new intent.
 
 The helper does not call models, spawn agents, hold a daemon loop, parse prose, or make substantive review decisions. It may validate a receipt from an approved native Git operation; it must not bypass approval by becoming an opaque shell wrapper.
 
@@ -35,6 +45,9 @@ The helper does not call models, spawn agents, hold a daemon loop, parse prose, 
 - Ticket dependencies must be current reviewed `INTEGRATED` outcomes. DAG validation rejects cycles. Active/quarantined leases and stale epochs cannot be reused.
 - A return is accepted only when attempt, packet hash, contract versions, owner epoch, subject fingerprint, and lease match. Late/stale payloads remain evidence without authority.
 - A prepared effect with unknown result is reconciled by identity/base/tree/receipt evidence before any repeat. No exactly-once promise exists.
+- G2/G3 gate PASS requires a current `PUBLISHED` design bundle and matching
+  PASS coverage/plan review records; provisional or unpublished artifacts never
+  satisfy either gate.
 
 ## Objects, docs, views, and inboxes
 
@@ -46,6 +59,6 @@ An attempt inbox is exact, regular, non-symlink, bounded, and registered before 
 
 `ledger.prev.json` is the last valid publication. Recovery snapshots are selected copies at gates and before dangerous effects; retain the last eight unpinned snapshots plus pinned unresolved-operation/recovery/terminal-acceptance snapshots. Never prune referenced evidence/docs/packets or unresolved receipts, and never prune during corrupt-state diagnosis.
 
-Owner takeover and checkout reuse are separate. Increment epoch only after planned handoff or explicit user attestation of old session and background-writer closure, plus available corroborating observations. Quarantine leases until all known writing activity is stopped and bounded process/checkout observations agree. Epoch does not stop processes. Then audit actual state, invalidate affected facts/gates, and publish the earliest safe next action. An unknown schema is read-only migration diagnosis.
+Owner takeover and checkout reuse are separate. Increment epoch only after planned handoff or explicit user attestation of old session and background-writer closure, plus available corroborating observations. Quarantine leases until all known writing activity is stopped and bounded process/checkout observations agree. Epoch does not stop processes. Then audit actual state, invalidate affected facts/gates, and publish the earliest safe next action. A crash after design documents are installed but before the ledger publication leaves only an orphan; resume retries the same bundle and adopts same bytes or reports a conflict. A crash after publication but before reviewer registration leaves a valid published bundle with the durable `prepare_g2_coverage_review` next action; resume registers the review against that exact revision. An unknown schema is read-only migration diagnosis.
 
 **Completion:** each publication is lock-protected, revision/epoch-checked, schema/semantic-valid, atomically durable, and reconstructible from files plus Git; every uncertain effect has a quarantine/next action rather than a duplicate execution.

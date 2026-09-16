@@ -148,6 +148,23 @@ def project_ledger(state: dict[str, Any], ledger_path: Path, raw: bytes) -> dict
     if "tickets" not in state:
         _add_concern(concerns, "tickets-missing", "В ledger отсутствует коллекция tickets; список tickets недоступен.")
 
+    design_publication = state.get("design_publication")
+    design_review_attempts = [
+        {
+            "id": attempt.get("id"),
+            "kind": attempt.get("mode"),
+            "state": attempt.get("state"),
+            "result": attempt.get("review_result"),
+            "reviewer_identity": attempt.get("reviewer_identity"),
+            "reviewer_role": attempt.get("reviewer_role"),
+            "target_revision": attempt.get("target_revision"),
+        }
+        for attempt in state.get("attempts", [])
+        if attempt.get("mode") in ("coverage", "plan")
+    ]
+    if phase in {"DESIGN", "PLAN"} and not design_publication:
+        _add_concern(concerns, "design-publication-missing", "Для G2/G3 отсутствует canonical design publication; provisional artifacts не считаются опубликованными.")
+
     active = []
     for attempt in state.get("attempts", []):
         lease = attempt.get("lease", {})
@@ -249,6 +266,8 @@ def project_ledger(state: dict[str, Any], ledger_path: Path, raw: bytes) -> dict
         "run_settings": settings,
         "gates": gates,
         "tickets": tickets,
+        "design_publication": design_publication,
+        "design_review_attempts": design_review_attempts,
         "ticket_counts": {
             status: sum(1 for ticket in tickets if ticket.get("status") == status)
             for status in sorted({ticket.get("status") for ticket in tickets})

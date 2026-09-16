@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.1"
+SKILL_VERSION = "1.0.2"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -317,7 +317,7 @@ def validate(value: Any, spec: dict[str, Any], root: dict[str, Any], path: str =
                 validate(value[key], child, root, f"{path}.{key}")
 
 
-def validate_ledger(state: dict[str, Any]) -> None:
+def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None:
     root = schema()
     validate(state, root, root)
     if state["run_id"] != Path(state["repository"]["control_root"]).name and state["run_id"] == "":
@@ -329,6 +329,11 @@ def validate_ledger(state: dict[str, Any]) -> None:
                 if item["id"] in ids:
                     fail(f"duplicate immutable ID: {item['id']}")
                 ids.add(item["id"])
+    publication = state.get("design_publication")
+    if publication:
+        if publication["id"] in ids:
+            fail(f"duplicate immutable ID: {publication['id']}")
+        ids.add(publication["id"])
     ticket_ids = {item["id"] for item in state.get("tickets", [])}
     criterion_ids = {item["id"] for item in state.get("criteria", [])}
     requirement_ids = {item["id"] for item in state.get("requirements", [])}
@@ -341,6 +346,26 @@ def validate_ledger(state: dict[str, Any]) -> None:
             document = next(item for item in state.get("documents", []) if item["id"] == intent["document_ref"])
             if document.get("hash") != intent["document_hash"]:
                 fail("intent document_hash does not match document")
+    if publication and publication.get("status") == "PUBLISHED":
+        if not state.get("intent"):
+            fail("design publication requires a current intent")
+        intent = state["intent"]
+        if publication["intent_revision"] != intent.get("current_revision") or publication["intent_document_ref"] != intent.get("document_ref") or publication["intent_document_hash"] != intent.get("document_hash"):
+            fail("design publication is bound to a stale intent")
+        refs = set(publication["document_refs"])
+        if not refs or not refs.issubset(document_ids):
+            fail("design publication references an unknown document")
+        if not set(publication["contract_refs"]).issubset({item["id"] for item in state.get("contracts", [])}):
+            fail("design publication references an unknown contract")
+        if not set(publication["ticket_refs"]).issubset({item["id"] for item in state.get("tickets", [])}):
+            fail("design publication references an unknown ticket")
+        if not set(publication["route_refs"]).issubset({item["id"] for item in state.get("routes", [])}):
+            fail("design publication references an unknown route")
+        for document in state.get("documents", []):
+            if document["id"] in refs:
+                path = Path(document["path"])
+                if verify_files and (not path.exists() or path.is_symlink() or not path.is_file() or sha256_file(path) != document["hash"]):
+                    fail(f"published design document is unavailable or drifted: {document['id']}")
     for requirement in state.get("requirements", []):
         if any(ref not in criterion_ids for ref in requirement.get("criterion_refs", [])):
             fail(f"requirement references unknown criterion: {requirement['id']}")
@@ -631,6 +656,64 @@ def ids_from_records(records: list[dict[str, Any]], key: str, label: str) -> lis
     return values
 
 
+def design_bundle_source(record: dict[str, Any]) -> tuple[Path, bytes]:
+    source_value = record.get("source")
+    if not isinstance(source_value, str) or not source_value or not Path(source_value).is_absolute() or ".." in Path(source_value).parts:
+        fail("design artifact source must be an absolute, traversal-free path")
+    candidate = Path(source_value).expanduser()
+    if candidate.is_symlink():
+        fail("design artifact source may not be a symlink")
+    source = candidate.resolve()
+    if not source.exists():
+        fail(f"design artifact source does not exist: {source}")
+    regular_non_symlink(source)
+    if source.stat().st_size > 4 * 1024 * 1024:
+        fail("design artifact exceeds the 4 MiB bound")
+    raw = source.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"design artifact must be UTF-8 Markdown: {exc}")
+    if not text.strip():
+        fail("design artifact must contain non-whitespace Markdown")
+    if sha256_bytes(raw) != record.get("hash"):
+        fail(f"design artifact hash does not match source: {record.get('id')}")
+    return source, raw
+
+
+def validate_design_bundle(bundle: dict[str, Any]) -> None:
+    """Validate the complete proposed design publication without touching state."""
+    safe_id(bundle.get("bundle_id"), "design bundle ID")
+    root = schema()
+    documents = bundle.get("documents", [])
+    document_ids = ids_from_records(documents, "id", "design document")
+    kinds = {item.get("kind") for item in documents}
+    if "design" not in kinds:
+        fail("design bundle requires a design artifact")
+    if not ({"interfaces", "contracts", "interface"} & kinds) or not bundle.get("contracts"):
+        fail("design bundle requires interfaces and contract records")
+    if "manifest" not in kinds:
+        fail("design bundle requires a manifest artifact")
+    if not ({"plan", "implementation_plan", "implementation-plan", "evaluation_plan", "evaluation-plan"} & kinds):
+        fail("design bundle requires an implementation plan artifact")
+    if not ({"tickets", "implementation_tickets", "implementation-tickets"} & kinds) or not bundle.get("tickets"):
+        fail("design bundle requires a tickets artifact and ticket records")
+    if not ({"routes", "route", "dependencies"} & kinds) or not bundle.get("routes"):
+        fail("design bundle requires routes/dependencies and route records")
+    for document in documents:
+        design_bundle_source(document)
+    for name in ("contracts", "tickets", "routes"):
+        definition = root["$defs"][name[:-1] if name != "routes" else "route"]
+        for index, record in enumerate(bundle[name]):
+            validate(record, definition, root, f"$.{name}[{index}]")
+            safe_id(record["id"], f"{name[:-1]} ID")
+    all_bundle_ids = document_ids + [item["id"] for item in bundle["contracts"]] + [item["id"] for item in bundle["tickets"]] + [item["id"] for item in bundle["routes"]]
+    if len(all_bundle_ids) != len(set(all_bundle_ids)):
+        fail("design bundle contains duplicate immutable IDs")
+    for route in bundle["routes"]:
+        validate_route_eligibility(route)
+
+
 def stored_payload(p: dict[str, Path], ref: str | None, label: str) -> dict[str, Any]:
     if not isinstance(ref, str) or not ref.startswith("objects/"):
         fail(f"{label} is not an immutable object reference")
@@ -780,6 +863,8 @@ def validate_standalone_contract(value: dict[str, Any], kind: str) -> None:
             fail("acceptance outcomes contain duplicate criteria")
         if value.get("verdict") == "PASS" and any(item.get("outcome") != "fulfilled" for item in value.get("outcomes", [])):
             fail("acceptance PASS requires fulfilled outcomes")
+    elif kind == "design_bundle":
+        validate_design_bundle(value)
 
 
 def ingest_payload(p: dict[str, Path], state: dict[str, Any], attempt_id: str, payload_path: Path, expected_packet_hash: str | None = None, kind: str | None = None) -> tuple[dict[str, Any], str]:
@@ -885,7 +970,7 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         usage = copy.deepcopy(state.get("usage", default_usage()))
         binding = {"revision": state.get("intent", {}).get("current_revision"), "document_ref": state.get("intent", {}).get("document_ref"), "document_hash": state.get("intent", {}).get("document_hash")}
         settings = resolved_run_settings(state)
-        brief = {"run_id": state["run_id"], "revision": state["revision"], "phase": lifecycle["phase"], "control": lifecycle["control"], "reason": lifecycle.get("reason"), "next_action": lifecycle["next_action"], "run_settings": settings, "preset_display": run_settings_display(settings), "issues": [i["id"] for i in state.get("issues", []) if i.get("impact") == "blocking"], "findings": [f["id"] for f in state.get("findings", [])], "reviews": [{"id": r.get("id"), "subject": r.get("subject_fingerprint"), "verdict": r.get("verdict"), "finding_refs": r.get("finding_refs", [])} for r in state.get("reviews", [])], "adjudications": [d.get("id") for d in state.get("decisions", []) if d.get("type") == "reviewer_adjudication"], "intent": binding, "consumer_invalidation_count": len(state.get("invalidations", [])), "usage": usage, "evidence_count": len(state.get("evidence", [])), "ledger_bytes": len(raw), "ledger_hash": sha256_bytes(raw)}
+        brief = {"run_id": state["run_id"], "revision": state["revision"], "phase": lifecycle["phase"], "control": lifecycle["control"], "reason": lifecycle.get("reason"), "next_action": lifecycle["next_action"], "run_settings": settings, "preset_display": run_settings_display(settings), "issues": [i["id"] for i in state.get("issues", []) if i.get("impact") == "blocking"], "findings": [f["id"] for f in state.get("findings", [])], "reviews": [{"id": r.get("id"), "subject": r.get("subject_fingerprint"), "verdict": r.get("verdict"), "review_kind": r.get("review_kind"), "reviewer_identity": r.get("reviewer_identity"), "reviewer_role": r.get("reviewer_role"), "finding_refs": r.get("finding_refs", [])} for r in state.get("reviews", [])], "design_publication": state.get("design_publication"), "design_review_attempts": [{"id": a.get("id"), "kind": a.get("mode"), "state": a.get("state"), "result": a.get("review_result"), "reviewer_identity": a.get("reviewer_identity"), "reviewer_role": a.get("reviewer_role")} for a in state.get("attempts", []) if a.get("mode") in ("coverage", "plan")], "adjudications": [d.get("id") for d in state.get("decisions", []) if d.get("type") == "reviewer_adjudication"], "intent": binding, "consumer_invalidation_count": len(state.get("invalidations", [])), "usage": usage, "evidence_count": len(state.get("evidence", [])), "ledger_bytes": len(raw), "ledger_hash": sha256_bytes(raw)}
         brief["usage"]["counters"]["brief_bytes"] = len(canonical_bytes(brief))
         return brief
     settings = resolved_run_settings(state)
@@ -988,10 +1073,20 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         identity = packet_identity(payload)
         if identity.get("epoch") not in (None, attempt["epoch"]):
             fail("return epoch mismatch; stale payload remains historical evidence")
+        if args.kind == "review" and attempt.get("mode") in ("coverage", "plan"):
+            publication = current_design_publication(state)
+            if attempt.get("subject_ref") != publication.get("id") or attempt.get("subject_fingerprint") != publication.get("publication_hash") or payload.get("subject_fingerprint") != publication.get("publication_hash"):
+                fail("design review return is not bound to the current published bundle")
+            if identity.get("source_revision") not in (None, attempt.get("target_revision")):
+                fail("design review return source revision is stale")
+            if identity.get("intent_revision") not in (None, publication.get("intent_revision")):
+                fail("design review return intent revision is stale")
         next_state = copy.deepcopy(state)
         target = attempt_by_id(next_state, args.attempt_id)
         target["state"] = "RETURNED"
         target["return_ref"] = f"objects/{digest}"
+        if args.kind == "review" and target.get("mode") in ("coverage", "plan"):
+            target["review_result"] = payload.get("verdict")
         target["finding_refs"] = append_review_findings(next_state, payload, args.attempt_id, digest)
         write_set_violations = worker_return_write_set_violations(payload, attempt.get("lease", {})) if args.kind == "worker" else []
         if write_set_violations:
@@ -1023,7 +1118,7 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         if args.kind == "review":
             review_id = f"REV-{digest[:16]}"
             if review_id not in {item.get("id") for item in next_state.get("reviews", [])}:
-                review = {"id": review_id, "mandate": stored_payload(p, target.get("packet_ref"), "review packet").get("mandate", "review"), "subject_fingerprint": payload.get("subject_fingerprint", ""), "verdict": payload.get("verdict"), "return_ref": f"objects/{digest}", "context_refs": payload.get("context_refs", []), "finding_refs": target["finding_refs"], "intent_revision": next_state.get("intent", {}).get("current_revision"), "invalidated_by": []}
+                review = {"id": review_id, "mandate": stored_payload(p, target.get("packet_ref"), "review packet").get("mandate", "review"), "subject_fingerprint": payload.get("subject_fingerprint", ""), "verdict": payload.get("verdict"), "return_ref": f"objects/{digest}", "context_refs": payload.get("context_refs", []), "finding_refs": target["finding_refs"], "intent_revision": next_state.get("intent", {}).get("current_revision"), "reviewer_identity": target.get("reviewer_identity"), "reviewer_role": target.get("reviewer_role"), "review_kind": target.get("mode") if target.get("mode") in ("coverage", "plan") else None, "target_artifact_refs": target.get("target_artifact_refs", []), "target_artifact_versions": target.get("target_artifact_versions", []), "target_revision": target.get("target_revision"), "invalidated_by": []}
                 next_state.setdefault("reviews", []).append(review)
             prior = [item for item in next_state.get("reviews", []) if item.get("subject_fingerprint") == payload.get("subject_fingerprint")]
             verdicts = {item.get("verdict") for item in prior}
@@ -1276,6 +1371,63 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
         state["lifecycle"]["next_action"] = {"kind": "await_review_return", "subject_refs": [args.review_attempt_id], "preconditions": ["reviewer stopped", "integrity baseline unchanged", "strict packet/subject match"], "read_refs": ["contracts/reviewer.md", "phases/execute.md"]}
     result = transaction(p, args.owner_token, args.revision, change)
     return {"prepared": True, "attempt_id": args.review_attempt_id, "packet_hash": packet_hash, "revision": result["revision"]}
+
+
+def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    packet_path = Path(args.packet).expanduser().resolve()
+    packet = read_json(packet_path, "design review packet")
+    root = schema()
+    validate(packet, root["$defs"]["review_packet"], root, "$.packet")
+    identity = packet_identity(packet)
+    if identity.get("run_id") not in (None, args.run_id) or identity.get("attempt_id") != args.review_attempt_id:
+        fail("design review packet identity does not match review attempt")
+    if args.review_kind not in ("coverage", "plan"):
+        fail("design review kind must be coverage or plan")
+    reviewer_identity = nonempty_string(args.reviewer_identity, "reviewer identity")
+    reviewer_role = nonempty_string(args.reviewer_role, "reviewer role")
+    packet_hash = object_store(p, packet_path.read_bytes())
+
+    def change(state: dict[str, Any]) -> None:
+        if state["lifecycle"]["phase"] != "DESIGN":
+            fail("design review preparation requires DESIGN phase")
+        if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
+            fail("terminal run is immutable; start a successor run")
+        publication = current_design_publication(state)
+        if packet.get("subject_fingerprint") != publication.get("publication_hash"):
+            fail("design review packet subject is not the current published bundle")
+        binding = current_intent_binding(state)
+        if identity.get("epoch") != state["owner"]["epoch"]:
+            fail("design review packet epoch does not match current owner")
+        if identity.get("source_revision") != state["revision"]:
+            fail("design review packet source revision is stale")
+        if identity.get("intent_revision") not in (None, binding["revision"]):
+            fail("design review packet intent revision is stale")
+        if identity.get("intent_document_ref") not in (None, binding["document_ref"]):
+            fail("design review packet intent document ref is stale")
+        if identity.get("intent_document_hash") not in (None, binding["document_hash"]):
+            fail("design review packet intent document hash is stale")
+        if any(item.get("id") == args.review_attempt_id for item in state.get("attempts", [])):
+            fail("review attempt ID already exists")
+        target_refs = [*publication["document_refs"], *publication["contract_refs"], *publication["ticket_refs"], *publication["route_refs"]]
+        documents = {item["id"]: item for item in state.get("documents", [])}
+        target_versions = [{"ref": ref, "version": documents[ref]["version"]} for ref in publication["document_refs"]]
+        target_versions.extend({"ref": ref, "version": next(item for item in state.get("contracts", []) if item["id"] == ref)["version"]} for ref in publication["contract_refs"])
+        target_versions.extend({"ref": ref, "version": "ledger"} for ref in [*publication["ticket_refs"], *publication["route_refs"]])
+        attempt_record = {
+            "id": args.review_attempt_id, "kind": "review", "mode": args.review_kind, "subject_ref": publication["id"], "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash,
+            "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": {"id": args.lease_id, "state": "active", "zone": []}, "route_ref": None,
+            "checkout": None, "base_sha": None, "candidate_sha": None, "candidate_tree_sha": None, "return_ref": None, "finding_refs": [],
+            "reviewer_identity": reviewer_identity, "reviewer_role": reviewer_role, "subject_fingerprint": publication["publication_hash"], "target_artifact_refs": target_refs,
+            "target_artifact_versions": target_versions, "target_revision": publication["published_revision"], "review_result": None,
+            "intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"],
+        }
+        state.setdefault("attempts", []).append(attempt_record)
+        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": packet_path.stat().st_size, "spawn_calls": 1})
+        state["lifecycle"]["next_action"] = {"kind": "await_design_review_return", "subject_refs": [args.review_attempt_id, publication["id"]], "preconditions": ["reviewer identity/role registered", "reviewer stopped", "exact bundle fingerprint and revision"], "read_refs": ["contracts/reviewer.md", "phases/design.md", "references/ledger.md"]}
+
+    result = transaction(p, args.owner_token, args.revision, change)
+    return {"prepared": True, "attempt_id": args.review_attempt_id, "review_kind": args.review_kind, "packet_hash": packet_hash, "revision": result["revision"]}
 
 
 def cmd_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
@@ -1886,6 +2038,142 @@ def cmd_publish_intent(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def current_design_publication(state: dict[str, Any]) -> dict[str, Any]:
+    publication = state.get("design_publication")
+    if not isinstance(publication, dict) or publication.get("status") != "PUBLISHED":
+        fail("G2/G3 requires a published design bundle")
+    validate_ledger(state)
+    return publication
+
+
+def design_review_pass(state: dict[str, Any], review_kind: str) -> bool:
+    publication = current_design_publication(state)
+    return any(
+        review.get("review_kind") == review_kind
+        and review.get("verdict") == "PASS"
+        and review.get("subject_fingerprint") == publication.get("publication_hash")
+        and review.get("intent_revision") == publication.get("intent_revision")
+        and review.get("target_revision") == publication.get("published_revision")
+        for review in state.get("reviews", [])
+    )
+
+
+def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    bundle_path = Path(args.bundle).expanduser().resolve()
+    bundle = read_json(bundle_path, "design bundle")
+    root = schema()
+    validate(bundle, root["$defs"]["design_bundle"], root, "$.design_bundle")
+    validate_design_bundle(bundle)
+    bundle_hash = sha256_bytes(canonical_bytes(bundle))
+    source_bytes = {document["id"]: design_bundle_source(document)[1] for document in bundle["documents"]}
+    started = time.monotonic()
+
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
+            fail("terminal run is immutable; start a successor run")
+        if state["lifecycle"]["phase"] != "DESIGN":
+            fail("design bundle publication requires a G1-complete DESIGN phase")
+        binding = current_intent_binding(state)
+        if bundle["epoch"] != state["owner"]["epoch"]:
+            fail("design bundle epoch does not match current owner")
+        if (bundle["intent_revision"], bundle["intent_document_ref"], bundle["intent_document_hash"]) != (binding["revision"], binding["document_ref"], binding["document_hash"]):
+            fail("design bundle is bound to a stale intent")
+        existing = state.get("design_publication")
+        if existing:
+            if existing.get("publication_hash") != bundle_hash:
+                fail("conflicting design bundle is already published")
+            return {"published": True, "idempotent": True, "bundle_id": bundle["bundle_id"], "publication_hash": bundle_hash, "revision": state["revision"], "next_action": state["lifecycle"]["next_action"]}
+
+        collections = {collection: {item.get("id"): item for item in state.get(collection, [])} for collection in ("documents", "contracts", "tickets", "routes")}
+        occupied = {item.get("id") for collection in state.values() if isinstance(collection, list) for item in collection if isinstance(item, dict) and item.get("id")}
+        if bundle["bundle_id"] in occupied:
+            fail("design bundle ID conflicts with an existing immutable ID")
+        if state.get("design_publication") and state["design_publication"].get("id") == bundle["bundle_id"]:
+            fail("design bundle ID was already used by a prior publication")
+        for collection_name in ("documents", "contracts", "tickets", "routes"):
+            for record in bundle[collection_name]:
+                existing_record = collections[collection_name].get(record["id"])
+                if record["id"] in occupied and (existing_record is None or existing_record != record and collection_name != "documents"):
+                    fail(f"design bundle ID conflicts with an existing immutable ID: {record['id']}")
+        next_state = copy.deepcopy(state)
+        next_state.setdefault("documents", [])
+        for document in bundle["documents"]:
+            canonical = {"id": document["id"], "version": document["version"], "path": str(canonical_document_path(p, document["id"], document["version"])), "hash": document["hash"], "kind": document["kind"], "section_anchors": document.get("section_anchors", [])}
+            existing_document = collections["documents"].get(document["id"])
+            if existing_document is not None:
+                if existing_document != canonical:
+                    fail(f"conflicting canonical document: {document['id']}")
+                continue
+            next_state["documents"].append(canonical)
+        for collection_name in ("contracts", "tickets", "routes"):
+            for record in bundle[collection_name]:
+                existing_record = collections[collection_name].get(record["id"])
+                if existing_record is not None:
+                    if existing_record != record:
+                        fail(f"conflicting canonical {collection_name[:-1]}: {record['id']}")
+                    continue
+                next_state.setdefault(collection_name, []).append(copy.deepcopy(record))
+        known_criteria = {item["id"] for item in next_state.get("criteria", [])}
+        known_contracts = {item["id"] for item in next_state.get("contracts", [])}
+        known_tickets = {item["id"] for item in next_state.get("tickets", [])}
+        for ticket in bundle["tickets"]:
+            if not set(ticket.get("criterion_refs", [])).issubset(known_criteria):
+                fail(f"design ticket references an unknown criterion: {ticket['id']}")
+            if not set(ticket.get("contract_refs", [])).issubset(known_contracts):
+                fail(f"design ticket references an unknown contract: {ticket['id']}")
+            if not set(ticket.get("dependency_refs", [])).issubset(known_tickets):
+                fail(f"design ticket references an unknown dependency: {ticket['id']}")
+
+        document_refs = [item["id"] for item in bundle["documents"]]
+        next_state["design_publication"] = {
+            "id": bundle["bundle_id"], "version": bundle["version"], "status": "PUBLISHED", "owner_epoch": state["owner"]["epoch"],
+            "intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"],
+            "publication_hash": bundle_hash, "bundle_ref": f"objects/{bundle_hash}", "published_revision": state["revision"] + 1,
+            "document_refs": document_refs, "contract_refs": [item["id"] for item in bundle["contracts"]], "ticket_refs": [item["id"] for item in bundle["tickets"]], "route_refs": [item["id"] for item in bundle["routes"]],
+        }
+        if state["lifecycle"]["control"] == "BLOCKED" and state["lifecycle"].get("reason") in ("missing_design_publication", "design_publication_required", "design_artifacts_unpublished", "publication_gap"):
+            publication_blockers = set(state["lifecycle"].get("issue_refs", []))
+            unrelated_blockers = [issue for issue in state.get("issues", []) if issue.get("id") in publication_blockers and issue.get("type") not in ("design_publication_gap", "missing_design_publication")]
+            if not unrelated_blockers:
+                for issue in next_state.get("issues", []):
+                    if issue.get("id") in publication_blockers:
+                        issue["impact"] = "advisory"
+                        issue["disposition"] = "resolved by design publication"
+                next_state["lifecycle"]["issue_refs"] = []
+                next_state["lifecycle"]["control"] = "ACTIVE"
+        next_state["lifecycle"]["next_action"] = {"kind": "prepare_g2_coverage_review", "subject_refs": [bundle["bundle_id"], *document_refs], "preconditions": ["published design bundle is current", "fresh coverage reviewer attempt"], "read_refs": ["phases/design.md", "contracts/reviewer.md", "references/ledger.md"]}
+        validate_ledger(next_state, verify_files=False)
+        destinations: list[tuple[Path, bytes, str]] = []
+        for document in bundle["documents"]:
+            destination = canonical_document_path(p, document["id"], document["version"])
+            if destination.exists():
+                regular_non_symlink(destination)
+                if destination.read_bytes() != source_bytes[document["id"]]:
+                    fail(f"canonical design document destination already exists with different bytes: {document['id']}")
+            destinations.append((destination, source_bytes[document["id"]], document["id"]))
+        object_store(p, canonical_bytes(bundle))
+        for destination, raw, _document_id in destinations:
+            if not destination.exists():
+                atomic_write(destination, raw)
+        usage = next_state.setdefault("usage", default_usage())
+        usage.setdefault("counters", zero_usage()); usage.setdefault("trace", []); usage.setdefault("shared_setup", zero_usage()); usage.setdefault("gate_costs", {f"G{i}": zero_usage() for i in range(7)})
+        delta = {field: 0 for field in USAGE_FIELDS}; delta["helper_calls"] = 1; delta["internal_publications"] = 1; delta["wall_time_ms"] = max(0, int((time.monotonic() - started) * 1000))
+        add_usage(usage["counters"], delta)
+        usage["trace"].append({"id": f"trace-{state['revision'] + 1}-helper", "kind": "helper_publication", "actor": "ledger-helper", "subject_ref": bundle["bundle_id"], "delta": delta, "evidence_ref": None, "recorded_at": now()})
+        next_state["revision"] = state["revision"] + 1
+        next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        next_state["updated_at"] = now()
+        validate_ledger(next_state)
+        publish(p, next_state, previous_raw, "design-publication")
+    return {"published": True, "idempotent": False, "bundle_id": bundle["bundle_id"], "publication_hash": bundle_hash, "revision": next_state["revision"], "next_action": next_state["lifecycle"]["next_action"]}
+
+
 def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     source = Path(args.intent_file).expanduser().resolve()
@@ -1917,6 +2205,10 @@ def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
                     consumer_refs.append(item["id"])
                     if "invalidated_by" in item or collection in {"documents", "requirements", "criteria", "contracts", "decisions", "tickets", "attempts", "issues", "findings", "reviews", "acceptance", "operations", "capabilities", "routes", "evidence"}:
                         item.setdefault("invalidated_by", []).append(args.amendment_id)
+        if state.get("design_publication"):
+            state["design_publication"].setdefault("invalidated_by", []).append(args.amendment_id)
+            state["design_publication"]["status"] = "INVALIDATED"
+            consumer_refs.append(state["design_publication"]["id"])
         state.setdefault("invalidations", []).append({"id": f"invalidation-{args.amendment_id}", "amendment_ref": args.amendment_id, "intent_revision": args.intent_revision, "previous_intent_revision": old_binding["revision"], "previous_document_ref": old_binding["document_ref"], "previous_document_hash": old_binding["document_hash"], "affected_refs": [old_binding["document_ref"], doc_id], "consumer_refs": sorted(set(consumer_refs)), "recorded_at": now()})
         state["intent"] = {"current_revision": args.intent_revision, "document_ref": doc_id, "document_hash": digest, "approved_amendments": [*state.get("intent", {}).get("approved_amendments", []), args.amendment_id], "acceptance_policy": state.get("intent", {}).get("acceptance_policy", "automatic"), "checkpoint_policy": state.get("intent", {}).get("checkpoint_policy", "gate"), "prior_accepted_refs": state.get("intent", {}).get("prior_accepted_refs", [])}
         for ticket in state.get("tickets", []):
@@ -1966,6 +2258,15 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
             ]
             if active_attempts or active_leases or unresolved_effects:
                 fail("PAUSED requires stopped writers, released leases, and reconciled effects")
+        action = (args.next_action or "").casefold()
+        g2_pass = control == "ACTIVE" and phase == "DESIGN" and ("g2" in action or "coverage" in action)
+        g3_pass = control == "ACTIVE" and phase == "PLAN" and ("g3" in action or "plan" in action)
+        if state.get("intent") and (g2_pass or g3_pass):
+            current_design_publication(state)
+            if not design_review_pass(state, "coverage"):
+                fail("G2 cannot pass without a PASS coverage review of the published design bundle")
+            if g3_pass and not design_review_pass(state, "plan"):
+                fail("G3 cannot pass without a PASS plan review of the published design bundle")
         current_index = PHASES.index(current_phase)
         requested_index = PHASES.index(phase)
         if requested_index not in (current_index, current_index + 1):
@@ -2063,6 +2364,7 @@ def build_parser() -> argparse.ArgumentParser:
     effect = sub.add_parser("prepare-effect"); effect.add_argument("--control-root", required=True); effect.add_argument("--run-id", required=True); effect.add_argument("--owner-token", required=True); effect.add_argument("--revision", type=int, required=True); effect.add_argument("--operation-id", required=True); effect.add_argument("--kind", required=True); effect.add_argument("--target", required=True); effect.add_argument("--expected-before", default=None); effect.add_argument("--intended-after", default=None); effect.add_argument("--authority-ref", required=True)
     reconcile_effect = sub.add_parser("reconcile-effect"); reconcile_effect.add_argument("--control-root", required=True); reconcile_effect.add_argument("--run-id", required=True); reconcile_effect.add_argument("--owner-token", required=True); reconcile_effect.add_argument("--revision", type=int, required=True); reconcile_effect.add_argument("--operation-id", required=True); reconcile_effect.add_argument("--result", choices=["applied", "uncertain", "unchanged"], required=True); reconcile_effect.add_argument("--receipt")
     review = sub.add_parser("prepare-review"); review.add_argument("--control-root", required=True); review.add_argument("--run-id", required=True); review.add_argument("--owner-token", required=True); review.add_argument("--revision", type=int, required=True); review.add_argument("--ticket-id", required=True); review.add_argument("--review-attempt-id", required=True); review.add_argument("--lease-id", required=True); review.add_argument("--packet", required=True)
+    design_review = sub.add_parser("prepare-design-review"); design_review.add_argument("--control-root", required=True); design_review.add_argument("--run-id", required=True); design_review.add_argument("--owner-token", required=True); design_review.add_argument("--revision", type=int, required=True); design_review.add_argument("--review-attempt-id", required=True); design_review.add_argument("--lease-id", required=True); design_review.add_argument("--packet", required=True); design_review.add_argument("--review-kind", choices=["coverage", "plan"], required=True); design_review.add_argument("--reviewer-identity", required=True); design_review.add_argument("--reviewer-role", required=True)
     adjudicate = sub.add_parser("adjudicate"); adjudicate.add_argument("--control-root", required=True); adjudicate.add_argument("--run-id", required=True); adjudicate.add_argument("--owner-token", required=True); adjudicate.add_argument("--revision", type=int, required=True); adjudicate.add_argument("--decision-file", required=True)
     integrate = sub.add_parser("integrate"); integrate.add_argument("--control-root", required=True); integrate.add_argument("--run-id", required=True); integrate.add_argument("--owner-token", required=True); integrate.add_argument("--revision", type=int, required=True); integrate.add_argument("--attempt-id", required=True); integrate.add_argument("--review-file", required=True); integrate.add_argument("--integrity-receipt", required=True); integrate.add_argument("--review-id", required=True)
     handoff = sub.add_parser("prepare-handoff"); handoff.add_argument("--control-root", required=True); handoff.add_argument("--run-id", required=True); handoff.add_argument("--owner-token", required=True); handoff.add_argument("--revision", type=int, required=True); handoff.add_argument("--attempt-id", required=True); handoff.add_argument("--packet", required=True); handoff.add_argument("--projection", required=True); handoff.add_argument("--export-root", required=True); handoff.add_argument("--bundle-root", required=True)
@@ -2072,6 +2374,7 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = sub.add_parser("cancel"); cancel.add_argument("--control-root", required=True); cancel.add_argument("--run-id", required=True); cancel.add_argument("--owner-token", required=True); cancel.add_argument("--revision", type=int, required=True); cancel.add_argument("--reason", default="user_cancelled"); cancel.add_argument("--stop-target", default=None); cancel.add_argument("--finalize", action="store_true"); cancel.add_argument("--stop-evidence")
     recover = sub.add_parser("recover"); recover.add_argument("--control-root", required=True); recover.add_argument("--run-id", required=True); recover.add_argument("--owner-token", required=True); recover.add_argument("--revision", type=int, required=True); recover.add_argument("--reason", default="recovery"); recover.add_argument("--takeover", action="store_true"); recover.add_argument("--new-owner-token", default=None); recover.add_argument("--attestation-ref", default=None)
     initial_intent = sub.add_parser("publish-intent"); initial_intent.add_argument("--control-root", required=True); initial_intent.add_argument("--run-id", required=True); initial_intent.add_argument("--owner-token", required=True); initial_intent.add_argument("--revision", type=int, required=True); initial_intent.add_argument("--intent-file", required=True); initial_intent.add_argument("--doc-id", required=True); initial_intent.add_argument("--doc-version", required=True); initial_intent.add_argument("--intent-revision", required=True)
+    design = sub.add_parser("publish-design-bundle", aliases=["publish-design"]); design.add_argument("--control-root", required=True); design.add_argument("--run-id", required=True); design.add_argument("--owner-token", required=True); design.add_argument("--revision", type=int, required=True); design.add_argument("--bundle", required=True)
     amend = sub.add_parser("amend"); amend.add_argument("--control-root", required=True); amend.add_argument("--run-id", required=True); amend.add_argument("--owner-token", required=True); amend.add_argument("--revision", type=int, required=True); amend.add_argument("--intent-file", required=True); amend.add_argument("--doc-id", required=True); amend.add_argument("--doc-version", required=True); amend.add_argument("--intent-revision", required=True); amend.add_argument("--amendment-id", required=True); amend.add_argument("--authority-ref", required=True)
     usage = sub.add_parser("publish-usage"); usage.add_argument("--control-root", required=True); usage.add_argument("--run-id", required=True); usage.add_argument("--owner-token", required=True); usage.add_argument("--revision", type=int, required=True); usage.add_argument("--event-file", required=True)
     return parser
@@ -2091,6 +2394,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "prepare-effect": result = cmd_prepare_effect(args)
         elif args.command == "reconcile-effect": result = cmd_reconcile_effect(args)
         elif args.command == "prepare-review": result = cmd_prepare_review(args)
+        elif args.command == "prepare-design-review": result = cmd_prepare_design_review(args)
         elif args.command == "adjudicate": result = cmd_adjudicate(args)
         elif args.command == "integrate": result = cmd_integrate(args)
         elif args.command == "prepare-handoff": result = cmd_prepare_handoff(args)
@@ -2100,6 +2404,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "cancel": result = cmd_cancel(args)
         elif args.command == "recover": result = cmd_recover(args)
         elif args.command == "publish-intent": result = cmd_publish_intent(args)
+        elif args.command in ("publish-design-bundle", "publish-design"): result = cmd_publish_design_bundle(args)
         elif args.command == "amend": result = cmd_amend(args)
         elif args.command == "publish-usage": result = cmd_publish_usage(args)
         else: fail(f"unsupported command: {args.command}")

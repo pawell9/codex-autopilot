@@ -6,7 +6,7 @@ orchestrator owns the durable ledger, routing, contracts, review flow, and
 Git integration; bounded workers implement ticket-sized changes, and
 independent reviewers verify them.
 
-**CODEX-AUTOPILOT V1.0.1 — PATCH RELEASE**
+**CODEX-AUTOPILOT V1.0.2 — PATCH RELEASE**
 
 ## Requirements
 
@@ -54,6 +54,15 @@ the document copy, hash binding, revision, and next action under the normal
 ledger lock; later intent changes use `amend`. A pre-v1.0.1 nonterminal run
 that stopped before its first intent should be resumed and bootstrapped in
 place, not replaced or hand-edited.
+
+After G1, publish the complete design-stage bundle with
+`publish-design-bundle`, then register independent coverage and plan review
+attempts with `prepare-design-review`. The publication binds the
+hash-verified design/interfaces/manifest/plan/tickets/routes bundle to the
+current intent in one ledger transaction. Reviewer attempts bind identity,
+role, artifact versions, epoch, and publication revision; G2/G3 cannot pass on
+provisional files. Same-byte retries recover safely after a crash, while
+conflicting or stale inputs leave canonical state unchanged.
 
 ## Presets
 

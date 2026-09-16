@@ -1,5 +1,17 @@
 # Changelog
 
+## [v1.0.2] — 2026-09-16
+
+Patch release for the post-G1 design publication/reviewer-registration gap.
+
+- Added atomic `publish-design-bundle` (`publish-design` alias) for the
+  complete design/interfaces/manifest/plan/tickets/routes bundle.
+- Added current-intent, owner/epoch/revision, artifact hash/path, retry,
+  conflict, amendment-invalidation, and G2/G3 precondition guards.
+- Added durable `prepare-design-review` coverage/plan attempts with reviewer
+  identity, role, artifact/version targets, and publication revision binding.
+- Preserved v1.0.0/v1.0.1 optional-field compatibility and recovery semantics.
+
 ## [v1.0.1] — 2026-09-16
 
 Patch release for the first-intent bootstrap gap found during an Idea Scout V2

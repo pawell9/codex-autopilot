@@ -12,6 +12,13 @@ Resolve routing per attempt from task complexity, risk, cause, valid capability 
 
 ## G3 readiness
 
+Plan review uses the same published bundle, never provisional files. Register it
+with `prepare-design-review --review-kind plan`; the helper records reviewer
+identity/role, target artifact versions, intent revision, and the immutable
+publication revision. A crash after design publication but before registration
+leaves the bundle durable and the next action explicitly at reviewer
+registration; resume/retry registers the same target or rejects a conflict.
+
 Plan review is required for elevated/critical work and can be combined with G2 only on an unchanged compact artifact with separate outcomes. The plan is ready when:
 
 - the DAG is acyclic and each ticket has a current criterion/oracle owner;
@@ -22,4 +29,4 @@ Plan review is required for elevated/critical work and can be combined with G2 o
 
 Publish the plan, tickets, routes, and G3 evidence atomically. A new user amendment, contract change, zone overlap, or oracle loss invalidates affected packets and returns through the legal phase transition. Do not dispatch while G3 is stale.
 
-**Done when:** every active criterion is covered by an executable ticket/oracle, the DAG and zones pass semantic validation, required plan review is PASS, and G3 next action is durable.
+**Done when:** the published bundle is current, every active criterion is covered by an executable ticket/oracle, the DAG and zones pass semantic validation, the registered plan review is PASS on that bundle, and G3 next action is durable.

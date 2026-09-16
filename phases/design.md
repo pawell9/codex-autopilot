@@ -10,6 +10,22 @@ The plan must anticipate independent evidence beyond worker tests: expected-valu
 
 ## G2 coverage request
 
+When G1 is complete, publish the complete design-stage bundle before preparing
+the reviewer: design, interfaces/contracts, manifest, implementation plan,
+tickets, routes, and dependency bindings must all be immutable, hash-verified
+documents or ledger records in one `publish-design-bundle` transaction. The
+bundle is bound to the current intent revision and owner epoch. A same-byte
+retry adopts an orphaned canonical document after a crash; a conflicting byte,
+missing source, traversal path, stale revision, or partial bundle leaves the
+ledger unchanged. The transaction's next action is the only route to G2.
+
+Register the coverage reviewer with `prepare-design-review --review-kind
+coverage --reviewer-identity ... --reviewer-role ...`. This durable attempt
+records the exact bundle fingerprint, artifact/version refs, publication
+revision, intent binding, reviewer identity/role, and PREPARED state before the
+reviewer runs. Ingest the exact structured return through the normal review
+path; a PASS is then bound to that attempt and target.
+
 Prepare a fresh `coverage` reviewer packet on the current intent and proposed design. It contains no author defense, worker self-rating, or implementation history. The reviewer assesses every active requirement, omissions, silent narrowing, assumptions, interfaces, and oracle feasibility, then returns structured coverage and findings on the exact document revision. A PASS requires all active requirements assessed with no blocking gap.
 
 If the routine reviewer route is unavailable, do not self-review. Record the capability blocker and use the designated recovery/fallback for that action; manual critical/G5 is not a substitute for ordinary design coverage.
@@ -20,4 +36,4 @@ For at most two routine tickets with no public interface change, migration, unre
 
 Publish G2 only against matching intent/spec hashes. A contract defect discovered later returns to this phase or INTENT according to the current transition rules in `phases/intent.md` and `references/ledger.md`; it is never patched silently inside a worker ticket.
 
-**Done when:** an independent fresh coverage verdict is PASS on the exact intent/design revision, every active criterion has a feasible contract and oracle, and assumptions/risks are explicit.
+**Done when:** the complete bundle is PUBLISHED, an independently registered coverage attempt has returned PASS on its exact fingerprint/revision, every active criterion has a feasible contract and oracle, and assumptions/risks are explicit.
