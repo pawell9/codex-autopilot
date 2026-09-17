@@ -1,5 +1,21 @@
 # Changelog
 
+## [v1.0.8] — 2026-09-17
+
+Transitive repair provenance patch release.
+
+- Extended the narrow same-ticket create-to-modify exception across continuous
+  `candidate → repair modify → candidate` chains without widening create-only
+  ticket zones.
+- Revalidated every candidate/base edge, worker return, finding-bound review,
+  consumed authorization, path, packet allow/deny boundary, and the original
+  validated create; stale/forked, foreign, discontinuous, and originless chains
+  remain blocked.
+- Persisted the complete path-specific attempt/finding/authorization lineage in
+  each new repair lease provenance record.
+- Added regression coverage for two and many repairs plus stale/forked,
+  foreign-path/ticket, and missing-origin failures.
+
 ## [v1.0.7] — 2026-09-17
 
 Quarantine reconciliation patch release.

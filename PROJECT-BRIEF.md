@@ -1,6 +1,6 @@
 # Codex Autopilot — PROJECT BRIEF
 
-**Status:** CODEX-AUTOPILOT V1.0.7 — QUARANTINE RECONCILIATION PATCH RELEASE
+**Status:** CODEX-AUTOPILOT V1.0.8 — TRANSITIVE REPAIR PROVENANCE PATCH RELEASE
 **Purpose:** starting context for research and design of a Codex-native Autopilot skill
 **Working project name:** `codex-autopilot`
 

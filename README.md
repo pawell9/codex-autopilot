@@ -6,7 +6,7 @@ orchestrator owns the durable ledger, routing, contracts, review flow, and
 Git integration; bounded workers implement ticket-sized changes, and
 independent reviewers verify them.
 
-**CODEX-AUTOPILOT V1.0.7 — QUARANTINE RECONCILIATION PATCH RELEASE**
+**CODEX-AUTOPILOT V1.0.8 — TRANSITIVE REPAIR PROVENANCE PATCH RELEASE**
 
 ## Requirements
 
@@ -108,6 +108,15 @@ hash-addressed receipt naming the actor and
 all evidence. A matching retry is a zero-effect success; stale, foreign,
 overbroad, deny-listed, non-write-set, or otherwise unsafe quarantine remains
 blocked.
+
+After that initial compatibility repair, the same ticket may perform further
+`repair modify → candidate` cycles for a create-only path. Each dispatch
+revalidates an unbroken current candidate/base chain back to the original
+validated create, checks every intervening repair's accepted blocking finding
+and authorization, intersects the path with the current packet allowlist, and
+records the full path-specific lineage. This does not grant general `modify`
+authority to create-only zones; stale/forked candidates, foreign tickets or
+paths, broken provenance, and missing original creates remain blocked.
 
 ## Presets
 

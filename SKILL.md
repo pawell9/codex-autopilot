@@ -84,7 +84,11 @@ lease. The only normal reconciliation path is
 `reconcile-quarantined-attempt`, and only for the exact same-ticket
 `create → candidate → repair modify` compatibility case. Supply the exact
 ticket/current attempt, named prior create attempt, accepted blocking finding,
-candidate/base SHA, actor, and unique reconciliation ID. Optionally supply a
+candidate/base SHA, actor, and unique reconciliation ID. New repairs may
+continue the same ticket through any number of candidate-bound modify repairs
+only when every base/candidate edge, finding authorization, and path-specific
+lineage is revalidated back to that original create; the current attempt stores
+the complete chain. Optionally supply a
 pre-attempt baseline; otherwise the command derives it from the exact Git base
 tree. The command reruns the checkout audit and publishes the receipt atomically;
 all other quarantines remain blocking.

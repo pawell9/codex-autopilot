@@ -86,6 +86,117 @@ class LifecycleRepairTests(unittest.TestCase):
         run("authorize-repair", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--finding-ref", "F-1", "--authorization-id", "AUTH-1", "--repair-contract", str(repair_path))
         return control, paths, candidate
 
+    def seed_completed_repair_chain(self, root: Path, completed_repairs: int) -> tuple[Path, dict[str, Path], str, dict[str, object]]:
+        control, repo, paths = self.init_ticket(root, operation="create")
+        candidates = [char * 40 for char in "bcdefghijklmnop"]
+        if completed_repairs >= len(candidates) - 1:
+            raise AssertionError("test repair chain is too long")
+
+        def worker_return(attempt_id: str, packet_hash: str, operation: str) -> str:
+            payload = {
+                "identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": attempt_id, "packet_hash": packet_hash, "epoch": 0},
+                "status": "DONE", "result": f"{operation}d app.txt", "files": [{"path": "app.txt", "operation": operation}],
+                "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "ok", "evidence_ref": f"EV-{attempt_id}"}],
+                "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": [f"EV-{attempt_id}"]}],
+            }
+            return ledger.object_store(paths, ledger.canonical_bytes(payload))
+
+        state, previous = ledger.load_state(paths)
+        attempts: list[dict[str, object]] = []
+        findings: list[dict[str, object]] = []
+        decisions: list[dict[str, object]] = []
+        create_hash = "1" * 64
+        create_return = worker_return("A-create", create_hash, "create")
+        attempts.append({
+            "id": "A-create", "kind": "worker", "mode": "implement", "subject_ref": "T-1",
+            "packet_ref": "objects/" + "2" * 64, "packet_hash": create_hash, "epoch": 0, "state": "RETURNED",
+            "lease": {"id": "L-create", "state": "released", "zone": [{"path": "app.txt", "operations": ["create"]}]},
+            "route_ref": "route-create", "checkout": str(repo), "base_sha": "a" * 40,
+            "candidate_sha": candidates[0], "candidate_tree_sha": "1" * 40,
+            "return_ref": f"objects/{create_return}", "finding_refs": [],
+        })
+        prior_worker = "A-create"
+        prior_candidate = candidates[0]
+        for index in range(1, completed_repairs + 2):
+            finding_id = f"F-{index}"
+            review_id = f"R-{index}"
+            attempts.append({
+                "id": review_id, "kind": "review", "mode": "change", "subject_ref": "T-1",
+                "packet_ref": "objects/" + str((index + 2) % 10) * 64, "packet_hash": str((index + 3) % 10) * 64,
+                "epoch": 0, "state": "RETURNED", "lease": {"id": f"L-{review_id}", "state": "released", "zone": []},
+                "route_ref": None, "checkout": None, "base_sha": prior_candidate, "candidate_sha": prior_candidate,
+                "candidate_tree_sha": str((index + 1) % 10) * 40, "return_ref": "objects/" + str((index + 4) % 10) * 64,
+                "finding_refs": [finding_id], "subject_fingerprint": prior_candidate, "review_result": "BLOCK",
+            })
+            findings.append({
+                "id": finding_id, "axis": "correctness", "impact": "blocking", "claim": f"repair finding {index}",
+                "expected": "correct", "actual": "incorrect", "evidence": f"EV-{review_id}",
+                "affected_refs": ["T-1"], "source_ref": review_id, "intent_revision": None,
+                "repair_contract_ref": None, "invalidated_by": [],
+            })
+            if index > completed_repairs:
+                break
+            repair = {
+                "cause": "implementation", "finding_ref": finding_id, "hypothesis": f"root cause {index}",
+                "expected_proof": f"proof {index}", "stopping_condition": f"stop {index}",
+                "causal_change": f"change {index}", "source_attempt_ref": review_id,
+            }
+            contract_digest = ledger.object_store(paths, ledger.canonical_bytes(repair))
+            authorization_id = f"AUTH-{index}"
+            decisions.append({
+                "id": authorization_id, "type": "repair_authorization", "status": "authorized", "decision": "REPAIR",
+                "reason": repair["hypothesis"], "evidence_refs": [finding_id, f"objects/{contract_digest}"],
+                "affected_refs": ["T-1", finding_id], "intent_revision": None, "invalidated_by": [],
+            })
+            findings[-1]["repair_contract_ref"] = authorization_id
+            attempt_id = f"A-repair-{index}"
+            packet_hash = str((index + 5) % 10) * 64
+            return_digest = worker_return(attempt_id, packet_hash, "modify")
+            candidate = candidates[index]
+            attempts.append({
+                "id": attempt_id, "kind": "worker", "mode": "repair", "subject_ref": "T-1",
+                "packet_ref": "objects/" + str((index + 6) % 10) * 64, "packet_hash": packet_hash,
+                "epoch": 0, "state": "RETURNED", "lease": {"id": f"L-{attempt_id}", "state": "released", "zone": [{"path": "app.txt", "operations": ["modify"]}]},
+                "route_ref": f"route-{attempt_id}", "checkout": str(repo), "base_sha": prior_candidate,
+                "candidate_sha": candidate, "candidate_tree_sha": str((index + 2) % 10) * 40,
+                "return_ref": f"objects/{return_digest}", "finding_refs": [], "repair_contract": repair,
+                "repair_authorization_ref": authorization_id, "failure_signature": ledger.repair_signature(repair),
+                "repair_lease_provenance": {
+                    "authorization_ref": authorization_id, "finding_ref": finding_id,
+                    "source_attempt_ref": prior_worker, "candidate_sha": prior_candidate,
+                    "packet_base_sha": prior_candidate,
+                    "expanded_entries": [{"path": "app.txt", "operations": ["modify"]}],
+                },
+            })
+            prior_worker = attempt_id
+            prior_candidate = candidate
+
+        state["attempts"] = attempts
+        state["findings"] = findings
+        state["decisions"] = decisions
+        state["tickets"][0]["state"] = "REVIEW"
+        state["tickets"][0]["current_attempt"] = prior_worker
+        state["lifecycle"]["control"] = "BLOCKED"
+        state["lifecycle"]["reason"] = "review_not_pass"
+        state["revision"] = 2
+        state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+        ledger.validate_ledger(state)
+        ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        next_index = completed_repairs + 1
+        next_repair = {
+            "cause": "implementation", "finding_ref": f"F-{next_index}", "hypothesis": f"root cause {next_index}",
+            "expected_proof": f"proof {next_index}", "stopping_condition": f"stop {next_index}",
+            "causal_change": f"change {next_index}", "source_attempt_ref": f"R-{next_index}",
+        }
+        repair_path = root / "repair-contract.json"
+        write_json(repair_path, next_repair)
+        run(
+            "authorize-repair", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a",
+            "--revision", "2", "--ticket-id", "T-1", "--finding-ref", f"F-{next_index}",
+            "--authorization-id", f"AUTH-{next_index}", "--repair-contract", str(repair_path),
+        )
+        return control, paths, prior_candidate, next_repair
+
     def seed_legacy_quarantined_repair(self, root: Path, *, foreign_change: bool = False, issue_type: str = "write_set_violation") -> tuple[Path, Path, dict[str, Path], Path, str]:
         control, repo, paths = self.init_ticket(root, operation="create")
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -216,6 +327,106 @@ class LifecycleRepairTests(unittest.TestCase):
                 packet = self.worker_packet(root, f"A-{case}", mode="repair", base=values["base"], path=values["path"], repair=repair)
                 rejected = self.dispatch(control, packet, f"A-{case}", 3, expect=2)
                 self.assertIn(values["error"], rejected.stderr)
+
+    def test_create_repair_modify_repair_modify_lineage_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, paths, candidate, repair = self.seed_completed_repair_chain(root, completed_repairs=1)
+            packet = self.worker_packet(root, "A-repair-2", mode="repair", base=candidate, repair=repair)
+            self.dispatch(control, packet, "A-repair-2", 3)
+            state, _ = ledger.load_state(paths)
+            provenance = ledger.attempt_by_id(state, "A-repair-2")["repair_lease_provenance"]
+            self.assertEqual("A-repair-1", provenance["source_attempt_ref"])
+            self.assertEqual(["create", "modify"], [item["operation"] for item in provenance["lineage"][0]["attempts"]])
+            self.assertEqual(["A-create", "A-repair-1"], [item["attempt_ref"] for item in provenance["lineage"][0]["attempts"]])
+
+    def test_multiple_sequential_legitimate_repairs_preserve_full_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, paths, candidate, repair = self.seed_completed_repair_chain(root, completed_repairs=4)
+            packet = self.worker_packet(root, "A-repair-5", mode="repair", base=candidate, repair=repair)
+            self.dispatch(control, packet, "A-repair-5", 3)
+            state, _ = ledger.load_state(paths)
+            lineage = ledger.attempt_by_id(state, "A-repair-5")["repair_lease_provenance"]["lineage"][0]["attempts"]
+            self.assertEqual(["create", "modify", "modify", "modify", "modify"], [item["operation"] for item in lineage])
+            self.assertEqual(["AUTH-1", "AUTH-2", "AUTH-3", "AUTH-4"], [item["authorization_ref"] for item in lineage[1:]])
+
+    def test_repair_lineage_can_cross_an_authorized_candidate_that_preserved_the_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, paths, candidate, repair = self.seed_completed_repair_chain(root, completed_repairs=1)
+            state, previous = ledger.load_state(paths)
+            state["tickets"][0]["zone"].append({"path": "side.txt", "operations": ["modify"]})
+            intermediate = ledger.attempt_by_id(state, "A-repair-1")
+            returned = ledger.stored_payload(paths, intermediate["return_ref"], "test intermediate return")
+            returned["files"] = [{"path": "side.txt", "operation": "modify"}]
+            replacement = ledger.object_store(paths, ledger.canonical_bytes(returned))
+            intermediate["return_ref"] = f"objects/{replacement}"
+            intermediate["lease"]["zone"] = [{"path": "side.txt", "operations": ["modify"]}]
+            intermediate.pop("repair_lease_provenance")
+            state["revision"] = 3
+            state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            packet = self.worker_packet(root, "A-repair-2", mode="repair", base=candidate, repair=repair)
+            self.dispatch(control, packet, "A-repair-2", 3)
+            final, _ = ledger.load_state(paths)
+            lineage = ledger.attempt_by_id(final, "A-repair-2")["repair_lease_provenance"]["lineage"][0]["attempts"]
+            self.assertEqual(["create", "preserve"], [item["operation"] for item in lineage])
+
+    def test_transitive_repair_rejects_stale_and_forked_candidate_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, _, _, repair = self.seed_completed_repair_chain(root, completed_repairs=1)
+            packet = self.worker_packet(root, "A-stale-chain", mode="repair", base="b" * 40, repair=repair)
+            rejected = self.dispatch(control, packet, "A-stale-chain", 3, expect=2)
+            self.assertIn("stale or forked", rejected.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, paths, candidate, repair = self.seed_completed_repair_chain(root, completed_repairs=1)
+            state, previous = ledger.load_state(paths)
+            ledger.attempt_by_id(state, "A-repair-1")["repair_lease_provenance"]["candidate_sha"] = "f" * 40
+            state["revision"] = 3
+            state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            packet = self.worker_packet(root, "A-forked-chain", mode="repair", base=candidate, repair=repair)
+            rejected = self.dispatch(control, packet, "A-forked-chain", 3, expect=2)
+            self.assertIn("broken create-to-modify provenance edge", rejected.stderr)
+
+    def test_transitive_repair_rejects_foreign_path_and_ticket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, _, candidate, repair = self.seed_completed_repair_chain(root, completed_repairs=1)
+            packet = self.worker_packet(root, "A-foreign-path", mode="repair", base=candidate, path="other.txt", repair=repair)
+            rejected = self.dispatch(control, packet, "A-foreign-path", 3, expect=2)
+            self.assertIn("lacks prior-create provenance", rejected.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, paths, candidate, repair = self.seed_completed_repair_chain(root, completed_repairs=1)
+            state, previous = ledger.load_state(paths)
+            ledger.attempt_by_id(state, "A-create")["subject_ref"] = "T-foreign"
+            state["revision"] = 3
+            state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            packet = self.worker_packet(root, "A-foreign-ticket", mode="repair", base=candidate, repair=repair)
+            rejected = self.dispatch(control, packet, "A-foreign-ticket", 3, expect=2)
+            self.assertIn("foreign", rejected.stderr)
+
+    def test_transitive_repair_rejects_missing_original_validated_create(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, paths, candidate, repair = self.seed_completed_repair_chain(root, completed_repairs=1)
+            state, previous = ledger.load_state(paths)
+            origin = ledger.attempt_by_id(state, "A-create")
+            returned = ledger.stored_payload(paths, origin["return_ref"], "test origin return")
+            returned["files"][0]["operation"] = "modify"
+            replacement = ledger.object_store(paths, ledger.canonical_bytes(returned))
+            origin["return_ref"] = f"objects/{replacement}"
+            state["revision"] = 3
+            state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            packet = self.worker_packet(root, "A-no-create", mode="repair", base=candidate, repair=repair)
+            rejected = self.dispatch(control, packet, "A-no-create", 3, expect=2)
+            self.assertIn("original validated create", rejected.stderr)
 
     def test_repair_return_outside_packet_allowlist_is_still_quarantined(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

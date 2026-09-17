@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.7"
+SKILL_VERSION = "1.0.8"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 COMPATIBILITY_FLOOR = "1.0.0"
@@ -1032,6 +1032,215 @@ def finding_matches_candidate(state: dict[str, Any], finding_ref: str, ticket_id
     return bool(source_review and source_review.get("subject_fingerprint") == candidate_sha and ticket_id in record.get("affected_refs", []))
 
 
+def repair_candidate_worker(
+    state: dict[str, Any], ticket: dict[str, Any], repair: dict[str, Any], packet_base: str
+) -> dict[str, Any]:
+    """Resolve the one current worker candidate authorized for this repair base."""
+    source_ref = repair.get("source_attempt_ref")
+    source = next((item for item in state.get("attempts", []) if item.get("id") == source_ref), None)
+    current = next(
+        (item for item in state.get("attempts", []) if item.get("id") == ticket.get("current_attempt")),
+        None,
+    )
+    if (
+        current is None
+        or current.get("kind") != "worker"
+        or current.get("subject_ref") != ticket["id"]
+        or current.get("candidate_sha") != packet_base
+    ):
+        fail("repair lease expansion base SHA is stale or forked from the current ticket candidate")
+    if source is None or source.get("subject_ref") != ticket["id"]:
+        fail("repair lease expansion requires exact same-ticket source_attempt_ref provenance")
+    if source.get("kind") == "worker":
+        if source.get("id") != current.get("id"):
+            fail("repair lease expansion source worker is stale or forked from the current ticket candidate")
+    elif source.get("kind") == "review":
+        finding = next((item for item in state.get("findings", []) if item.get("id") == repair.get("finding_ref")), None)
+        if (
+            finding is None
+            or finding.get("source_ref") != source.get("id")
+            or repair.get("finding_ref") not in source.get("finding_refs", [])
+            or source.get("candidate_sha") != packet_base
+            or source.get("subject_fingerprint") not in (None, packet_base)
+        ):
+            fail("repair lease expansion source review is not the exact candidate-bound finding review")
+    else:
+        fail("repair lease expansion source_attempt_ref must name the current worker or its finding review")
+    return current
+
+
+def historical_repair_authorization(
+    p: dict[str, Path], state: dict[str, Any], ticket_id: str, attempt: dict[str, Any], candidate_sha: str
+) -> tuple[str, str]:
+    """Revalidate one already-consumed repair authorization in a lineage."""
+    repair = attempt.get("repair_contract")
+    authorization_ref = attempt.get("repair_authorization_ref")
+    provenance = attempt.get("repair_lease_provenance")
+    if not isinstance(repair, dict):
+        fail("repair lineage contains a repair attempt without a repair contract")
+    finding_ref = repair.get("finding_ref")
+    authorization = next(
+        (
+            item
+            for item in state.get("decisions", [])
+            if item.get("id") == authorization_ref
+            and item.get("type") == "repair_authorization"
+            and item.get("status") == "authorized"
+            and item.get("decision") == "REPAIR"
+            and ticket_id in item.get("affected_refs", [])
+            and finding_ref in item.get("affected_refs", [])
+            and not item.get("invalidated_by")
+        ),
+        None,
+    )
+    if authorization is None:
+        fail("repair lineage contains a repair without an accepted same-ticket authorization")
+    if isinstance(provenance, dict) and (
+        provenance.get("authorization_ref") != authorization_ref
+        or provenance.get("finding_ref") != finding_ref
+    ):
+        fail("repair lineage authorization/finding provenance is discontinuous")
+    contract_refs = [
+        ref
+        for ref in authorization.get("evidence_refs", [])
+        if isinstance(ref, str) and ref.startswith("objects/")
+    ]
+    contract_bound = len(contract_refs) == 1 and stored_payload(p, contract_refs[0], "lineage repair contract") == repair
+    if not contract_bound and attempt.get("quarantine_reconciliation_ref"):
+        receipt = stored_payload(p, attempt.get("quarantine_reconciliation_ref"), "lineage reconciliation receipt")
+        receipt_contract_ref = receipt.get("repair_contract_ref")
+        contract_bound = bool(
+            receipt.get("authorization_ref") == authorization_ref
+            and receipt.get("finding_ref") == finding_ref
+            and stored_payload(p, receipt_contract_ref, "lineage reconciled repair contract") == repair
+        )
+    if not contract_bound:
+        fail("repair lineage authorization is not bound to the exact repair contract")
+    finding = next((item for item in state.get("findings", []) if item.get("id") == finding_ref), None)
+    source_review = next(
+        (
+            item
+            for item in state.get("attempts", [])
+            if finding is not None and item.get("id") == finding.get("source_ref")
+        ),
+        None,
+    )
+    historical_candidate_binding = bool(
+        finding
+        and finding.get("impact") == "blocking"
+        and source_review
+        and source_review.get("kind") == "review"
+        and source_review.get("subject_ref") == ticket_id
+        and source_review.get("state") == "RETURNED"
+        and source_review.get("candidate_sha") == candidate_sha
+        and source_review.get("subject_fingerprint") in (None, candidate_sha)
+        and finding_ref in source_review.get("finding_refs", [])
+    )
+    if not finding_matches_candidate(state, finding_ref, ticket_id, candidate_sha) and not historical_candidate_binding:
+        fail("repair lineage finding is not a current blocking finding bound to its base candidate")
+    return authorization_ref, finding_ref
+
+
+def validated_repair_path_lineage(
+    p: dict[str, Path],
+    state: dict[str, Any],
+    ticket: dict[str, Any],
+    source_attempt: dict[str, Any],
+    path: str,
+    expected_candidate: str,
+    seen: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Prove a continuous same-ticket candidate chain back to one validated create."""
+    seen = set() if seen is None else set(seen)
+    attempt_id = source_attempt.get("id")
+    if attempt_id in seen:
+        fail("repair lineage contains a provenance cycle")
+    seen.add(attempt_id)
+    if (
+        source_attempt.get("kind") != "worker"
+        or source_attempt.get("subject_ref") != ticket["id"]
+        or source_attempt.get("state") != "RETURNED"
+        or source_attempt.get("candidate_sha") != expected_candidate
+        or source_attempt.get("lease", {}).get("state") == "quarantined"
+    ):
+        fail("repair lineage candidate is missing, foreign, stale, or quarantined")
+    returned = stored_payload(p, source_attempt.get("return_ref"), "repair lineage worker return")
+    root = schema()
+    validate(returned, root["$defs"]["worker_return"], root, "$.lineage_return")
+    identity = packet_identity(returned)
+    if (
+        identity.get("run_id") != state["run_id"]
+        or identity.get("ticket_id") != ticket["id"]
+        or identity.get("attempt_id") != attempt_id
+        or identity.get("packet_hash") != source_attempt.get("packet_hash")
+        or identity.get("epoch") != source_attempt.get("epoch")
+        or returned.get("status") != "DONE"
+    ):
+        fail("repair lineage requires an exact validated DONE worker return")
+    operations = {
+        item.get("operation")
+        for item in returned.get("files", [])
+        if relative_path(item.get("path"), "repair lineage return path") == path
+    }
+    base_entry = {
+        "attempt_ref": attempt_id,
+        "ticket_ref": ticket["id"],
+        "base_sha": source_attempt.get("base_sha"),
+        "candidate_sha": source_attempt.get("candidate_sha"),
+        "return_ref": source_attempt.get("return_ref"),
+    }
+    if operations == {"create"}:
+        if (
+            source_attempt.get("mode") != "implement"
+            or not zone_allows(ticket.get("zone", []), path, "create")
+            or not zone_allows(source_attempt.get("lease", {}).get("zone", []), path, "create")
+        ):
+            fail(f"repair lineage lacks an original validated same-ticket create: {path}")
+        return [{**base_entry, "operation": "create"}]
+    if operations not in (set(), {"modify"}) or source_attempt.get("mode") != "repair":
+        fail(f"repair lineage does not continuously reach an original validated create: {path}")
+    provenance = source_attempt.get("repair_lease_provenance")
+    base_sha = source_attempt.get("base_sha")
+    authorization_ref, finding_ref = historical_repair_authorization(
+        p, state, ticket["id"], source_attempt, base_sha
+    )
+    if isinstance(provenance, dict):
+        if provenance.get("packet_base_sha") != base_sha or provenance.get("candidate_sha") != base_sha:
+            fail(f"repair lineage has a broken create-to-modify provenance edge: {path}")
+        prior_ref = provenance.get("source_attempt_ref")
+        prior = next((item for item in state.get("attempts", []) if item.get("id") == prior_ref), None)
+    else:
+        prior_candidates = [
+            item
+            for item in state.get("attempts", [])
+            if item.get("kind") == "worker"
+            and item.get("subject_ref") == ticket["id"]
+            and item.get("candidate_sha") == base_sha
+            and item.get("id") != attempt_id
+        ]
+        if len(prior_candidates) != 1:
+            fail("repair lineage candidate/base SHA chain is missing, ambiguous, or forked")
+        prior = prior_candidates[0]
+    if operations == {"modify"} and (
+        not isinstance(provenance, dict)
+        or not zone_allows(provenance.get("expanded_entries", []), path, "modify")
+        or not zone_allows(source_attempt.get("lease", {}).get("zone", []), path, "modify")
+    ):
+        fail(f"repair lineage has a broken create-to-modify provenance edge: {path}")
+    if prior is None or prior.get("candidate_sha") != base_sha:
+        fail("repair lineage candidate/base SHA chain is stale or forked")
+    lineage = validated_repair_path_lineage(p, state, ticket, prior, path, base_sha, seen)
+    lineage.append(
+        {
+            **base_entry,
+            "operation": "modify" if operations else "preserve",
+            "authorization_ref": authorization_ref,
+            "finding_ref": finding_ref,
+        }
+    )
+    return lineage
+
+
 def effective_worker_lease(
     p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], packet: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -1053,14 +1262,9 @@ def effective_worker_lease(
     if not repair:
         fail(f"packet write allowlist exceeds the ticket zone: {json.dumps(disallowed, sort_keys=True)}")
 
-    source_attempt_ref = repair.get("source_attempt_ref")
-    source_attempt = next(
-        (item for item in state.get("attempts", []) if item.get("id") == source_attempt_ref),
-        None,
-    )
     packet_base = packet.get("workspace", {}).get("expected_base")
-    if source_attempt is None or source_attempt.get("kind") != "worker" or source_attempt.get("subject_ref") != ticket["id"]:
-        fail("repair lease expansion requires same-ticket source_attempt_ref provenance")
+    source_attempt = repair_candidate_worker(state, ticket, repair, packet_base)
+    source_attempt_ref = source_attempt["id"]
     if source_attempt.get("state") != "RETURNED" or not source_attempt.get("return_ref") or not source_attempt.get("candidate_sha"):
         fail("repair lease expansion requires a validated prior candidate attempt")
     if source_attempt.get("lease", {}).get("state") == "quarantined":
@@ -1070,23 +1274,20 @@ def effective_worker_lease(
     if not finding_matches_candidate(state, finding_ref, ticket["id"], packet_base):
         fail("repair lease expansion finding is not bound to the prior candidate")
 
-    prior_return = stored_payload(p, source_attempt.get("return_ref"), "prior worker return")
-    if prior_return.get("status") != "DONE":
-        fail("repair lease expansion requires a prior DONE worker return")
-    created_paths = {
-        relative_path(item.get("path"), "prior created path")
-        for item in prior_return.get("files", [])
-        if item.get("operation") == "create"
-    }
     expanded: list[dict[str, Any]] = []
+    lineage: list[dict[str, Any]] = []
     for violation in disallowed:
         path, operation = violation["path"], violation["operation"]
-        if operation != "modify" or path not in created_paths or not zone_allows(ticket_zone, path, "create") or not zone_allows(source_attempt.get("lease", {}).get("zone", []), path, "create"):
+        if operation != "modify" or not zone_allows(ticket_zone, path, "create"):
             fail(f"repair packet write allowlist lacks prior-create provenance: {path} ({operation})")
         denied = [relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])]
         if any(path == item or path.startswith(item + "/") for item in denied):
             fail(f"repair lease expansion conflicts with packet deny list: {path}")
+        attempts = validated_repair_path_lineage(
+            p, state, ticket, source_attempt, path, packet_base
+        )
         expanded.append({"path": path, "operations": ["modify"]})
+        lineage.append({"path": path, "attempts": attempts})
 
     provenance = {
         "authorization_ref": authorization["id"],
@@ -1095,6 +1296,7 @@ def effective_worker_lease(
         "candidate_sha": source_attempt["candidate_sha"],
         "packet_base_sha": packet_base,
         "expanded_entries": expanded,
+        "lineage": lineage,
     }
     return requested, provenance
 
@@ -2625,6 +2827,7 @@ def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any
             for item in packet.get("write", {}).get("deny", [])
         ]
         expanded: list[dict[str, Any]] = []
+        lineage: list[dict[str, Any]] = []
         requested_exceptions = [
             {"path": entry["path"], "operation": operation}
             for entry in requested
@@ -2644,6 +2847,12 @@ def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any
             if any(path == item or path.startswith(item + "/") for item in denied):
                 fail(f"reconciliation path conflicts with packet deny list: {path}")
             expanded.append({"path": path, "operations": ["modify"]})
+            lineage.append({
+                "path": path,
+                "attempts": validated_repair_path_lineage(
+                    p, state, ticket, prior, path, args.candidate_sha
+                ),
+            })
         legacy_pairs = {(item["path"], item["operation"]) for item in legacy_violations}
         exception_pairs = {(item["path"], item["operation"]) for item in requested_exceptions}
         if not legacy_pairs.issubset(exception_pairs):
@@ -2690,6 +2899,7 @@ def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any
             "candidate_sha": args.candidate_sha,
             "packet_base_sha": args.base_sha,
             "expanded_entries": sorted(expanded, key=lambda item: item["path"]),
+            "lineage": sorted(lineage, key=lambda item: item["path"]),
         }
         receipt = {
             **requested_binding,

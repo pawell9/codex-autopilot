@@ -1,6 +1,10 @@
 # Qualification status
 
-**CODEX-AUTOPILOT V1.0.7 — QUARANTINE RECONCILIATION PATCH RELEASE.**
+**CODEX-AUTOPILOT V1.0.8 — TRANSITIVE REPAIR PROVENANCE PATCH RELEASE.**
+
+The v1.0.8 regressions prove repeated same-ticket create-to-modify repair
+lineage and reject stale/forked candidates, foreign paths/tickets, broken
+provenance, and chains without an original validated create.
 
 The v1.0.7 regression adds positive/idempotent and negative coverage for the
 narrow legacy quarantine reconciliation path without touching the mounted

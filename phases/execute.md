@@ -19,14 +19,18 @@ Read `contracts/worker.md`, `contracts/reviewer.md`, `references/ledger.md`, `re
 `implementation` routes to a minimal worker repair with changed hypothesis and regression proof. `contract` or `user_intent` returns through versioned INTENT/DESIGN/PLAN. `oracle` reconstructs expected behavior independently. `environment`/`permission` performs a conditional preflight or records a user action. `ownership` quarantines and resolves the exact zone/base. `orchestration` reconciles ledger/attempt/effect state. `unknown` gets a fresh read-only diagnosis.
 
 A repair lease is still packet-scoped. The sole cumulative exception is an
-exact same-ticket `create → candidate → repair modify`: the repair packet must
-name the prior worker attempt, use that attempt's candidate SHA as its base,
-reference a current authorized blocking finding raised against that candidate,
-and allow the exact path whose validated prior return declared `create` inside
-the original create zone. `authorize-repair` stores the exact repair-contract
-object, and one authorization is consumed by one repair attempt; the attempt
-records both that authorization and any lease derivation. A stale base,
-foreign path, missing provenance, packet-denied path, or any other operation is
+exact same-ticket chain `create → candidate → repair modify → candidate →
+repair modify ...`. The repair packet must use the current worker candidate
+SHA as its base and name either that worker or the exact finding review. Every
+candidate/base edge must be continuous; every modify hop must carry its own
+accepted blocking finding and consumed authorization; and the chain must end
+at a validated DONE create return inside the original ticket create zone. The
+current packet must independently allow the exact modify path. The attempt
+stores the complete path-specific lineage, including every worker candidate,
+return, finding, and authorization. `authorize-repair` stores the exact
+repair-contract object, and one authorization is consumed by one repair
+attempt. A stale or forked base, other ticket, foreign path, broken provenance,
+packet-denied path, missing original create, or any other operation is
 rejected; quarantined provenance is never reused or auto-released. An already
 quarantined legacy repair return may use `reconcile-quarantined-attempt` only
 when the exact current attempt, prior DONE create attempt, accepted blocking
