@@ -36,8 +36,13 @@ at a validated DONE create return inside the original ticket create zone. The
 current packet must independently allow the exact modify path. The attempt
 stores the complete path-specific lineage, including every worker candidate,
 return, finding, and authorization. `authorize-repair` stores the exact
-repair-contract object, and one authorization is consumed by one repair
-attempt. A stale or forked base, other ticket, foreign path, broken provenance,
+repair-contract object and, when the current candidate crosses a create-only
+path into repair modification, requires a current same-ticket
+`source_attempt_ref` before publishing READY. One authorization is consumed by
+one repair attempt. An unused older READY authorization that omitted this now
+required source may be superseded by a fresh exact contract; the prior decision
+remains historical and is invalidated by the replacement. A stale or forked
+base, other ticket, foreign path, broken provenance,
 packet-denied path, missing original create, or any other operation is
 rejected; quarantined provenance is never reused or auto-released. An already
 quarantined legacy repair return may use `reconcile-quarantined-attempt` only

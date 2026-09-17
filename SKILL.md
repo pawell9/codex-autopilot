@@ -86,7 +86,13 @@ still the exact clean Git base, use `close-blocked-attempt` (alias
 The command derives and revalidates the immediately preceding same-ticket
 candidate, preserves the blocked attempt/return, records the closure receipt,
 releases the lease, and restores ticket linkage. Then enter the next ordinary
-repair only through a fresh `authorize-repair` decision.
+repair only through a fresh `authorize-repair` decision. That authorization
+must already name the exact current same-ticket `source_attempt_ref` whenever
+the repaired candidate requires create-to-modify provenance; do not enter
+READY first and add the field only to the worker packet. An unused older READY
+authorization missing this now-required source may be superseded with a fresh
+authorization, preserving and invalidating the prior decision rather than
+editing history.
 
 For an already quarantined legacy repair return, do not edit the ledger or
 lease. The only normal reconciliation path is

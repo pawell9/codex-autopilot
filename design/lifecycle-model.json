@@ -1,5 +1,5 @@
 {
-  "model_version": "1.0.9",
+  "model_version": "1.0.10",
   "initial": "PREFLIGHT/ACTIVE",
   "success_terminal": "ACCEPT/ACCEPTED",
   "failure_terminals": [

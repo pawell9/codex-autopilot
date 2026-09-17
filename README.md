@@ -6,7 +6,7 @@ orchestrator owns the durable ledger, routing, contracts, review flow, and
 Git integration; bounded workers implement ticket-sized changes, and
 independent reviewers verify them.
 
-**CODEX-AUTOPILOT V1.0.9 — BLOCKED ATTEMPT CLOSURE PATCH RELEASE**
+**CODEX-AUTOPILOT V1.0.10 — REPAIR AUTHORIZATION PROVENANCE PATCH RELEASE**
 
 ## Requirements
 
@@ -117,6 +117,16 @@ and authorization, intersects the path with the current packet allowlist, and
 records the full path-specific lineage. This does not grant general `modify`
 authority to create-only zones; stale/forked candidates, foreign tickets or
 paths, broken provenance, and missing original creates remain blocked.
+
+Before `authorize-repair` moves a ticket to `READY`, it inspects the exact
+current validated candidate. If the repair continues a create-only ticket path
+as a modify, the contract must already contain a current same-ticket
+`source_attempt_ref`; missing, foreign, and stale sources are rejected without
+publishing a ledger revision. Dispatch still requires byte-for-byte equality
+with that authorized contract. A single unused `READY` authorization created
+by an older helper without this now-required source may be superseded through
+the same command: the old decision remains in history and is invalidated by the
+new authorization.
 
 A returned repair that is durably `BLOCKED` before its first write may be
 closed with `close-blocked-attempt` (alias

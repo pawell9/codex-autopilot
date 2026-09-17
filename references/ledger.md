@@ -104,10 +104,16 @@ The helper does not call models, spawn agents, hold a daemon loop, parse prose, 
   zone. Repair may add `modify` only for an exact path that the named same-ticket
   source attempt declared as `create`, when its candidate SHA equals the repair
   packet base and the authorized finding is bound to that candidate. The
-  authorization stores the exact repair-contract object and is single-use; the
-  authorization and lease derivation are stored on the repair attempt. Legacy
-  unbound authorizations require an explicit `authorize-repair` rebind and are
-  never inferred. The narrow reconciliation command above may repair only the
+  authorization stores the exact repair-contract object and is single-use.
+  `authorize-repair` validates required transitive create-to-modify provenance
+  before READY, including the current same-ticket source attempt. Missing,
+  stale, or foreign sources publish no state change. The authorization and
+  lease derivation are stored on the repair attempt. Legacy unbound
+  authorizations require an explicit `authorize-repair` rebind and are never
+  inferred. An unused older READY authorization whose exact bound contract
+  lacks a now-required source may likewise be superseded; the old decision is
+  retained with `invalidated_by` and exact dispatch matching is unchanged. The
+  narrow reconciliation command above may repair only the
   already-recorded create-only compatibility mismatch; all other zone
   violations retain the existing quarantine path.
 - Packet registration revision, immutable subject/publication revision,

@@ -57,19 +57,26 @@ class LifecycleRepairTests(unittest.TestCase):
     def dispatch(self, control: Path, packet: Path, attempt_id: str, revision: int, *, expect: int = 0) -> subprocess.CompletedProcess[str]:
         return run("dispatch", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", str(revision), "--ticket-id", "T-1", "--attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--route-id", f"route-{attempt_id}", "--packet", str(packet), expect=expect)
 
-    def seed_create_candidate_finding(self, root: Path, *, source_attempt_ref: str | None = "A-create") -> tuple[Path, dict[str, Path], str]:
-        control, _, paths = self.init_ticket(root, operation="create")
+    def seed_create_candidate_finding(
+        self,
+        root: Path,
+        *,
+        source_attempt_ref: str | None = "A-create",
+        zone_operation: str = "create",
+        authorize: bool = True,
+    ) -> tuple[Path, dict[str, Path], str]:
+        control, _, paths = self.init_ticket(root, operation=zone_operation)
         candidate = "b" * 40
         prior_return = {
             "identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": "A-create", "packet_hash": "1" * 64, "epoch": 0},
-            "status": "DONE", "result": "created app.txt", "files": [{"path": "app.txt", "operation": "create"}],
-            "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "created", "evidence_ref": "EV-create"}],
+            "status": "DONE", "result": f"{zone_operation}d app.txt", "files": [{"path": "app.txt", "operation": zone_operation}],
+            "checks": [{"check_id": "oracle", "outcome": "pass", "actual": zone_operation, "evidence_ref": "EV-create"}],
             "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV-create"]}],
         }
         prior_digest = ledger.object_store(paths, ledger.canonical_bytes(prior_return))
         state, previous = ledger.load_state(paths)
         state["attempts"] = [
-            {"id": "A-create", "kind": "worker", "mode": "implement", "subject_ref": "T-1", "packet_ref": "objects/" + "2" * 64, "packet_hash": "1" * 64, "epoch": 0, "state": "RETURNED", "lease": {"id": "L-create", "state": "released", "zone": [{"path": "app.txt", "operations": ["create"]}]}, "route_ref": "route-create", "checkout": str(root / "repo"), "base_sha": "a" * 40, "candidate_sha": candidate, "candidate_tree_sha": "c" * 40, "return_ref": f"objects/{prior_digest}", "finding_refs": []},
+            {"id": "A-create", "kind": "worker", "mode": "implement", "subject_ref": "T-1", "packet_ref": "objects/" + "2" * 64, "packet_hash": "1" * 64, "epoch": 0, "state": "RETURNED", "lease": {"id": "L-create", "state": "released", "zone": [{"path": "app.txt", "operations": [zone_operation]}]}, "route_ref": "route-create", "checkout": str(root / "repo"), "base_sha": "a" * 40, "candidate_sha": candidate, "candidate_tree_sha": "c" * 40, "return_ref": f"objects/{prior_digest}", "finding_refs": []},
             {"id": "A-review", "kind": "review", "mode": "change", "subject_ref": "T-1", "packet_ref": "objects/" + "3" * 64, "packet_hash": "4" * 64, "epoch": 0, "state": "RETURNED", "lease": {"id": "L-review", "state": "released", "zone": []}, "route_ref": None, "checkout": None, "base_sha": candidate, "candidate_sha": candidate, "candidate_tree_sha": "c" * 40, "return_ref": "objects/" + "5" * 64, "finding_refs": ["F-1"], "subject_fingerprint": candidate, "review_result": "BLOCK"},
         ]
         state["findings"] = [{"id": "F-1", "axis": "correctness", "impact": "blocking", "claim": "created file needs correction", "expected": "correct", "actual": "incorrect", "evidence": "EV-review", "affected_refs": ["T-1"], "source_ref": "A-review", "intent_revision": None, "repair_contract_ref": None, "invalidated_by": []}]
@@ -81,9 +88,12 @@ class LifecycleRepairTests(unittest.TestCase):
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
-        repair = {"cause": "implementation", "finding_ref": "F-1", "hypothesis": "created content is wrong", "expected_proof": "regression observes corrected content", "stopping_condition": "stop after the focused regression passes", "causal_change": "replace the generated value", "source_attempt_ref": source_attempt_ref}
+        repair = {"cause": "implementation", "finding_ref": "F-1", "hypothesis": "created content is wrong", "expected_proof": "regression observes corrected content", "stopping_condition": "stop after the focused regression passes", "causal_change": "replace the generated value"}
+        if source_attempt_ref is not None:
+            repair["source_attempt_ref"] = source_attempt_ref
         repair_path = root / "repair-contract.json"; write_json(repair_path, repair)
-        run("authorize-repair", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--finding-ref", "F-1", "--authorization-id", "AUTH-1", "--repair-contract", str(repair_path))
+        if authorize:
+            run("authorize-repair", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--finding-ref", "F-1", "--authorization-id", "AUTH-1", "--repair-contract", str(repair_path))
         return control, paths, candidate
 
     def seed_completed_repair_chain(self, root: Path, completed_repairs: int) -> tuple[Path, dict[str, Path], str, dict[str, object]]:
@@ -426,11 +436,95 @@ class LifecycleRepairTests(unittest.TestCase):
             final, _ = ledger.load_state(paths)
             self.assertEqual("active", ledger.attempt_by_id(final, "A-repair")["lease"]["state"])
 
-    def test_repair_modify_rejects_stale_foreign_and_missing_provenance(self) -> None:
+    def test_authorize_repair_requires_source_for_create_to_modify_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, paths, _ = self.seed_create_candidate_finding(root, source_attempt_ref=None, authorize=False)
+            rejected = run(
+                "authorize-repair", "--control-root", str(control), "--run-id", "repair-run",
+                "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1",
+                "--finding-ref", "F-1", "--authorization-id", "AUTH-missing",
+                "--repair-contract", str(root / "repair-contract.json"), expect=2,
+            )
+            self.assertIn("source_attempt_ref provenance", rejected.stderr)
+            state, _ = ledger.load_state(paths)
+            self.assertEqual(2, state["revision"])
+            self.assertEqual("REVIEW", state["tickets"][0]["state"])
+            self.assertFalse(any(item.get("id") == "AUTH-missing" for item in state.get("decisions", [])))
+
+    def test_authorize_repair_does_not_require_source_for_ordinary_modify(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, paths, _ = self.seed_create_candidate_finding(
+                root, source_attempt_ref=None, zone_operation="modify", authorize=False,
+            )
+            result = run(
+                "authorize-repair", "--control-root", str(control), "--run-id", "repair-run",
+                "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1",
+                "--finding-ref", "F-1", "--authorization-id", "AUTH-ordinary",
+                "--repair-contract", str(root / "repair-contract.json"),
+            )
+            self.assertTrue(json.loads(result.stdout)["authorized"])
+            state, _ = ledger.load_state(paths)
+            self.assertEqual("READY", state["tickets"][0]["state"])
+
+    def test_authorize_repair_rejects_stale_source_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, paths, _ = self.seed_create_candidate_finding(
+                root, source_attempt_ref="A-stale", authorize=False,
+            )
+            rejected = run(
+                "authorize-repair", "--control-root", str(control), "--run-id", "repair-run",
+                "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1",
+                "--finding-ref", "F-1", "--authorization-id", "AUTH-stale",
+                "--repair-contract", str(root / "repair-contract.json"), expect=2,
+            )
+            self.assertIn("same-ticket source_attempt_ref provenance", rejected.stderr)
+            state, _ = ledger.load_state(paths)
+            self.assertEqual("REVIEW", state["tickets"][0]["state"])
+
+    def test_unused_ready_authorization_without_required_source_can_be_superseded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, paths, candidate = self.seed_create_candidate_finding(
+                root, source_attempt_ref=None, authorize=False,
+            )
+            bad_contract = json.loads((root / "repair-contract.json").read_text(encoding="utf-8"))
+            bad_digest = ledger.object_store(paths, ledger.canonical_bytes(bad_contract))
+            state, _ = ledger.load_state(paths)
+            state["decisions"] = [{
+                "id": "AUTH-bad", "type": "repair_authorization", "status": "authorized",
+                "decision": "REPAIR", "reason": bad_contract["hypothesis"],
+                "evidence_refs": ["F-1", f"objects/{bad_digest}"],
+                "affected_refs": ["T-1", "F-1"], "intent_revision": None, "invalidated_by": [],
+            }]
+            state["findings"][0]["repair_contract_ref"] = "AUTH-bad"
+            state["tickets"][0]["state"] = "READY"
+            state["lifecycle"]["control"] = "ACTIVE"
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+
+            fixed_contract = {**bad_contract, "source_attempt_ref": "A-create"}
+            fixed_path = root / "fixed-repair-contract.json"; write_json(fixed_path, fixed_contract)
+            run(
+                "authorize-repair", "--control-root", str(control), "--run-id", "repair-run",
+                "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1",
+                "--finding-ref", "F-1", "--authorization-id", "AUTH-fixed",
+                "--repair-contract", str(fixed_path),
+            )
+            rebound, _ = ledger.load_state(paths)
+            old = next(item for item in rebound["decisions"] if item["id"] == "AUTH-bad")
+            self.assertEqual(["AUTH-fixed"], old["invalidated_by"])
+            self.assertEqual("AUTH-fixed", rebound["findings"][0]["repair_contract_ref"])
+            packet = self.worker_packet(root, "A-fixed", mode="repair", base=candidate, repair=fixed_contract)
+            self.dispatch(control, packet, "A-fixed", 3)
+            dispatched, _ = ledger.load_state(paths)
+            self.assertEqual("AUTH-fixed", ledger.attempt_by_id(dispatched, "A-fixed")["repair_authorization_ref"])
+
+    def test_repair_modify_rejects_stale_and_foreign_scope(self) -> None:
         cases = {
             "stale": {"base": "d" * 40, "path": "app.txt", "source": "A-create", "error": "base SHA is stale"},
             "foreign": {"base": "b" * 40, "path": "other.txt", "source": "A-create", "error": "lacks prior-create provenance"},
-            "missing": {"base": "b" * 40, "path": "app.txt", "source": None, "error": "source_attempt_ref provenance"},
         }
         for case, values in cases.items():
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:

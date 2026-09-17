@@ -1,5 +1,22 @@
 # Changelog
 
+## [v1.0.10] — 2026-09-17
+
+Repair authorization provenance patch release.
+
+- Moved transitive same-ticket create-to-modify source validation into
+  `authorize-repair`, before the ticket can enter `READY`.
+- Required the exact current worker or candidate-bound finding review as
+  `source_attempt_ref` when the current candidate crosses a create-only zone;
+  missing, stale, and foreign sources leave the ledger unchanged.
+- Preserved exact authorized-contract matching at dispatch and kept ordinary
+  modify repairs source-optional.
+- Added a narrow history-preserving supersession path for an unused older
+  `READY` authorization whose bound contract lacks the now-required source.
+- Added regression coverage for rejection, successful authorize-to-dispatch,
+  ordinary repairs, stale sources, and revision-49-style authorization
+  recovery.
+
 ## [v1.0.9] — 2026-09-17
 
 BLOCKED no-write repair closure patch release.

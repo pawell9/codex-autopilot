@@ -1,6 +1,12 @@
 # Qualification status
 
-**CODEX-AUTOPILOT V1.0.9 — BLOCKED ATTEMPT CLOSURE PATCH RELEASE.**
+**CODEX-AUTOPILOT V1.0.10 — REPAIR AUTHORIZATION PROVENANCE PATCH RELEASE.**
+
+The v1.0.10 regressions prove that transitive create-to-modify provenance is
+validated before repair authorization can enter READY, exact current sources
+authorize and dispatch, ordinary modify repairs remain source-optional, stale
+sources fail closed, and an unused legacy READY authorization missing the now
+required source can be superseded without rewriting ledger history.
 
 The v1.0.9 regressions prove safe closure of an exact no-write BLOCKED repair,
 automatic restoration of the immediate prior validated candidate, immutable

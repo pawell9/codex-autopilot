@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.9"
+SKILL_VERSION = "1.0.10"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 COMPATIBILITY_FLOOR = "1.0.0"
@@ -1069,6 +1069,56 @@ def repair_candidate_worker(
     return current
 
 
+def repair_requires_transitive_create_modify_provenance(
+    p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any]
+) -> bool:
+    """Detect a repair of a current candidate that crosses a create-only zone."""
+    current = next(
+        (item for item in state.get("attempts", []) if item.get("id") == ticket.get("current_attempt")),
+        None,
+    )
+    if (
+        current is None
+        or current.get("kind") != "worker"
+        or current.get("subject_ref") != ticket.get("id")
+        or current.get("state") != "RETURNED"
+        or not current.get("candidate_sha")
+        or not current.get("return_ref")
+    ):
+        return False
+
+    returned = stored_payload(p, current["return_ref"], "current candidate worker return")
+    schema_root = schema()
+    validate(returned, schema_root["$defs"]["worker_return"], schema_root, "$.current_candidate_return")
+    identity = packet_identity(returned)
+    if (
+        returned.get("status") != "DONE"
+        or identity.get("run_id") != state.get("run_id")
+        or identity.get("ticket_id") != ticket.get("id")
+        or identity.get("attempt_id") != current.get("id")
+        or identity.get("packet_hash") != current.get("packet_hash")
+        or identity.get("epoch") != current.get("epoch")
+    ):
+        fail("repair authorization cannot prove the exact current validated candidate return")
+
+    candidate_paths = {
+        relative_path(item.get("path"), "current candidate return path")
+        for item in returned.get("files", [])
+        if item.get("operation") in ("create", "modify")
+    }
+    provenance = current.get("repair_lease_provenance")
+    if isinstance(provenance, dict):
+        candidate_paths.update(
+            relative_path(item.get("path"), "current repair provenance path")
+            for item in provenance.get("expanded_entries", [])
+        )
+    return any(
+        zone_allows(ticket.get("zone", []), path, "create")
+        and not zone_allows(ticket.get("zone", []), path, "modify")
+        for path in candidate_paths
+    )
+
+
 def historical_repair_authorization(
     p: dict[str, Path], state: dict[str, Any], ticket_id: str, attempt: dict[str, Any], candidate_sha: str
 ) -> tuple[str, str]:
@@ -1939,19 +1989,42 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
     validate(contract, root["$defs"]["repair_contract"], root, "$.repair_contract")
     if contract.get("finding_ref") != args.finding_ref:
         fail("repair contract finding_ref does not match the command")
-    contract_ref = f"objects/{object_store(p, canonical_bytes(contract))}"
 
     def change(state: dict[str, Any]) -> None:
         ticket = next((item for item in state.get("tickets", []) if item.get("id") == args.ticket_id), None)
-        legacy_authorization = active_repair_authorization(state, args.ticket_id, args.finding_ref) if ticket else None
+        prior_authorization = active_repair_authorization(state, args.ticket_id, args.finding_ref) if ticket else None
+        authorization_consumed = bool(
+            prior_authorization
+            and any(
+                item.get("repair_authorization_ref") == prior_authorization.get("id")
+                for item in state.get("attempts", [])
+            )
+        )
+        prior_contract_refs = [
+            ref for ref in prior_authorization.get("evidence_refs", [])
+            if isinstance(ref, str) and ref.startswith("objects/")
+        ] if prior_authorization else []
         legacy_rebind = bool(
             ticket
             and ticket.get("state") == "READY"
-            and legacy_authorization
-            and not any(isinstance(ref, str) and ref.startswith("objects/") for ref in legacy_authorization.get("evidence_refs", []))
-            and not any(item.get("repair_authorization_ref") == legacy_authorization.get("id") for item in state.get("attempts", []))
+            and prior_authorization
+            and not prior_contract_refs
+            and not authorization_consumed
         )
-        if ticket is None or (ticket.get("state") not in ("REVIEW", "BLOCKED", "REPAIR") and not legacy_rebind):
+        provenance_rebind = bool(
+            ticket
+            and ticket.get("state") == "READY"
+            and prior_authorization
+            and len(prior_contract_refs) == 1
+            and not authorization_consumed
+            and repair_requires_transitive_create_modify_provenance(p, state, ticket)
+            and not stored_payload(p, prior_contract_refs[0], "prior authorized repair contract").get("source_attempt_ref")
+        )
+        if ticket is None or (
+            ticket.get("state") not in ("REVIEW", "BLOCKED", "REPAIR")
+            and not legacy_rebind
+            and not provenance_rebind
+        ):
             fail("repair authorization requires a REVIEW/BLOCKED/REPAIR ticket")
         known_findings = {item.get("id") for item in state.get("findings", [])} | {item.get("id") for item in state.get("issues", [])}
         if args.finding_ref not in known_findings:
@@ -1965,6 +2038,12 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
             fail("repair authorization finding/issue is not bound to this ticket")
         if any(item.get("id") == args.authorization_id for item in state.get("decisions", [])):
             fail("repair authorization ID already exists")
+        if repair_requires_transitive_create_modify_provenance(p, state, ticket):
+            current = next(
+                item for item in state.get("attempts", [])
+                if item.get("id") == ticket.get("current_attempt")
+            )
+            repair_candidate_worker(state, ticket, contract, current["candidate_sha"])
         for attempt in state.get("attempts", []):
             if attempt.get("subject_ref") == args.ticket_id and attempt.get("state") in ("PREPARED", "DISPATCHED"):
                 fail("repair authorization requires stopped attempts")
@@ -1972,6 +2051,9 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
                 fail("repair authorization requires quarantine reconciliation")
             if attempt.get("subject_ref") == args.ticket_id and attempt.get("lease", {}).get("state") == "active":
                 attempt["lease"]["state"] = "released"
+        if provenance_rebind:
+            prior_authorization.setdefault("invalidated_by", []).append(args.authorization_id)
+        contract_ref = f"objects/{object_store(p, canonical_bytes(contract))}"
         state.setdefault("decisions", []).append({"id": args.authorization_id, "type": "repair_authorization", "status": "authorized", "decision": "REPAIR", "reason": contract["hypothesis"], "evidence_refs": [args.finding_ref, contract_ref], "affected_refs": [args.ticket_id, args.finding_ref], "intent_revision": state.get("intent", {}).get("current_revision"), "invalidated_by": []})
         if finding is not None:
             finding["repair_contract_ref"] = args.authorization_id
