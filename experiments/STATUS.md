@@ -1,6 +1,12 @@
 # Qualification status
 
-**CODEX-AUTOPILOT V1.0.8 — TRANSITIVE REPAIR PROVENANCE PATCH RELEASE.**
+**CODEX-AUTOPILOT V1.0.9 — BLOCKED ATTEMPT CLOSURE PATCH RELEASE.**
+
+The v1.0.9 regressions prove safe closure of an exact no-write BLOCKED repair,
+automatic restoration of the immediate prior validated candidate, immutable
+closure audit evidence, idempotency, and an ordinary subsequent repair cycle;
+wrong-status, candidate-bearing, stale-linkage, closed-lease, and dirty-checkout
+states remain blocked.
 
 The v1.0.8 regressions prove repeated same-ticket create-to-modify repair
 lineage and reject stale/forked candidates, foreign paths/tickets, broken

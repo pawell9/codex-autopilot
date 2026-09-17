@@ -14,6 +14,14 @@ Read `contracts/worker.md`, `contracts/reviewer.md`, `references/ledger.md`, `re
 8. Stop the reviewer, run the independent integrity barrier, and ingest its exact structured return. A subject/state/docs/evidence mismatch invalidates the verdict and quarantines the target. PASS on an altered or unverified subject is not PASS.
 9. On required PASS, mechanically verify integration and release the reservation; mark the ticket `INTEGRATED`. On a finding, preserve the immutable verdict, triage cause first, and use `authorize-repair` before repair dispatch. Semantic integration conflicts become worker integration-repair tickets. Do not batch away a blocking issue.
 
+If a repair returns `BLOCKED` before any write, do not feed that candidate-less
+attempt into a new authorization and do not hand-release its lease. Run
+`close-blocked-attempt` only when the stored return is exact and declares
+`files=[]`; the command independently proves a clean checkout at the attempt
+base, derives the immediate previous validated candidate, preserves the full
+attempt history, releases the lease, and restores `ticket.current_attempt`.
+Afterward create a changed repair contract and use normal `authorize-repair`.
+
 ## Cause-first repair
 
 `implementation` routes to a minimal worker repair with changed hypothesis and regression proof. `contract` or `user_intent` returns through versioned INTENT/DESIGN/PLAN. `oracle` reconstructs expected behavior independently. `environment`/`permission` performs a conditional preflight or records a user action. `ownership` quarantines and resolves the exact zone/base. `orchestration` reconciles ledger/attempt/effect state. `unknown` gets a fresh read-only diagnosis.

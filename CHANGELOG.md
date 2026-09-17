@@ -1,5 +1,24 @@
 # Changelog
 
+## [v1.0.9] — 2026-09-17
+
+BLOCKED no-write repair closure patch release.
+
+- Added owner/revision-fenced `close-blocked-attempt` with
+  `restore-last-validated-candidate` as an alias for returned BLOCKED repair
+  attempts that stopped before their first write.
+- Required a schema-valid exact return with `files=[]`, null candidate fields,
+  active lease, no unresolved effect, exact checkout HEAD/tree, and a complete
+  zero-change Git audit including tracked, untracked, ignored, mode/type,
+  rename, and symlink evidence.
+- Derived the immediate prior validated same-ticket candidate without accepting
+  a candidate selector, released only the blocked attempt lease, preserved all
+  attempt/return history, and appended a hash-addressed receipt plus decision
+  and evidence records before restoring ticket linkage.
+- Added positive/idempotent/follow-on repair-cycle coverage and negative tests
+  for wrong status, candidate presence, stale linkage, released lease, and a
+  dirty checkout.
+
 ## [v1.0.8] — 2026-09-17
 
 Transitive repair provenance patch release.

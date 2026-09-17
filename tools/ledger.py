@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.8"
+SKILL_VERSION = "1.0.9"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 COMPATIBILITY_FLOOR = "1.0.0"
@@ -2628,6 +2628,206 @@ def audit_write_set(
     }
 
 
+def cmd_close_blocked_attempt(args: argparse.Namespace) -> dict[str, Any]:
+    """Close a no-write BLOCKED repair and restore its immediate prior candidate."""
+    p = paths(args.control_root, args.run_id)
+    ticket_id = safe_id(args.ticket_id, "ticket_id")
+    attempt_id = safe_id(args.attempt_id, "attempt_id")
+    closure_id = safe_id(f"blocked-close-{attempt_id}", "blocked closure ID")
+
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        attempt = attempt_by_id(state, attempt_id)
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == ticket_id), None)
+        existing_ref = attempt.get("blocked_closure_ref")
+        if existing_ref:
+            receipt = stored_payload(p, existing_ref, "blocked attempt closure receipt")
+            restored_ref = receipt.get("restored_attempt_ref")
+            if (
+                receipt.get("closure_id") != closure_id
+                or receipt.get("ticket_id") != ticket_id
+                or receipt.get("attempt_id") != attempt_id
+                or ticket is None
+                or ticket.get("current_attempt") != restored_ref
+                or attempt.get("lease", {}).get("state") != "released"
+                or not any(item.get("id") == closure_id and item.get("type") == "blocked_attempt_closure" for item in state.get("decisions", []))
+            ):
+                fail("blocked attempt closure receipt exists but ledger effects are incomplete or conflicting")
+            return {
+                "closed": True,
+                "idempotent": True,
+                "attempt_id": attempt_id,
+                "restored_attempt_id": restored_ref,
+                "candidate_sha": receipt.get("restored_candidate_sha"),
+                "receipt_ref": existing_ref,
+                "revision": state["revision"],
+            }
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        if state["lifecycle"]["control"] != "BLOCKED":
+            fail("blocked attempt closure requires lifecycle control BLOCKED")
+        if ticket is None or ticket.get("state") != "BLOCKED" or ticket.get("current_attempt") != attempt_id or attempt.get("subject_ref") != ticket_id:
+            fail("blocked attempt closure requires the exact current BLOCKED ticket attempt")
+        if attempt.get("kind") != "worker" or attempt.get("mode") != "repair" or attempt.get("state") != "RETURNED":
+            fail("blocked attempt closure applies only to a returned worker repair attempt")
+        if attempt.get("lease", {}).get("state") != "active":
+            fail("blocked attempt closure requires the attempt's active lease")
+        if attempt.get("candidate_sha") is not None or attempt.get("candidate_tree_sha") is not None:
+            fail("blocked attempt closure requires candidate_sha and candidate_tree_sha to be null")
+        if any(item.get("state") in ("prepared", "uncertain") for item in state.get("operations", [])):
+            fail("blocked attempt closure requires all prepared effects to be reconciled")
+
+        returned = stored_payload(p, attempt.get("return_ref"), "blocked worker return")
+        schema_root = schema()
+        validate(returned, schema_root["$defs"]["worker_return"], schema_root, "$.blocked_return")
+        identity = packet_identity(returned)
+        if (
+            returned.get("status") != "BLOCKED"
+            or returned.get("files") != []
+            or identity.get("run_id") != state["run_id"]
+            or identity.get("ticket_id") != ticket_id
+            or identity.get("attempt_id") != attempt_id
+            or identity.get("packet_hash") != attempt.get("packet_hash")
+            or identity.get("epoch") != attempt.get("epoch")
+        ):
+            fail("blocked attempt closure requires an exact validated BLOCKED return declaring no files")
+
+        attempt_index = next(index for index, item in enumerate(state.get("attempts", [])) if item.get("id") == attempt_id)
+        earlier_workers = [
+            item for item in state.get("attempts", [])[:attempt_index]
+            if item.get("kind") == "worker" and item.get("subject_ref") == ticket_id and item.get("candidate_sha")
+        ]
+        if not earlier_workers:
+            fail("blocked attempt closure requires a previous validated candidate for the same ticket")
+        restored = earlier_workers[-1]
+        if restored.get("candidate_sha") != attempt.get("base_sha"):
+            fail("the last validated same-ticket candidate does not match the blocked attempt base")
+        if restored.get("state") != "RETURNED" or restored.get("lease", {}).get("state") != "released" or not restored.get("candidate_tree_sha"):
+            fail("the last same-ticket candidate is not a closed validated candidate")
+        restored_return = stored_payload(p, restored.get("return_ref"), "restored candidate worker return")
+        validate(restored_return, schema_root["$defs"]["worker_return"], schema_root, "$.restored_return")
+        restored_identity = packet_identity(restored_return)
+        if (
+            restored_return.get("status") != "DONE"
+            or restored_identity.get("run_id") != state["run_id"]
+            or restored_identity.get("ticket_id") != ticket_id
+            or restored_identity.get("attempt_id") != restored.get("id")
+            or restored_identity.get("packet_hash") != restored.get("packet_hash")
+            or restored_identity.get("epoch") != restored.get("epoch")
+        ):
+            fail("the last same-ticket candidate lacks an exact validated DONE return")
+        provenance = attempt.get("repair_lease_provenance")
+        if isinstance(provenance, dict) and (
+            provenance.get("source_attempt_ref") != restored.get("id")
+            or provenance.get("candidate_sha") != restored.get("candidate_sha")
+            or provenance.get("packet_base_sha") != restored.get("candidate_sha")
+        ):
+            fail("blocked repair provenance does not point to the last validated candidate")
+        other_open = [
+            item.get("id") for item in state.get("attempts", [])
+            if item.get("subject_ref") == ticket_id
+            and item.get("id") != attempt_id
+            and item.get("lease", {}).get("state") in ("active", "quarantined")
+        ]
+        if other_open:
+            fail(f"blocked attempt closure found other open same-ticket leases: {other_open}")
+
+        if not isinstance(attempt.get("checkout"), str) or not attempt.get("checkout"):
+            fail("blocked attempt closure requires an exact checkout path")
+        checkout = safe_root(attempt["checkout"], "blocked attempt checkout")
+        top_level = Path(git_output(checkout, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+        try:
+            exact_worktree = checkout.samefile(top_level)
+        except OSError:
+            exact_worktree = False
+        if not exact_worktree:
+            fail("blocked attempt checkout is not the exact Git worktree root")
+        observed_head = git_output(checkout, "rev-parse", "HEAD").decode().strip()
+        if observed_head != attempt.get("base_sha") or observed_head != restored.get("candidate_sha"):
+            fail("blocked attempt checkout HEAD does not match its last validated candidate base")
+        observed_tree = git_output(checkout, "rev-parse", "HEAD^{tree}").decode().strip()
+        if observed_tree != restored.get("candidate_tree_sha"):
+            fail("blocked attempt checkout tree does not match the last validated candidate")
+        baseline = git_tree_baseline(checkout, observed_head)
+        audit = audit_write_set(checkout, baseline, [], [])
+        if not audit.get("pass") or audit.get("changed_paths"):
+            fail(f"blocked attempt checkout is not unchanged: {json.dumps(audit.get('changed_paths', []), sort_keys=True)}")
+
+        receipt = {
+            "closure_id": closure_id,
+            "kind": "blocked_attempt_closure",
+            "run_id": state["run_id"],
+            "ticket_id": ticket_id,
+            "attempt_id": attempt_id,
+            "source_revision": state["revision"],
+            "source_ledger_hash": sha256_bytes(previous_raw),
+            "return_ref": attempt.get("return_ref"),
+            "return_status": "BLOCKED",
+            "declared_files": [],
+            "candidate_sha": None,
+            "candidate_tree_sha": None,
+            "lease_before": "active",
+            "lease_after": "released",
+            "checkout": str(checkout),
+            "observed_head": observed_head,
+            "observed_tree": observed_tree,
+            "write_set_audit": audit,
+            "restored_attempt_ref": restored["id"],
+            "restored_candidate_sha": restored["candidate_sha"],
+            "restored_candidate_tree_sha": restored["candidate_tree_sha"],
+            "owner_epoch": state["owner"]["epoch"],
+        }
+        receipt_digest = object_store(p, canonical_bytes(receipt))
+        receipt_ref = f"objects/{receipt_digest}"
+        attempt["lease"]["state"] = "released"
+        attempt["blocked_closure_ref"] = receipt_ref
+        ticket["current_attempt"] = restored["id"]
+        state.setdefault("decisions", []).append({
+            "id": closure_id,
+            "type": "blocked_attempt_closure",
+            "status": "closed",
+            "decision": "RESTORE_LAST_VALIDATED_CANDIDATE",
+            "reason": "validated BLOCKED repair returned before any file or candidate change",
+            "evidence_refs": [attempt["return_ref"], receipt_ref],
+            "affected_refs": [ticket_id, attempt_id, restored["id"]],
+            "intent_revision": state.get("intent", {}).get("current_revision"),
+            "invalidated_by": [],
+        })
+        evidence_id = f"ev-{receipt_digest[:16]}"
+        state.setdefault("evidence", []).append({
+            "id": evidence_id,
+            "hash": receipt_digest,
+            "source": "blocked_attempt_closure",
+            "scenario": "BLOCKED_NO_WRITE",
+            "outcome": "RESTORED_LAST_VALIDATED_CANDIDATE",
+            "observer": "ledger-helper",
+            "subject": attempt_id,
+        })
+        state["lifecycle"]["reason"] = "blocked_attempt_closed"
+        state["lifecycle"]["next_action"] = {
+            "kind": "authorize_repair",
+            "subject_refs": [ticket_id, restored["id"], attempt_id],
+            "preconditions": ["changed repair contract", "fresh authorization and attempt ID", "dependencies remain INTEGRATED"],
+            "read_refs": ["phases/execute.md", "references/ledger.md", "references/routing.md"],
+        }
+        state["revision"] += 1
+        state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        state["updated_at"] = now()
+        publish(p, state, previous_raw, "blocked-attempt-closed")
+        return {
+            "closed": True,
+            "idempotent": False,
+            "attempt_id": attempt_id,
+            "restored_attempt_id": restored["id"],
+            "candidate_sha": restored["candidate_sha"],
+            "receipt_ref": receipt_ref,
+            "revision": state["revision"],
+            "next_action": state["lifecycle"]["next_action"],
+        }
+
+
 def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any]:
     """Reconcile one legacy create-only repair lease without weakening quarantine."""
     p = paths(args.control_root, args.run_id)
@@ -4333,6 +4533,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch = sub.add_parser("dispatch"); dispatch.add_argument("--control-root", required=True); dispatch.add_argument("--run-id", required=True); dispatch.add_argument("--owner-token", required=True); dispatch.add_argument("--revision", type=int, required=True); dispatch.add_argument("--ticket-id", required=True); dispatch.add_argument("--attempt-id", required=True); dispatch.add_argument("--lease-id", required=True); dispatch.add_argument("--route-id", required=True); dispatch.add_argument("--packet", required=True); dispatch.add_argument("--route")
     ready = sub.add_parser("ready-ticket"); ready.add_argument("--control-root", required=True); ready.add_argument("--run-id", required=True); ready.add_argument("--owner-token", required=True); ready.add_argument("--revision", type=int, required=True); ready.add_argument("--ticket-id", required=True)
     repair = sub.add_parser("authorize-repair"); repair.add_argument("--control-root", required=True); repair.add_argument("--run-id", required=True); repair.add_argument("--owner-token", required=True); repair.add_argument("--revision", type=int, required=True); repair.add_argument("--ticket-id", required=True); repair.add_argument("--finding-ref", required=True); repair.add_argument("--authorization-id", required=True); repair.add_argument("--repair-contract", required=True)
+    close_blocked = sub.add_parser("close-blocked-attempt", aliases=["restore-last-validated-candidate"]); close_blocked.add_argument("--control-root", required=True); close_blocked.add_argument("--run-id", required=True); close_blocked.add_argument("--owner-token", required=True); close_blocked.add_argument("--revision", type=int, required=True); close_blocked.add_argument("--ticket-id", required=True); close_blocked.add_argument("--attempt-id", required=True)
     reconcile_quarantine = sub.add_parser("reconcile-quarantined-attempt"); reconcile_quarantine.add_argument("--control-root", required=True); reconcile_quarantine.add_argument("--run-id", required=True); reconcile_quarantine.add_argument("--owner-token", required=True); reconcile_quarantine.add_argument("--revision", type=int, required=True); reconcile_quarantine.add_argument("--ticket-id", required=True); reconcile_quarantine.add_argument("--attempt-id", required=True); reconcile_quarantine.add_argument("--prior-attempt-id", required=True); reconcile_quarantine.add_argument("--finding-ref", required=True); reconcile_quarantine.add_argument("--candidate-sha", required=True); reconcile_quarantine.add_argument("--base-sha", required=True); reconcile_quarantine.add_argument("--baseline", help="optional pre-attempt manifest; omitted means derive the complete baseline from the exact Git base tree"); reconcile_quarantine.add_argument("--reconciliation-id", required=True); reconcile_quarantine.add_argument("--actor", required=True)
     terminate = sub.add_parser("terminate-attempt"); terminate.add_argument("--control-root", required=True); terminate.add_argument("--run-id", required=True); terminate.add_argument("--owner-token", required=True); terminate.add_argument("--revision", type=int, required=True); terminate.add_argument("--attempt-id", required=True); terminate.add_argument("--state", choices=["LOST", "INTERRUPTED"], required=True); terminate.add_argument("--lease-state", choices=["released", "quarantined"], required=True); terminate.add_argument("--evidence", required=True)
     candidate = sub.add_parser("candidate"); candidate.add_argument("--control-root", required=True); candidate.add_argument("--run-id", required=True); candidate.add_argument("--owner-token", required=True); candidate.add_argument("--revision", type=int, required=True); candidate.add_argument("--attempt-id", required=True); candidate.add_argument("--commit-receipt", required=True); candidate.add_argument("--operation-id", required=True)
@@ -4371,6 +4572,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "dispatch": result = cmd_dispatch(args)
         elif args.command == "ready-ticket": result = cmd_ready_ticket(args)
         elif args.command == "authorize-repair": result = cmd_authorize_repair(args)
+        elif args.command in ("close-blocked-attempt", "restore-last-validated-candidate"): result = cmd_close_blocked_attempt(args)
         elif args.command == "reconcile-quarantined-attempt": result = cmd_reconcile_quarantined_attempt(args)
         elif args.command == "terminate-attempt": result = cmd_terminate_attempt(args)
         elif args.command == "candidate": result = cmd_candidate(args)

@@ -267,6 +267,50 @@ class LifecycleRepairTests(unittest.TestCase):
             args.extend(["--baseline", str(baseline)])
         return run(*args, expect=expect)
 
+    def seed_blocked_no_write_repair(self, root: Path) -> tuple[Path, Path, dict[str, Path], str, str]:
+        control, repo, paths = self.init_ticket(root)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "README.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], cwd=repo, check=True)
+        old_candidate = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+        (repo / "app.txt").write_text("candidate\n", encoding="utf-8")
+        subprocess.run(["git", "add", "app.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "candidate"], cwd=repo, check=True)
+        candidate = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+        candidate_tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+
+        def worker_return(attempt_id: str, packet_hash: str, status: str, files: list[dict[str, str]]) -> str:
+            payload = {
+                "identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": attempt_id, "packet_hash": packet_hash, "epoch": 0},
+                "status": status, "result": "candidate complete" if status == "DONE" else "blocked before first write",
+                "files": files,
+                "checks": [{"check_id": "oracle", "outcome": "pass" if status == "DONE" else "not_run", "actual": "clean", "evidence_ref": f"EV-{attempt_id}"}],
+                "criteria": [{"criterion_id": "C-1", "outcome": "satisfied" if status == "DONE" else "unverifiable", "evidence_refs": [f"EV-{attempt_id}"]}],
+                **({"issues": [{"id": "ISS-blocked", "type": "scope_blocker", "cause": "ownership", "impact": "blocking", "affected_refs": ["T-1"], "disposition": "authorize changed scope"}]} if status == "BLOCKED" else {}),
+            }
+            return ledger.object_store(paths, ledger.canonical_bytes(payload))
+
+        old_hash, current_hash, blocked_hash = "1" * 64, "2" * 64, "3" * 64
+        old_return = worker_return("A-old", old_hash, "DONE", [{"path": "README.md", "operation": "modify"}])
+        current_return = worker_return("A-current", current_hash, "DONE", [{"path": "app.txt", "operation": "modify"}])
+        blocked_return = worker_return("A-blocked", blocked_hash, "BLOCKED", [])
+        state, previous = ledger.load_state(paths)
+        state["attempts"] = [
+            {"id": "A-old", "kind": "worker", "mode": "implement", "subject_ref": "T-1", "packet_ref": "objects/" + "4" * 64, "packet_hash": old_hash, "epoch": 0, "state": "RETURNED", "lease": {"id": "L-old", "state": "released", "zone": [{"path": "README.md", "operations": ["modify"]}]}, "route_ref": "route-old", "checkout": str(repo), "base_sha": None, "candidate_sha": old_candidate, "candidate_tree_sha": subprocess.run(["git", "rev-parse", f"{old_candidate}^{{tree}}"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip(), "return_ref": f"objects/{old_return}", "finding_refs": []},
+            {"id": "A-current", "kind": "worker", "mode": "repair", "subject_ref": "T-1", "packet_ref": "objects/" + "5" * 64, "packet_hash": current_hash, "epoch": 0, "state": "RETURNED", "lease": {"id": "L-current", "state": "released", "zone": [{"path": "app.txt", "operations": ["modify"]}]}, "route_ref": "route-current", "checkout": str(repo), "base_sha": old_candidate, "candidate_sha": candidate, "candidate_tree_sha": candidate_tree, "return_ref": f"objects/{current_return}", "finding_refs": []},
+            {"id": "A-blocked", "kind": "worker", "mode": "repair", "subject_ref": "T-1", "packet_ref": "objects/" + "6" * 64, "packet_hash": blocked_hash, "epoch": 0, "state": "RETURNED", "lease": {"id": "L-blocked", "state": "active", "zone": [{"path": "app.txt", "operations": ["modify"]}]}, "route_ref": "route-blocked", "checkout": str(repo), "base_sha": candidate, "candidate_sha": None, "candidate_tree_sha": None, "return_ref": f"objects/{blocked_return}", "finding_refs": ["ISS-blocked"], "repair_contract": {"cause": "implementation", "finding_ref": "F-old", "hypothesis": "old", "expected_proof": "old proof", "stopping_condition": "old stop", "causal_change": "old change", "source_attempt_ref": "A-current"}, "failure_signature": "f" * 64, "repair_lease_provenance": {"authorization_ref": "AUTH-old", "finding_ref": "F-old", "source_attempt_ref": "A-current", "candidate_sha": candidate, "packet_base_sha": candidate, "expanded_entries": [{"path": "app.txt", "operations": ["modify"]}] }},
+        ]
+        state["issues"] = [{"id": "ISS-blocked", "type": "scope_blocker", "cause": "ownership", "impact": "blocking", "affected_refs": ["T-1", "A-blocked"], "expected": "bounded repair", "actual": "scope too narrow", "disposition": "authorize changed scope", "resolution_condition": "fresh authorization", "owner": None, "failure_signature": None, "finding_ref": None, "source_ref": "A-blocked", "intent_revision": None, "invalidated_by": []}]
+        state["tickets"][0]["state"] = "BLOCKED"
+        state["tickets"][0]["current_attempt"] = "A-blocked"
+        state["lifecycle"] = {"phase": "EXECUTE", "control": "BLOCKED", "reason": "worker_blocked", "issue_refs": ["ISS-blocked"], "stop_target": None, "next_action": {"kind": "triage_or_repair", "subject_refs": ["A-blocked"], "preconditions": [], "read_refs": []}}
+        state["revision"] = 2
+        state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+        ledger.validate_ledger(state)
+        ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        return control, repo, paths, old_candidate, candidate
+
     def test_dispatch_return_ingest_is_internal_and_advances_without_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); control, _, paths = self.init_ticket(root)
@@ -284,6 +328,74 @@ class LifecycleRepairTests(unittest.TestCase):
             ingested, _ = ledger.load_state(paths)
             self.assertEqual("ACTIVE", ingested["lifecycle"]["control"])
             self.assertEqual("audit_worker_return_and_prepare_candidate", ingested["lifecycle"]["next_action"]["kind"])
+
+    def test_close_blocked_no_write_repair_restores_last_candidate_and_allows_new_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, _, paths, _, candidate = self.seed_blocked_no_write_repair(root)
+            before, _ = ledger.load_state(paths)
+            before_attempt_ids = [item["id"] for item in before["attempts"]]
+            result = json.loads(run("close-blocked-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--attempt-id", "A-blocked").stdout)
+            self.assertFalse(result["idempotent"])
+            self.assertEqual("A-current", result["restored_attempt_id"])
+            self.assertEqual(candidate, result["candidate_sha"])
+            state, _ = ledger.load_state(paths)
+            self.assertEqual(before_attempt_ids, [item["id"] for item in state["attempts"]])
+            self.assertEqual("released", ledger.attempt_by_id(state, "A-blocked")["lease"]["state"])
+            self.assertIsNone(ledger.attempt_by_id(state, "A-blocked")["candidate_sha"])
+            self.assertEqual("A-current", state["tickets"][0]["current_attempt"])
+            self.assertEqual("BLOCKED", state["tickets"][0]["state"])
+            self.assertEqual("authorize_repair", state["lifecycle"]["next_action"]["kind"])
+            receipt = ledger.stored_payload(paths, ledger.attempt_by_id(state, "A-blocked")["blocked_closure_ref"], "test closure receipt")
+            self.assertTrue(receipt["write_set_audit"]["pass"])
+            self.assertEqual([], receipt["write_set_audit"]["changed_paths"])
+            self.assertEqual("A-current", receipt["restored_attempt_ref"])
+            self.assertTrue(any(item["type"] == "blocked_attempt_closure" for item in state["decisions"]))
+
+            repeated = json.loads(run("restore-last-validated-candidate", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--attempt-id", "A-blocked").stdout)
+            self.assertTrue(repeated["idempotent"])
+            self.assertEqual(state["revision"], ledger.load_state(paths)[0]["revision"])
+
+            repair = {"cause": "ownership", "finding_ref": "ISS-blocked", "hypothesis": "scope omitted one required fixture", "expected_proof": "changed packet covers the fixture", "stopping_condition": "focused regression and suite pass", "causal_change": "expand the replacement packet", "source_attempt_ref": "A-current"}
+            repair_path = root / "replacement-repair.json"; write_json(repair_path, repair)
+            run("authorize-repair", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "3", "--ticket-id", "T-1", "--finding-ref", "ISS-blocked", "--authorization-id", "AUTH-replacement", "--repair-contract", str(repair_path))
+            packet = self.worker_packet(root, "A-replacement", mode="repair", base=candidate, repair=repair)
+            self.dispatch(control, packet, "A-replacement", 4)
+            cycled, _ = ledger.load_state(paths)
+            self.assertEqual("A-replacement", cycled["tickets"][0]["current_attempt"])
+            self.assertEqual("RUNNING", cycled["tickets"][0]["state"])
+
+    def test_close_blocked_attempt_rejects_nonblocked_candidate_dirty_and_stale_cases(self) -> None:
+        mutations = {
+            "nonblocked-return": (lambda state, repo, paths, old, candidate: self._replace_blocked_return(state, paths, status="FAILED", files=[]), "exact validated BLOCKED return"),
+            "declared-files": (lambda state, repo, paths, old, candidate: self._replace_blocked_return(state, paths, status="BLOCKED", files=[{"path": "app.txt", "operation": "modify"}]), "exact validated BLOCKED return declaring no files"),
+            "candidate-present": (lambda state, repo, paths, old, candidate: ledger.attempt_by_id(state, "A-blocked").update({"candidate_sha": candidate}), "candidate_sha and candidate_tree_sha to be null"),
+            "stale-base": (lambda state, repo, paths, old, candidate: ledger.attempt_by_id(state, "A-blocked").update({"base_sha": old}), "last validated same-ticket candidate"),
+            "released-lease": (lambda state, repo, paths, old, candidate: ledger.attempt_by_id(state, "A-blocked")["lease"].update({"state": "released"}), "active lease"),
+        }
+        for name, (mutate, expected) in mutations.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); control, repo, paths, old, candidate = self.seed_blocked_no_write_repair(root)
+                state, _ = ledger.load_state(paths); mutate(state, repo, paths, old, candidate); ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+                rejected = run("close-blocked-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--attempt-id", "A-blocked", expect=2)
+                self.assertIn(expected, rejected.stderr)
+                unchanged, _ = ledger.load_state(paths)
+                self.assertEqual("A-blocked", unchanged["tickets"][0]["current_attempt"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, repo, paths, _, _ = self.seed_blocked_no_write_repair(root)
+            (repo / "app.txt").write_text("dirty\n", encoding="utf-8")
+            rejected = run("close-blocked-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--attempt-id", "A-blocked", expect=2)
+            self.assertIn("checkout is not unchanged", rejected.stderr)
+            state, _ = ledger.load_state(paths)
+            self.assertEqual("active", ledger.attempt_by_id(state, "A-blocked")["lease"]["state"])
+
+    def _replace_blocked_return(self, state: dict[str, object], paths: dict[str, Path], *, status: str, files: list[dict[str, str]]) -> None:
+        attempt = ledger.attempt_by_id(state, "A-blocked")
+        payload = ledger.stored_payload(paths, attempt["return_ref"], "blocked test return")
+        payload["status"] = status
+        payload["files"] = files
+        replacement = ledger.object_store(paths, ledger.canonical_bytes(payload))
+        attempt["return_ref"] = f"objects/{replacement}"
 
     def test_lost_worker_has_bounded_recovery_without_releasing_unproven_writer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,5 +1,5 @@
 {
-  "model_version": "1.0.7",
+  "model_version": "1.0.9",
   "initial": "PREFLIGHT/ACTIVE",
   "success_terminal": "ACCEPT/ACCEPTED",
   "failure_terminals": [
@@ -36,7 +36,7 @@
       "transitions": [
         ["PLANNED", "READY"], ["READY", "RUNNING"], ["RUNNING", "CANDIDATE"],
         ["CANDIDATE", "REVIEW"], ["REVIEW", "INTEGRATED"], ["REVIEW", "REPAIR"],
-        ["REPAIR", "READY"], ["BLOCKED", "READY"], ["PLANNED", "BLOCKED"],
+        ["REPAIR", "READY"], ["BLOCKED", "BLOCKED"], ["BLOCKED", "READY"], ["PLANNED", "BLOCKED"],
         ["READY", "BLOCKED"], ["RUNNING", "BLOCKED"], ["CANDIDATE", "BLOCKED"],
         ["REVIEW", "BLOCKED"], ["PLANNED", "STALE"], ["READY", "STALE"],
         ["RUNNING", "STALE"], ["CANDIDATE", "STALE"], ["REVIEW", "STALE"],

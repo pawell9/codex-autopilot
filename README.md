@@ -6,7 +6,7 @@ orchestrator owns the durable ledger, routing, contracts, review flow, and
 Git integration; bounded workers implement ticket-sized changes, and
 independent reviewers verify them.
 
-**CODEX-AUTOPILOT V1.0.8 — TRANSITIVE REPAIR PROVENANCE PATCH RELEASE**
+**CODEX-AUTOPILOT V1.0.9 — BLOCKED ATTEMPT CLOSURE PATCH RELEASE**
 
 ## Requirements
 
@@ -117,6 +117,20 @@ and authorization, intersects the path with the current packet allowlist, and
 records the full path-specific lineage. This does not grant general `modify`
 authority to create-only zones; stale/forked candidates, foreign tickets or
 paths, broken provenance, and missing original creates remain blocked.
+
+A returned repair that is durably `BLOCKED` before its first write may be
+closed with `close-blocked-attempt` (alias
+`restore-last-validated-candidate`). The command accepts no candidate selector:
+it derives the immediately preceding validated same-ticket candidate, requires
+the blocked attempt base and stored repair provenance to point to it, verifies
+the exact BLOCKED return declares `files=[]` and has no candidate, and audits
+the exact checkout against that Git candidate with no tracked, untracked,
+ignored, type, mode, rename, or symlink delta. It then releases only that active
+lease, preserves the attempt and return, appends a hash-addressed closure
+receipt/decision/evidence record, and restores `ticket.current_attempt` so a
+fresh `authorize-repair` cycle can proceed. Dirty, stale, ambiguous,
+non-BLOCKED, already-candidate, quarantined, or otherwise open states remain
+unchanged.
 
 ## Presets
 

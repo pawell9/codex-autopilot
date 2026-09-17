@@ -79,6 +79,15 @@ evidence, and use `terminate-attempt` with a released lease only when stopped
 is proven, otherwise a quarantined lease. Only an explicit authority-sensitive
 blocker or manual-review protocol may become a user checkpoint.
 
+When an ingested repair return is exactly `BLOCKED` before its first write,
+has `files=[]`, has no candidate, retains its active lease, and the checkout is
+still the exact clean Git base, use `close-blocked-attempt` (alias
+`restore-last-validated-candidate`). Do not name or edit a prior candidate.
+The command derives and revalidates the immediately preceding same-ticket
+candidate, preserves the blocked attempt/return, records the closure receipt,
+releases the lease, and restores ticket linkage. Then enter the next ordinary
+repair only through a fresh `authorize-repair` decision.
+
 For an already quarantined legacy repair return, do not edit the ledger or
 lease. The only normal reconciliation path is
 `reconcile-quarantined-attempt`, and only for the exact same-ticket
@@ -116,7 +125,7 @@ Read `references/ledger.md` before the first state mutation or any recovery ques
 4. Candidate Git commit precedes review. `INTEGRATED` requires the required independent PASS and a post-review integrity barrier.
 5. Final G5 is a fresh current-intent check. For V1 critical axes and every G5 round, use the user-assisted clean-input/session protocol in `phases/accept.md` and `references/safety.md`; setup/context receipts, exact structured return, and integrity checks are mandatory. User approval alone is never G5.
 6. Unknown authority, oracle, liveness, schema, or declared input-boundary evidence blocks only the dependent action and records an exact next action. Unobservable underlying host properties are residual trust, not silently promoted to `STRICT_FRESH`; never fill missing evidence with a green default.
-7. Materialize readiness with `ready-ticket`; dependencies must be current reviewed `INTEGRATED` outcomes. Enter repair only through `authorize-repair`. Close a lost/interrupted attempt through `terminate-attempt` with stop evidence and a released or quarantined lease.
+7. Materialize readiness with `ready-ticket`; dependencies must be current reviewed `INTEGRATED` outcomes. Enter repair only through `authorize-repair`. Close a no-write BLOCKED repair through `close-blocked-attempt`; close a lost/interrupted attempt through `terminate-attempt` with stop evidence and a released or quarantined lease.
 8. Never hand-release quarantine. `reconcile-quarantined-attempt` may restore
    candidate authority only for its fully proven, single-use compatibility
    case and must leave every failed proof unchanged.
