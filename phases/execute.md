@@ -27,7 +27,13 @@ the original create zone. `authorize-repair` stores the exact repair-contract
 object, and one authorization is consumed by one repair attempt; the attempt
 records both that authorization and any lease derivation. A stale base,
 foreign path, missing provenance, packet-denied path, or any other operation is
-rejected; quarantined provenance is never reused or auto-released.
+rejected; quarantined provenance is never reused or auto-released. An already
+quarantined legacy repair return may use `reconcile-quarantined-attempt` only
+when the exact current attempt, prior DONE create attempt, accepted blocking
+finding, authorization, candidate/base SHA, packet allow/deny scope, and a
+fresh actual write-set audit all agree. The command records actor, inputs,
+fingerprints, issue refs, and the derived lease in an immutable receipt, is
+idempotent for the same evidence, and leaves every failed proof quarantined.
 
 Retry only after a confirmed transient cause and effect reconciliation. A repeat requires a changed causal input, approach, capability, or evidence and an expected distinguishing result. Repeated same-class failure first gets a diagnostic checkpoint; no arbitrary repair counter or automatic success exists. Fresh context is required after amendment, lost/context-saturated worker, or repeated causal defect after substantive repair.
 

@@ -79,6 +79,16 @@ evidence, and use `terminate-attempt` with a released lease only when stopped
 is proven, otherwise a quarantined lease. Only an explicit authority-sensitive
 blocker or manual-review protocol may become a user checkpoint.
 
+For an already quarantined legacy repair return, do not edit the ledger or
+lease. The only normal reconciliation path is
+`reconcile-quarantined-attempt`, and only for the exact same-ticket
+`create → candidate → repair modify` compatibility case. Supply the exact
+ticket/current attempt, named prior create attempt, accepted blocking finding,
+candidate/base SHA, actor, and unique reconciliation ID. Optionally supply a
+pre-attempt baseline; otherwise the command derives it from the exact Git base
+tree. The command reruns the checkout audit and publishes the receipt atomically;
+all other quarantines remain blocking.
+
 ## Read-only dashboard
 
 `tools/dashboard.py` serves a local read-only projection of the selected current `.autopilot/runs/<run-id>/ledger.json`. It reloads that ledger on refresh/auto-refresh, exposes no state mutation endpoint, and does not create a second state store. Missing ledger facts are shown as `CONCERN`; lifecycle, routing, contracts, safety, Git, and G0–G6 remain authoritative.
@@ -103,6 +113,9 @@ Read `references/ledger.md` before the first state mutation or any recovery ques
 5. Final G5 is a fresh current-intent check. For V1 critical axes and every G5 round, use the user-assisted clean-input/session protocol in `phases/accept.md` and `references/safety.md`; setup/context receipts, exact structured return, and integrity checks are mandatory. User approval alone is never G5.
 6. Unknown authority, oracle, liveness, schema, or declared input-boundary evidence blocks only the dependent action and records an exact next action. Unobservable underlying host properties are residual trust, not silently promoted to `STRICT_FRESH`; never fill missing evidence with a green default.
 7. Materialize readiness with `ready-ticket`; dependencies must be current reviewed `INTEGRATED` outcomes. Enter repair only through `authorize-repair`. Close a lost/interrupted attempt through `terminate-attempt` with stop evidence and a released or quarantined lease.
+8. Never hand-release quarantine. `reconcile-quarantined-attempt` may restore
+   candidate authority only for its fully proven, single-use compatibility
+   case and must leave every failed proof unchanged.
 
 After compaction, resume, owner transfer, or doubt about the retained protocol, reread this entry, obtain a fresh `brief`, reread the current phase and its safety/recovery pointers, and only then perform a state-changing action. The summary and old conversation are hints, not authority.
 

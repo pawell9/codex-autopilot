@@ -86,6 +86,76 @@ class LifecycleRepairTests(unittest.TestCase):
         run("authorize-repair", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--finding-ref", "F-1", "--authorization-id", "AUTH-1", "--repair-contract", str(repair_path))
         return control, paths, candidate
 
+    def seed_legacy_quarantined_repair(self, root: Path, *, foreign_change: bool = False, issue_type: str = "write_set_violation") -> tuple[Path, Path, dict[str, Path], Path, str]:
+        control, repo, paths = self.init_ticket(root, operation="create")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "README.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], cwd=repo, check=True)
+        (repo / "app.txt").write_text("created\n", encoding="utf-8")
+        subprocess.run(["git", "add", "app.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "create candidate"], cwd=repo, check=True)
+        candidate = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+
+        baseline_files = []
+        for name in ("README.md", "app.txt"):
+            path = repo / name
+            baseline_files.append({"path": name, "type": "file", "mode": path.stat().st_mode & 0o777, "sha256": ledger.sha256_file(path)})
+        baseline = root / "repair-baseline.json"
+        write_json(baseline, {"base_sha": candidate, "files": baseline_files})
+        (repo / "app.txt").write_text("repaired\n", encoding="utf-8")
+        if foreign_change:
+            (repo / "README.md").write_text("foreign\n", encoding="utf-8")
+
+        prior_return = {
+            "identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": "A-create", "packet_hash": "1" * 64, "epoch": 0},
+            "status": "DONE", "result": "created app.txt", "files": [{"path": "app.txt", "operation": "create"}],
+            "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "created", "evidence_ref": "EV-create"}],
+            "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV-create"]}],
+        }
+        current_return = {
+            "identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": "A-repair", "packet_hash": None, "epoch": 0},
+            "status": "DONE", "result": "repaired app.txt", "files": [{"path": "app.txt", "operation": "modify"}],
+            "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "repaired", "evidence_ref": "EV-repair"}],
+            "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV-repair"]}],
+        }
+        repair = {"cause": "implementation", "finding_ref": "F-1", "hypothesis": "created content is wrong", "expected_proof": "regression observes corrected content", "stopping_condition": "stop after the focused regression passes", "causal_change": "replace the generated value", "source_attempt_ref": "A-review"}
+        packet = {
+            "identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": "A-repair", "epoch": 0},
+            "kind": "worker", "mode": "repair", "goal": "repair created file", "acceptance": [{"criterion_id": "C-1"}],
+            "workspace": {"root": str(repo), "expected_base": candidate},
+            "write": {"allow": [{"path": "app.txt", "operations": ["modify"]}]},
+            "verification": [{"check_id": "oracle", "required": True}], "risk": {"level": "routine"},
+            "context": [{"ref": "contracts/worker.md"}], "return_target": {"path": "return.json"}, "repair": repair,
+        }
+        packet_digest = ledger.object_store(paths, ledger.canonical_bytes(packet))
+        current_return["identity"]["packet_hash"] = packet_digest
+        prior_digest = ledger.object_store(paths, ledger.canonical_bytes(prior_return))
+        current_digest = ledger.object_store(paths, ledger.canonical_bytes(current_return))
+        state, previous = ledger.load_state(paths)
+        state["attempts"] = [
+            {"id": "A-create", "kind": "worker", "mode": "implement", "subject_ref": "T-1", "packet_ref": "objects/" + "2" * 64, "packet_hash": "1" * 64, "epoch": 0, "state": "RETURNED", "lease": {"id": "L-create", "state": "released", "zone": [{"path": "app.txt", "operations": ["create"]}]}, "route_ref": "route-create", "checkout": str(repo), "base_sha": "a" * 40, "candidate_sha": candidate, "candidate_tree_sha": subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip(), "return_ref": f"objects/{prior_digest}", "finding_refs": []},
+            {"id": "A-review", "kind": "review", "mode": "change", "subject_ref": "T-1", "packet_ref": "objects/" + "3" * 64, "packet_hash": "4" * 64, "epoch": 0, "state": "RETURNED", "lease": {"id": "L-review", "state": "released", "zone": []}, "base_sha": candidate, "candidate_sha": candidate, "candidate_tree_sha": None, "return_ref": "objects/" + "5" * 64, "finding_refs": ["F-1"], "subject_fingerprint": candidate, "review_result": "BLOCK"},
+            {"id": "A-repair", "kind": "worker", "mode": "repair", "subject_ref": "T-1", "packet_ref": f"objects/{packet_digest}", "packet_hash": packet_digest, "epoch": 0, "state": "RETURNED", "lease": {"id": "L-repair", "state": "quarantined", "zone": [{"path": "app.txt", "operations": ["create"]}]}, "route_ref": "route-repair", "checkout": str(repo), "base_sha": candidate, "candidate_sha": None, "candidate_tree_sha": None, "return_ref": f"objects/{current_digest}", "finding_refs": ["ISS-quarantine"], "repair_contract": repair, "failure_signature": ledger.repair_signature(repair)},
+        ]
+        state["findings"] = [{"id": "F-1", "axis": "correctness", "impact": "blocking", "claim": "created file needs correction", "expected": "correct", "actual": "incorrect", "evidence": "EV-review", "affected_refs": ["A-review"], "source_ref": "A-review", "intent_revision": None, "repair_contract_ref": "AUTH-1", "invalidated_by": []}]
+        state["decisions"] = [{"id": "AUTH-1", "type": "repair_authorization", "status": "authorized", "decision": "REPAIR", "reason": repair["hypothesis"], "evidence_refs": ["F-1"], "affected_refs": ["T-1", "F-1"], "intent_revision": None, "invalidated_by": []}]
+        state["issues"] = [{"id": "ISS-quarantine", "type": issue_type, "cause": "ownership", "impact": "blocking", "affected_refs": ["T-1", "A-repair"], "expected": "lease match", "actual": '[{"operation":"modify","path":"app.txt"}]', "disposition": "quarantine", "resolution_condition": "audited reconciliation", "owner": None, "failure_signature": None, "finding_ref": None, "source_ref": "A-repair", "intent_revision": None, "decision_ref": None, "invalidated_by": []}]
+        state["tickets"][0]["state"] = "BLOCKED"
+        state["tickets"][0]["current_attempt"] = "A-repair"
+        state["lifecycle"] = {"phase": "EXECUTE", "control": "BLOCKED", "reason": "worker_done", "issue_refs": ["ISS-quarantine"], "stop_target": None, "next_action": {"kind": "triage_or_repair", "subject_refs": ["A-repair"], "preconditions": [], "read_refs": []}}
+        state["revision"] = 2
+        state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+        ledger.validate_ledger(state)
+        ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        return control, repo, paths, baseline, candidate
+
+    def reconcile_legacy(self, control: Path, baseline: Path | None, candidate: str, *, expect: int = 0, base: str | None = None) -> subprocess.CompletedProcess[str]:
+        args = ["reconcile-quarantined-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--attempt-id", "A-repair", "--prior-attempt-id", "A-create", "--finding-ref", "F-1", "--candidate-sha", candidate, "--base-sha", base or candidate, "--reconciliation-id", "QR-1", "--actor", "test-operator"]
+        if baseline is not None:
+            args.extend(["--baseline", str(baseline)])
+        return run(*args, expect=expect)
+
     def test_dispatch_return_ingest_is_internal_and_advances_without_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); control, _, paths = self.init_ticket(root)
@@ -125,6 +195,7 @@ class LifecycleRepairTests(unittest.TestCase):
             attempt = ledger.attempt_by_id(state, "A-repair")
             self.assertEqual([{"path": "app.txt", "operations": ["modify"]}], attempt["lease"]["zone"])
             self.assertEqual("A-create", attempt["repair_lease_provenance"]["source_attempt_ref"])
+            self.assertEqual("AUTH-1", attempt["repair_authorization_ref"])
             returned = {"identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": "A-repair", "packet_hash": attempt["packet_hash"], "epoch": 0}, "status": "DONE", "result": "repaired", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "fixed", "evidence_ref": "EV-repair"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV-repair"]}]}
             inbox = paths["scratch"] / "A-repair" / "return.json"; write_json(inbox, returned)
             result = run("ingest-return", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "4", "--attempt-id", "A-repair", "--return-file", str(inbox), "--kind", "worker")
@@ -159,6 +230,50 @@ class LifecycleRepairTests(unittest.TestCase):
             self.assertIn('"quarantined": true', result.stdout)
             final, _ = ledger.load_state(paths)
             self.assertEqual("quarantined", ledger.attempt_by_id(final, "A-repair")["lease"]["state"])
+
+    def test_legacy_quarantined_repair_reconciles_once_with_full_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, paths, baseline, candidate = self.seed_legacy_quarantined_repair(root)
+            first = json.loads(self.reconcile_legacy(control, None, candidate).stdout)
+            self.assertFalse(first["idempotent"])
+            self.assertEqual(["app.txt"], first["changed_paths"])
+            state, _ = ledger.load_state(paths)
+            attempt = ledger.attempt_by_id(state, "A-repair")
+            self.assertEqual("active", attempt["lease"]["state"])
+            self.assertEqual([{"path": "app.txt", "operations": ["modify"]}], attempt["lease"]["zone"])
+            self.assertEqual("A-create", attempt["repair_lease_provenance"]["source_attempt_ref"])
+            receipt = ledger.stored_payload(paths, attempt["quarantine_reconciliation_ref"], "test receipt")
+            self.assertEqual("test-operator", receipt["actor"])
+            self.assertEqual(candidate, receipt["candidate_sha"])
+            self.assertEqual("git_base", receipt["baseline_source"])
+            self.assertTrue(receipt["write_set_audit"]["pass"])
+            self.assertEqual("advisory", state["issues"][0]["impact"])
+            repeated = json.loads(self.reconcile_legacy(control, None, candidate).stdout)
+            self.assertTrue(repeated["idempotent"])
+            repeated_state, _ = ledger.load_state(paths)
+            self.assertEqual(state["revision"], repeated_state["revision"])
+
+    def test_quarantine_reconciliation_rejects_stale_base_and_foreign_write_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, paths, baseline, candidate = self.seed_legacy_quarantined_repair(root)
+            rejected = self.reconcile_legacy(control, baseline, candidate, base="d" * 40, expect=2)
+            self.assertIn("base SHA is stale", rejected.stderr)
+            state, _ = ledger.load_state(paths)
+            self.assertEqual("quarantined", ledger.attempt_by_id(state, "A-repair")["lease"]["state"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, paths, baseline, candidate = self.seed_legacy_quarantined_repair(root, foreign_change=True)
+            rejected = self.reconcile_legacy(control, baseline, candidate, expect=2)
+            self.assertIn("write-set audit failed", rejected.stderr)
+            state, _ = ledger.load_state(paths)
+            self.assertEqual("quarantined", ledger.attempt_by_id(state, "A-repair")["lease"]["state"])
+
+    def test_quarantine_reconciliation_rejects_non_write_set_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, paths, baseline, candidate = self.seed_legacy_quarantined_repair(root, issue_type="attempt_termination")
+            rejected = self.reconcile_legacy(control, baseline, candidate, expect=2)
+            self.assertIn("non-write-set blocking causes", rejected.stderr)
+            state, _ = ledger.load_state(paths)
+            self.assertEqual("quarantined", ledger.attempt_by_id(state, "A-repair")["lease"]["state"])
 
     def test_skill_declares_wait_internal_and_runtime_boundary(self) -> None:
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")

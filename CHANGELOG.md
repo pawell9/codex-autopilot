@@ -1,5 +1,21 @@
 # Changelog
 
+## [v1.0.7] — 2026-09-17
+
+Quarantine reconciliation patch release.
+
+- Added owner/revision-fenced `reconcile-quarantined-attempt` for the narrow
+  legacy same-ticket `create → candidate → repair modify` lease mismatch.
+- Bound reconciliation to the exact current ticket/attempt, prior DONE create
+  return, accepted blocking finding and authorization, candidate/base/HEAD,
+  packet allow/deny scope, and complete actual write-set audit.
+- Stored the baseline and actor-attributed reconciliation receipt by SHA-256,
+  made exact retries zero-effect, and restored candidate authority only after
+  every proof succeeds.
+- Kept stale bases, foreign/overdeclared paths, non-write-set quarantine,
+  missing provenance, unsafe types/symlinks, deny-list escapes, and all other
+  quarantined attempts blocked; added positive/idempotent and negative tests.
+
 ## [v1.0.6] — 2026-09-17
 
 Lifecycle repair patch release.

@@ -1,6 +1,10 @@
 # Design status
 
-**CODEX-AUTOPILOT V1.0.6 — LIFECYCLE REPAIR PATCH RELEASE.**
+**CODEX-AUTOPILOT V1.0.7 — QUARANTINE RECONCILIATION PATCH RELEASE.**
+
+v1.0.7 adds a single-use, hash-receipted compatibility reconciliation for an
+already quarantined same-ticket create-to-modify repair attempt. It re-audits
+the exact worktree and leaves every other quarantine blocked.
 
 v1.0.6 separates contract inputs from producer outputs at publication/gates,
 defines worker-return waits as bounded internal orchestration, and permits only

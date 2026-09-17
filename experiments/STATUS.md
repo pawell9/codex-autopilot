@@ -1,6 +1,10 @@
 # Qualification status
 
-**CODEX-AUTOPILOT V1.0.6 — LIFECYCLE REPAIR PATCH RELEASE.**
+**CODEX-AUTOPILOT V1.0.7 — QUARANTINE RECONCILIATION PATCH RELEASE.**
+
+The v1.0.7 regression adds positive/idempotent and negative coverage for the
+narrow legacy quarantine reconciliation path without touching the mounted
+Idea Scout run.
 
 The v1.0.6 lifecycle regressions cover early self-produced contract rejection,
 bounded worker loss recovery, ordinary return ingestion without a user

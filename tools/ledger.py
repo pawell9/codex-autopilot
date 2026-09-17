@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.6"
+SKILL_VERSION = "1.0.7"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 COMPATIBILITY_FLOOR = "1.0.0"
@@ -2219,22 +2219,56 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
     return {"integrated": True, "attempt_id": args.attempt_id, "review_ref": f"objects/{digest}", "revision": next_state["revision"]}
 
 
-def cmd_audit(args: argparse.Namespace) -> dict[str, Any]:
-    root = safe_root(args.root, "audit root")
-    regular_directory(root, "audit root")
-    baseline = read_json(Path(args.baseline), "baseline manifest")
-    declared = read_json(Path(args.declared), "declared write set")
-    zones = read_json(Path(args.zone), "lease zone")
+def git_output(root: Path, *command: str) -> bytes:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), *command], check=True, capture_output=True
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        fail(f"write audit cannot inspect Git root: {exc}")
 
-    def git_paths(*command: str) -> list[str]:
+
+def git_paths(root: Path, *command: str) -> list[str]:
+    return [
+        item
+        for item in git_output(root, *command).decode("utf-8", "surrogateescape").split("\0")
+        if item
+    ]
+
+
+def git_tree_baseline(root: Path, base_sha: str) -> dict[str, Any]:
+    """Build a complete fingerprint manifest from an exact committed Git tree."""
+    raw = git_output(root, "ls-tree", "-r", "-z", "--full-tree", base_sha)
+    files: list[dict[str, Any]] = []
+    for token in (item for item in raw.split(b"\0") if item):
+        header, separator, encoded_path = token.partition(b"\t")
+        if not separator:
+            fail("Git tree baseline contains a malformed entry")
         try:
-            proc = subprocess.run(["git", "-C", str(root), *command], check=True, capture_output=True)
-        except (OSError, subprocess.CalledProcessError) as exc:
-            fail(f"write audit cannot inspect Git root: {exc}")
-        return [item for item in proc.stdout.decode("utf-8", "surrogateescape").split("\0") if item]
+            mode, object_type, object_id = header.decode("ascii").split(" ", 2)
+            path = relative_path(encoded_path.decode("utf-8", "surrogateescape"), "Git tree path")
+        except (UnicodeError, ValueError) as exc:
+            fail(f"Git tree baseline contains an invalid entry: {exc}")
+        if object_type != "blob":
+            fail(f"Git tree baseline contains unsupported {object_type}: {path}")
+        content = git_output(root, "cat-file", "blob", object_id)
+        if mode == "120000":
+            target = content.decode("utf-8", "surrogateescape")
+            resolved = (root / path).parent.joinpath(target).resolve(strict=False)
+            files.append({"path": path, "type": "symlink", "target": target, "target_inside_root": under(resolved, root)})
+        else:
+            file_mode = 0o755 if mode == "100755" else 0o644
+            files.append({"path": path, "type": "file", "mode": file_mode, "sha256": sha256_bytes(content)})
+    return {"base_sha": base_sha, "source": "git_tree", "files": files}
+
+
+def audit_write_set(
+    root: Path, baseline: dict[str, Any], declared: list[Any], zones: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Inspect the complete checkout and return a deterministic write-set receipt."""
 
     def status_paths() -> tuple[set[str], set[str]]:
-        tokens = git_paths("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        tokens = git_paths(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
         found: set[str] = set()
         renamed: set[str] = set()
         index = 0
@@ -2257,12 +2291,22 @@ def cmd_audit(args: argparse.Namespace) -> dict[str, Any]:
             baseline_map[relative_path(item.get("path"), "baseline path")] = item
         else:
             baseline_map[relative_path(item, "baseline path")] = None
-    declared_paths = {relative_path(item.get("path"), "declared path") if isinstance(item, dict) else relative_path(item, "declared path") for item in declared}
+    declared_paths = {
+        relative_path(item.get("path"), "declared path")
+        if isinstance(item, dict)
+        else relative_path(item, "declared path")
+        for item in declared
+    }
+    declared_operations = {
+        relative_path(item.get("path"), "declared path"): item.get("operation")
+        for item in declared
+        if isinstance(item, dict) and item.get("operation")
+    }
     zone_paths = [relative_path(item.get("path"), "zone path") for item in zones]
 
-    tracked = set(git_paths("ls-files", "-z"))
+    tracked = set(git_paths(root, "ls-files", "-z"))
     status, renamed = status_paths()
-    ignored = set(git_paths("ls-files", "--others", "--ignored", "--exclude-standard", "-z"))
+    ignored = set(git_paths(root, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"))
     actual: set[str] = tracked | status | ignored
 
     def fingerprint(rel: str) -> dict[str, Any] | None:
@@ -2293,15 +2337,24 @@ def cmd_audit(args: argparse.Namespace) -> dict[str, Any]:
             continue
         if current is None:
             changed.add(rel)
-            if baseline_item is not None:
+            if baseline_item is not None and rel not in declared_paths:
                 foreign_changes.add(rel)
             continue
         if isinstance(baseline_item, dict):
-            comparable = {key: current.get(key) for key in ("type", "mode", "sha256", "target", "target_inside_root") if key in baseline_item}
+            comparable = {
+                key: baseline_item.get(key)
+                for key in ("type", "mode", "sha256", "target", "target_inside_root")
+                if key in baseline_item
+            }
             if any(current.get(key) != value for key, value in comparable.items()):
                 changed.add(rel)
                 if rel not in declared_paths:
                     foreign_changes.add(rel)
+    # Git status is an independent source for tracked and ordinary untracked
+    # effects.  The baseline remains necessary for ignored files, type/mode
+    # evidence, and the exact before/after receipt, but cannot normalize away
+    # a path that Git still reports as changed.
+    changed.update(status)
     changed.update(renamed)
     unsafe_paths: list[dict[str, Any]] = []
     for rel, item in fingerprints.items():
@@ -2312,7 +2365,26 @@ def cmd_audit(args: argparse.Namespace) -> dict[str, Any]:
         if item.get("type") == "other":
             unsafe_paths.append({"path": rel, "reason": "unsupported file type"})
     changed_paths = sorted(changed)
+    observed_operations: dict[str, str] = {}
+    for rel in changed_paths:
+        baseline_item = baseline_map.get(rel, "__missing__")
+        current = fingerprints.get(rel)
+        if baseline_item == "__missing__" and current is not None:
+            observed_operations[rel] = "create"
+        elif baseline_item != "__missing__" and current is None:
+            observed_operations[rel] = "delete"
+        else:
+            observed_operations[rel] = "modify"
     undeclared = sorted(set(changed_paths) - declared_paths)
+    overdeclared = sorted(declared_paths - set(changed_paths))
+    operation_mismatches = sorted(
+        (
+            {"path": path, "declared": declared_operations[path], "actual": observed_operations[path]}
+            for path in changed_paths
+            if path in declared_operations and declared_operations[path] != observed_operations[path]
+        ),
+        key=lambda item: (item["path"], item["declared"], item["actual"]),
+    )
     try:
         root_real = root.resolve()
     except OSError as exc:
@@ -2321,7 +2393,410 @@ def cmd_audit(args: argparse.Namespace) -> dict[str, Any]:
         clean = path.rstrip("/")
         return any(clean == zone or clean.startswith(zone.rstrip("/") + "/") for zone in zone_paths)
     outside = sorted(path for path in changed_paths if not allowed(path))
-    return {"root": str(root_real), "actual_paths": sorted(actual), "changed_paths": changed_paths, "undeclared_paths": undeclared, "outside_zone": outside, "rename_endpoints": sorted(renamed), "foreign_changes": sorted(foreign_changes), "unsafe_paths": unsafe_paths, "fingerprints": fingerprints, "pass": not undeclared and not outside and not foreign_changes and not unsafe_paths}
+    outside_operations = sorted(
+        (
+            {"path": path, "operation": observed_operations[path]}
+            for path in changed_paths
+            if not zone_allows(zones, path, observed_operations[path])
+        ),
+        key=lambda item: (item["path"], item["operation"]),
+    )
+    return {
+        "root": str(root_real),
+        "actual_paths": sorted(actual),
+        "changed_paths": changed_paths,
+        "observed_operations": observed_operations,
+        "undeclared_paths": undeclared,
+        "overdeclared_paths": overdeclared,
+        "operation_mismatches": operation_mismatches,
+        "outside_zone": outside,
+        "outside_operations": outside_operations,
+        "rename_endpoints": sorted(renamed),
+        "foreign_changes": sorted(foreign_changes),
+        "unsafe_paths": unsafe_paths,
+        "fingerprints": fingerprints,
+        "pass": not undeclared
+        and not overdeclared
+        and not operation_mismatches
+        and not outside
+        and not outside_operations
+        and not foreign_changes
+        and not unsafe_paths
+        and not renamed,
+    }
+
+
+def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any]:
+    """Reconcile one legacy create-only repair lease without weakening quarantine."""
+    p = paths(args.control_root, args.run_id)
+    reconciliation_id = safe_id(args.reconciliation_id, "reconciliation_id")
+    ticket_id = safe_id(args.ticket_id, "ticket_id")
+    attempt_id = safe_id(args.attempt_id, "attempt_id")
+    prior_attempt_id = safe_id(args.prior_attempt_id, "prior_attempt_id")
+    finding_ref = safe_id(args.finding_ref, "finding_ref")
+    actor = nonempty_string(args.actor, "reconciliation actor")
+    if not GIT_SHA_RE.fullmatch(args.candidate_sha or "") or not GIT_SHA_RE.fullmatch(args.base_sha or ""):
+        fail("reconciliation requires exact candidate and base Git SHAs")
+    baseline: dict[str, Any] | None = None
+    baseline_raw: bytes | None = None
+    baseline_hash: str | None = None
+    if args.baseline:
+        baseline_path = Path(args.baseline).expanduser().resolve()
+        regular_non_symlink(baseline_path)
+        baseline_raw = baseline_path.read_bytes()
+        try:
+            baseline = json.loads(baseline_raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            fail(f"invalid reconciliation baseline {baseline_path}: {exc}")
+        if not isinstance(baseline, dict):
+            fail("reconciliation baseline must be an object")
+        baseline_hash = sha256_bytes(baseline_raw)
+    base_binding = {
+        "reconciliation_id": reconciliation_id,
+        "actor": actor,
+        "ticket_id": ticket_id,
+        "attempt_id": attempt_id,
+        "prior_attempt_id": prior_attempt_id,
+        "finding_ref": finding_ref,
+        "candidate_sha": args.candidate_sha,
+        "base_sha": args.base_sha,
+    }
+
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        attempt = attempt_by_id(state, attempt_id)
+        existing_ref = attempt.get("quarantine_reconciliation_ref")
+        if existing_ref:
+            existing = stored_payload(p, existing_ref, "quarantine reconciliation receipt")
+            observed_binding = {key: existing.get(key) for key in base_binding}
+            baseline_matches = (
+                existing.get("baseline_sha256") == baseline_hash
+                if baseline_hash is not None
+                else existing.get("baseline_source") == "git_base"
+            )
+            if observed_binding != base_binding or not baseline_matches:
+                fail("quarantined attempt was already reconciled with different evidence")
+            if (
+                attempt.get("lease", {}).get("state") != "active"
+                or not any(item.get("id") == reconciliation_id and item.get("type") == "quarantine_reconciliation" for item in state.get("decisions", []))
+            ):
+                fail("quarantine reconciliation receipt exists but ledger effects are incomplete")
+            return {
+                "reconciled": True,
+                "idempotent": True,
+                "reconciliation_id": existing.get("reconciliation_id"),
+                "attempt_id": attempt_id,
+                "receipt_ref": existing_ref,
+                "revision": state["revision"],
+            }
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
+            fail("terminal run is immutable; start a successor run")
+        if any(item.get("id") == reconciliation_id for item in state.get("decisions", [])):
+            fail("reconciliation ID already exists")
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == ticket_id), None)
+        if ticket is None or attempt.get("subject_ref") != ticket_id or ticket.get("current_attempt") != attempt_id:
+            fail("reconciliation requires the exact current attempt of the same ticket")
+        if attempt.get("kind") != "worker" or attempt.get("mode") != "repair" or attempt.get("state") != "RETURNED":
+            fail("reconciliation requires a returned worker repair attempt")
+        if attempt.get("lease", {}).get("state") != "quarantined":
+            fail("reconciliation applies only to an existing quarantined lease")
+        if attempt.get("candidate_sha") is not None:
+            fail("reconciliation must precede candidate publication")
+
+        packet = stored_payload(p, attempt.get("packet_ref"), "quarantined worker packet")
+        schema_root = schema()
+        validate(packet, schema_root["$defs"]["worker_packet"], schema_root, "$.packet")
+        packet_identity_value = packet_identity(packet)
+        repair = packet.get("repair")
+        if (
+            packet.get("kind") != "worker"
+            or packet.get("mode") != "repair"
+            or packet_identity_value.get("run_id") != args.run_id
+            or packet_identity_value.get("ticket_id") != ticket_id
+            or packet_identity_value.get("attempt_id") != attempt_id
+            or not isinstance(repair, dict)
+        ):
+            fail("quarantined packet identity/mode does not match reconciliation")
+        if attempt.get("repair_contract") != repair:
+            fail("quarantined attempt repair contract does not match its packet")
+        if repair.get("finding_ref") != finding_ref:
+            fail("reconciliation finding does not match the repair contract")
+
+        authorization = active_repair_authorization(state, ticket_id, finding_ref)
+        if authorization is None or attempt.get("repair_authorization_ref") not in (None, authorization.get("id")):
+            fail("reconciliation requires the exact accepted repair authorization")
+        contract_refs = [
+            ref for ref in authorization.get("evidence_refs", [])
+            if isinstance(ref, str) and ref.startswith("objects/")
+        ]
+        if contract_refs:
+            if len(contract_refs) != 1 or stored_payload(p, contract_refs[0], "authorized repair contract") != repair:
+                fail("reconciliation repair contract is not hash-bound to its authorization")
+        elif finding_ref not in authorization.get("evidence_refs", []) or authorization.get("reason") != repair.get("hypothesis"):
+            fail("legacy repair authorization is not bound to the exact finding and hypothesis")
+        finding_record = next((item for item in state.get("findings", []) if item.get("id") == finding_ref), None)
+        issue_record = next((item for item in state.get("issues", []) if item.get("id") == finding_ref), None)
+        if issue_record and issue_record.get("finding_ref"):
+            finding_record = next((item for item in state.get("findings", []) if item.get("id") == issue_record.get("finding_ref")), finding_record)
+        legacy_review = next(
+            (item for item in state.get("attempts", []) if finding_record and item.get("id") == finding_record.get("source_ref")),
+            None,
+        )
+        legacy_candidate_binding = bool(
+            finding_record
+            and finding_record.get("impact") == "blocking"
+            and not finding_record.get("invalidated_by")
+            and legacy_review
+            and legacy_review.get("kind") == "review"
+            and legacy_review.get("subject_ref") == ticket_id
+            and legacy_review.get("state") == "RETURNED"
+            and legacy_review.get("candidate_sha") == args.candidate_sha
+            and finding_ref in legacy_review.get("finding_refs", [])
+        )
+        if not finding_matches_candidate(state, finding_ref, ticket_id, args.candidate_sha) and not legacy_candidate_binding:
+            fail("reconciliation requires a current blocking finding bound to the exact candidate")
+
+        repair_source_ref = repair.get("source_attempt_ref")
+        if repair_source_ref != prior_attempt_id:
+            source = attempt_by_id(state, repair_source_ref)
+            if (
+                finding_record is None
+                or finding_record.get("source_ref") != repair_source_ref
+                or source.get("kind") != "review"
+                or source.get("subject_ref") != ticket_id
+                or source.get("state") != "RETURNED"
+                or source.get("candidate_sha") != args.candidate_sha
+                or finding_ref not in source.get("finding_refs", [])
+            ):
+                fail("legacy repair source is not the exact candidate-bound finding review")
+
+        prior = attempt_by_id(state, prior_attempt_id)
+        if (
+            prior.get("kind") != "worker"
+            or prior.get("subject_ref") != ticket_id
+            or prior.get("state") != "RETURNED"
+            or prior.get("candidate_sha") != args.candidate_sha
+            or prior.get("lease", {}).get("state") == "quarantined"
+        ):
+            fail("reconciliation prior candidate provenance is missing, foreign, or quarantined")
+        if attempt.get("base_sha") != args.base_sha or args.base_sha != args.candidate_sha:
+            fail("reconciliation base SHA is stale or does not equal the prior candidate")
+        if packet.get("workspace", {}).get("expected_base") != args.base_sha:
+            fail("reconciliation packet base SHA does not match the exact base")
+        if baseline is not None and baseline.get("base_sha") not in (None, args.base_sha):
+            fail("reconciliation baseline is bound to a different base SHA")
+
+        prior_return = stored_payload(p, prior.get("return_ref"), "prior worker return")
+        current_return = stored_payload(p, attempt.get("return_ref"), "quarantined worker return")
+        for returned, returned_attempt, label in (
+            (prior_return, prior, "prior"),
+            (current_return, attempt, "quarantined"),
+        ):
+            validate(returned, schema_root["$defs"]["worker_return"], schema_root, f"$.{label}_return")
+            validate_standalone_contract(returned, "worker_return")
+            identity = packet_identity(returned)
+            if (
+                identity.get("run_id") != args.run_id
+                or identity.get("ticket_id") not in (None, ticket_id)
+                or identity.get("attempt_id") != returned_attempt.get("id")
+                or identity.get("packet_hash") != returned_attempt.get("packet_hash")
+                or identity.get("epoch") != returned_attempt.get("epoch")
+            ):
+                fail(f"reconciliation {label} worker return identity is not exact")
+        validate_worker_return_semantics(current_return, packet)
+        if prior_return.get("status") != "DONE" or current_return.get("status") != "DONE":
+            fail("reconciliation requires confirmed prior and current DONE worker returns")
+        created_paths = {
+            relative_path(item.get("path"), "prior created path")
+            for item in prior_return.get("files", [])
+            if item.get("operation") == "create"
+        }
+        legacy_violations = worker_return_write_set_violations(current_return, attempt.get("lease", {}))
+        if not legacy_violations:
+            fail("quarantined attempt has no legacy create-only lease violation to reconcile")
+        requested = packet_write_zone(packet)
+        ticket_zone = ticket.get("zone", [])
+        denied = [
+            relative_path(item, "packet write deny path").rstrip("/")
+            for item in packet.get("write", {}).get("deny", [])
+        ]
+        expanded: list[dict[str, Any]] = []
+        requested_exceptions = [
+            {"path": entry["path"], "operation": operation}
+            for entry in requested
+            for operation in entry["operations"]
+            if not zone_allows(ticket_zone, entry["path"], operation)
+        ]
+        for violation in requested_exceptions:
+            path, operation = violation["path"], violation["operation"]
+            if (
+                operation != "modify"
+                or path not in created_paths
+                or not zone_allows(ticket_zone, path, "create")
+                or not zone_allows(prior.get("lease", {}).get("zone", []), path, "create")
+                or not zone_allows(requested, path, "modify")
+            ):
+                fail(f"quarantine is not an exact same-ticket create-to-modify case: {path} ({operation})")
+            if any(path == item or path.startswith(item + "/") for item in denied):
+                fail(f"reconciliation path conflicts with packet deny list: {path}")
+            expanded.append({"path": path, "operations": ["modify"]})
+        legacy_pairs = {(item["path"], item["operation"]) for item in legacy_violations}
+        exception_pairs = {(item["path"], item["operation"]) for item in requested_exceptions}
+        if not legacy_pairs.issubset(exception_pairs):
+            fail("quarantined return contains violations outside the proven repair expansion")
+
+        quarantine_issues = [
+            item for item in state.get("issues", [])
+            if item.get("source_ref") == attempt_id
+            and item.get("impact") == "blocking"
+            and not item.get("invalidated_by")
+        ]
+        if not quarantine_issues or any(item.get("type") != "write_set_violation" for item in quarantine_issues):
+            fail("reconciliation refuses quarantine with missing or non-write-set blocking causes")
+
+        checkout = safe_root(attempt.get("checkout") or "", "reconciliation checkout")
+        regular_directory(checkout, "reconciliation checkout")
+        packet_checkout = safe_root(packet.get("workspace", {}).get("root") or "", "packet checkout")
+        if checkout != packet_checkout:
+            fail("reconciliation checkout does not match the quarantined packet")
+        git_root = Path(git_output(checkout, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+        if git_root != checkout:
+            fail("reconciliation checkout is not the exact Git worktree root")
+        observed_head = git_output(checkout, "rev-parse", "HEAD").decode().strip()
+        if observed_head != args.base_sha:
+            fail("reconciliation checkout HEAD is stale relative to the exact base SHA")
+        baseline_source = "supplied"
+        if baseline is None:
+            baseline = git_tree_baseline(checkout, args.base_sha)
+            baseline_raw = canonical_bytes(baseline)
+            baseline_hash = sha256_bytes(baseline_raw)
+            baseline_source = "git_base"
+        assert baseline_raw is not None and baseline_hash is not None
+        audit = audit_write_set(checkout, baseline, current_return.get("files", []), requested)
+        if not audit.get("pass"):
+            fail(f"reconciliation write-set audit failed: {json.dumps(audit, sort_keys=True)}")
+
+        baseline_ref = f"objects/{object_store(p, baseline_raw)}"
+        repair_contract_ref = f"objects/{object_store(p, canonical_bytes(repair))}"
+        requested_binding = {**base_binding, "baseline_sha256": baseline_hash}
+        provenance = {
+            "authorization_ref": authorization["id"],
+            "finding_ref": finding_ref,
+            "source_attempt_ref": prior_attempt_id,
+            "candidate_sha": args.candidate_sha,
+            "packet_base_sha": args.base_sha,
+            "expanded_entries": sorted(expanded, key=lambda item: item["path"]),
+        }
+        receipt = {
+            **requested_binding,
+            "kind": "quarantined_attempt_reconciliation",
+            "recorded_at": now(),
+            "authorization_ref": authorization["id"],
+            "packet_ref": attempt.get("packet_ref"),
+            "return_ref": attempt.get("return_ref"),
+            "prior_return_ref": prior.get("return_ref"),
+            "baseline_ref": baseline_ref,
+            "baseline_source": baseline_source,
+            "repair_contract_ref": repair_contract_ref,
+            "legacy_lease": copy.deepcopy(attempt.get("lease")),
+            "effective_lease_zone": requested,
+            "repair_lease_provenance": provenance,
+            "write_set_audit": audit,
+            "quarantine_issue_refs": [item["id"] for item in quarantine_issues],
+        }
+        receipt_digest = object_store(p, canonical_bytes(receipt))
+        receipt_ref = f"objects/{receipt_digest}"
+
+        attempt["lease"]["state"] = "active"
+        attempt["lease"]["zone"] = requested
+        attempt["repair_authorization_ref"] = authorization["id"]
+        attempt["repair_lease_provenance"] = provenance
+        attempt["quarantine_reconciliation_ref"] = receipt_ref
+        for issue in quarantine_issues:
+            issue["impact"] = "advisory"
+            issue["disposition"] = f"reconciled by {reconciliation_id}"
+            issue["decision_ref"] = reconciliation_id
+            issue.setdefault("invalidated_by", []).append(reconciliation_id)
+        state.setdefault("decisions", []).append({
+            "id": reconciliation_id,
+            "type": "quarantine_reconciliation",
+            "status": "applied",
+            "decision": "RECONCILE",
+            "reason": "legacy create-only lease proven as exact same-ticket create-to-modify repair",
+            "evidence_refs": [finding_ref, baseline_ref, receipt_ref],
+            "affected_refs": [ticket_id, attempt_id, prior_attempt_id, finding_ref],
+            "intent_revision": state.get("intent", {}).get("current_revision"),
+            "invalidated_by": [],
+        })
+        evidence_id = f"ev-{receipt_digest[:16]}"
+        state.setdefault("evidence", []).append({
+            "id": evidence_id,
+            "hash": receipt_digest,
+            "source": "quarantine_reconciliation",
+            "scenario": "legacy_create_to_modify",
+            "outcome": "PASS",
+            "observer": actor,
+            "subject": attempt_id,
+        })
+        ticket["state"] = "RUNNING"
+        state["lifecycle"]["issue_refs"] = [
+            ref for ref in state["lifecycle"].get("issue_refs", [])
+            if ref not in {item["id"] for item in quarantine_issues}
+        ]
+        state["lifecycle"]["control"] = "ACTIVE"
+        state["lifecycle"]["reason"] = "quarantined_attempt_reconciled"
+        state["lifecycle"]["next_action"] = {
+            "kind": "prepare_candidate_effect",
+            "subject_refs": [attempt_id, reconciliation_id],
+            "preconditions": ["reconciliation receipt remains current", "candidate base SHA unchanged"],
+            "read_refs": ["phases/execute.md", "references/ledger.md"],
+        }
+        usage = state.setdefault("usage", default_usage())
+        usage.setdefault("counters", zero_usage())
+        usage.setdefault("trace", [])
+        usage.setdefault("shared_setup", zero_usage())
+        usage.setdefault("gate_costs", {f"G{i}": zero_usage() for i in range(7)})
+        delta = {field: 0 for field in USAGE_FIELDS}
+        delta["helper_calls"] = 1
+        delta["internal_publications"] = 1
+        add_usage(usage["counters"], delta)
+        usage["trace"].append({
+            "id": f"trace-{state['revision'] + 1}-helper",
+            "kind": "helper_publication",
+            "actor": "ledger-helper",
+            "subject_ref": "prepare_candidate_effect",
+            "delta": delta,
+            "evidence_ref": receipt_ref,
+            "recorded_at": now(),
+        })
+        state["revision"] += 1
+        state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        state["updated_at"] = now()
+        publish(p, state, previous_raw, "quarantine-reconciled")
+        return {
+            "reconciled": True,
+            "idempotent": False,
+            "reconciliation_id": reconciliation_id,
+            "attempt_id": attempt_id,
+            "receipt_ref": receipt_ref,
+            "changed_paths": audit["changed_paths"],
+            "revision": state["revision"],
+        }
+
+
+def cmd_audit(args: argparse.Namespace) -> dict[str, Any]:
+    root = safe_root(args.root, "audit root")
+    regular_directory(root, "audit root")
+    baseline = read_json(Path(args.baseline), "baseline manifest")
+    declared = read_json(Path(args.declared), "declared write set")
+    zones = read_json(Path(args.zone), "lease zone")
+    if not isinstance(declared, list) or not isinstance(zones, list):
+        fail("declared write set and lease zone must be arrays")
+    return audit_write_set(root, baseline, declared, zones)
 
 
 def check_integrity(baseline: dict[str, Any], state: dict[str, Any], current_raw: bytes, expected_subject: str | None = None) -> None:
@@ -3648,6 +4123,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch = sub.add_parser("dispatch"); dispatch.add_argument("--control-root", required=True); dispatch.add_argument("--run-id", required=True); dispatch.add_argument("--owner-token", required=True); dispatch.add_argument("--revision", type=int, required=True); dispatch.add_argument("--ticket-id", required=True); dispatch.add_argument("--attempt-id", required=True); dispatch.add_argument("--lease-id", required=True); dispatch.add_argument("--route-id", required=True); dispatch.add_argument("--packet", required=True); dispatch.add_argument("--route")
     ready = sub.add_parser("ready-ticket"); ready.add_argument("--control-root", required=True); ready.add_argument("--run-id", required=True); ready.add_argument("--owner-token", required=True); ready.add_argument("--revision", type=int, required=True); ready.add_argument("--ticket-id", required=True)
     repair = sub.add_parser("authorize-repair"); repair.add_argument("--control-root", required=True); repair.add_argument("--run-id", required=True); repair.add_argument("--owner-token", required=True); repair.add_argument("--revision", type=int, required=True); repair.add_argument("--ticket-id", required=True); repair.add_argument("--finding-ref", required=True); repair.add_argument("--authorization-id", required=True); repair.add_argument("--repair-contract", required=True)
+    reconcile_quarantine = sub.add_parser("reconcile-quarantined-attempt"); reconcile_quarantine.add_argument("--control-root", required=True); reconcile_quarantine.add_argument("--run-id", required=True); reconcile_quarantine.add_argument("--owner-token", required=True); reconcile_quarantine.add_argument("--revision", type=int, required=True); reconcile_quarantine.add_argument("--ticket-id", required=True); reconcile_quarantine.add_argument("--attempt-id", required=True); reconcile_quarantine.add_argument("--prior-attempt-id", required=True); reconcile_quarantine.add_argument("--finding-ref", required=True); reconcile_quarantine.add_argument("--candidate-sha", required=True); reconcile_quarantine.add_argument("--base-sha", required=True); reconcile_quarantine.add_argument("--baseline", help="optional pre-attempt manifest; omitted means derive the complete baseline from the exact Git base tree"); reconcile_quarantine.add_argument("--reconciliation-id", required=True); reconcile_quarantine.add_argument("--actor", required=True)
     terminate = sub.add_parser("terminate-attempt"); terminate.add_argument("--control-root", required=True); terminate.add_argument("--run-id", required=True); terminate.add_argument("--owner-token", required=True); terminate.add_argument("--revision", type=int, required=True); terminate.add_argument("--attempt-id", required=True); terminate.add_argument("--state", choices=["LOST", "INTERRUPTED"], required=True); terminate.add_argument("--lease-state", choices=["released", "quarantined"], required=True); terminate.add_argument("--evidence", required=True)
     candidate = sub.add_parser("candidate"); candidate.add_argument("--control-root", required=True); candidate.add_argument("--run-id", required=True); candidate.add_argument("--owner-token", required=True); candidate.add_argument("--revision", type=int, required=True); candidate.add_argument("--attempt-id", required=True); candidate.add_argument("--commit-receipt", required=True); candidate.add_argument("--operation-id", required=True)
     effect = sub.add_parser("prepare-effect"); effect.add_argument("--control-root", required=True); effect.add_argument("--run-id", required=True); effect.add_argument("--owner-token", required=True); effect.add_argument("--revision", type=int, required=True); effect.add_argument("--operation-id", required=True); effect.add_argument("--kind", required=True); effect.add_argument("--target", required=True); effect.add_argument("--expected-before", default=None); effect.add_argument("--intended-after", default=None); effect.add_argument("--authority-ref", required=True)
@@ -3685,6 +4161,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "dispatch": result = cmd_dispatch(args)
         elif args.command == "ready-ticket": result = cmd_ready_ticket(args)
         elif args.command == "authorize-repair": result = cmd_authorize_repair(args)
+        elif args.command == "reconcile-quarantined-attempt": result = cmd_reconcile_quarantined_attempt(args)
         elif args.command == "terminate-attempt": result = cmd_terminate_attempt(args)
         elif args.command == "candidate": result = cmd_candidate(args)
         elif args.command == "prepare-effect": result = cmd_prepare_effect(args)

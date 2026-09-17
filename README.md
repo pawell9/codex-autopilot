@@ -6,7 +6,7 @@ orchestrator owns the durable ledger, routing, contracts, review flow, and
 Git integration; bounded workers implement ticket-sized changes, and
 independent reviewers verify them.
 
-**CODEX-AUTOPILOT V1.0.6 — LIFECYCLE REPAIR PATCH RELEASE**
+**CODEX-AUTOPILOT V1.0.7 — QUARANTINE RECONCILIATION PATCH RELEASE**
 
 ## Requirements
 
@@ -96,6 +96,18 @@ registered inbox. This read-only state-bound check applies the same attempt,
 packet hash, epoch, intent, subject fingerprint, source/registration/subject
 revision, criteria, axis, and reference rules as ingest. Structural
 `validate --kind ...` remains intentionally context-free.
+
+An already quarantined legacy repair return is never released by hand. Use
+`reconcile-quarantined-attempt` only for the narrow same-ticket
+`create → candidate → repair modify` case. The command owner/revision-fences
+the exact attempt, revalidates its DONE return, authorization, blocking
+finding, prior create return, candidate/base SHA and packet, reruns the actual
+tracked/untracked/ignored/type/symlink write-set audit against either a supplied
+pre-attempt baseline or the complete exact Git base tree, and stores a
+hash-addressed receipt naming the actor and
+all evidence. A matching retry is a zero-effect success; stale, foreign,
+overbroad, deny-listed, non-write-set, or otherwise unsafe quarantine remains
+blocked.
 
 ## Presets
 

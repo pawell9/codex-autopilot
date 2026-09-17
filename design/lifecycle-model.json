@@ -1,5 +1,5 @@
 {
-  "model_version": "1.0.6",
+  "model_version": "1.0.7",
   "initial": "PREFLIGHT/ACTIVE",
   "success_terminal": "ACCEPT/ACCEPTED",
   "failure_terminals": [
@@ -51,7 +51,7 @@
     "lease": {
       "initial": "active",
       "terminal": ["released"],
-      "transitions": [["active", "released"], ["active", "quarantined"], ["quarantined", "released"]]
+      "transitions": [["active", "released"], ["active", "quarantined"], ["quarantined", "released"], ["quarantined", "active"]]
     },
     "operation": {
       "initial": "prepared",

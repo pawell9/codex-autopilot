@@ -19,6 +19,13 @@ Pause preserves worktree and changes. Cancel records the goal termination, prese
 5. Audit foreign tracked/untracked/ignored changes, symlink targets, protected paths, and Git common-dir state. Preserve foreign fingerprints. Old-epoch returns are historical evidence until the current owner re-audits and accepts them by version/subject checks.
 6. Invalidate facts affected by build, permission, surface, repo, HEAD, instruction, toolchain, configuration, or contradictory observations. Set the earliest invalid gate and a precise `next_action`.
 
+Do not hand-edit a quarantined lease. A returned legacy repair attempt may be
+restored to candidate authority only through `reconcile-quarantined-attempt`
+and only for the provenance-bound same-ticket create-to-modify case documented
+in `phases/execute.md`. Lost/interrupted, stale-base, foreign-path, non-DONE,
+non-write-set, deny-listed, or incompletely evidenced quarantine is outside
+that command and remains blocked.
+
 Use `tools/ledger.py recover` for deterministic publication. If current JSON is corrupt, validate verified previous snapshots newest-first; do not overwrite the namespace with a guessed reconstruction. Use `diagnose` for an unknown schema; it is strictly read-only. If no safe recovery exists, remain `BLOCKED` or `FAILED` after all in-flight activity is stopped; a successor run needs an explicit new scope decision.
 
 ## Handoff and resume

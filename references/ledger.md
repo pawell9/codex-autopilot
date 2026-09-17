@@ -23,6 +23,19 @@ For every mutation, the helper acquires the fixed advisory owner lock, rereads t
 
 `ready-ticket` atomically materializes dependency/current-publication readiness. `dispatch` publishes the route, lease, packet ref/hash, and `PREPARED` attempt before spawn. `terminate-attempt` records LOST/INTERRUPTED plus stop evidence and releases or quarantines its lease. After G1, `adopt-requirements` may publish an explicit legacy requirements/criteria manifest, `migrate-review-currentness` may fence provably superseded legacy findings after fresh current G2/G3 PASS ingestion, and `publish-design-bundle` publishes the complete design bundle. `prepare-design-review` registers coverage or plan identity and immutable subject bindings. `validate-return` is a read-only state-bound preflight; accepted review returns release their lease in the same ingest transaction. `candidate` consumes the ingested worker return and Git operation receipt. `authorize-repair` binds a blocking finding to a changed repair contract. `integrate` accepts exact review evidence and integrity PASS, resolves the authorized repair finding, and publishes current integration. `publish-intent`, `gate`, `amend`, and `recover` are compound intent commands. `diagnose`, `brief`, and `status` are bounded reads.
 
+`reconcile-quarantined-attempt` is the sole mutating compatibility path for an
+already quarantined returned repair whose legacy lease encoded `create` where
+the authorized packet required `modify`. Under the owner lock it proves the
+same current ticket/attempt, exact prior same-ticket DONE create return,
+current blocking finding and consumed authorization, candidate/base/HEAD,
+packet allow/deny scope, and complete actual write set against a supplied
+pre-attempt baseline or the exact Git base tree. It stores the baseline and
+full generated receipt by SHA-256, names
+the actor, invalidates only the matching write-set quarantine issue, and
+restores the attempt's packet-scoped candidate authority. The attempt points
+to that receipt; an exact retry does not publish another revision. No other
+quarantine cause is eligible.
+
 `init` publishes revision 0 without intent. `publish-intent` is the single-use bootstrap transaction: from PREFLIGHT/INTENT and ACTIVE/BLOCKED/RECOVERING it validates non-empty UTF-8 Markdown, owner/revision, destination, complete next ledger, and absence of any prior intent binding before installing immutable bytes and publishing the INTENT revision. Existing blocking issue refs remain blocking; a recovering run remains `RECOVERING` until reconciliation completes. Once intent exists, only `amend` may publish a later intent revision.
 
 `adopt-requirements` is the schema-1.0 compatibility publication for a nonterminal, pre-execution run. Its explicit manifest contains complete requirement↔criterion links and criterion oracles and binds the current intent revision/document/hash and owner epoch. The helper validates uniqueness, cross-links, provenance refs, status, and conflicts; stores exact bytes as `objects/<sha256>`; and atomically appends requirements, criteria, the requirements publication, and a migration record. It never infers prose. An exact retry is zero-effect; same ID with different bytes/records, active leases, prepared effects, stale fencing, or execution entry is rejected.
@@ -87,8 +100,9 @@ The helper does not call models, spawn agents, hold a daemon loop, parse prose, 
   authorization stores the exact repair-contract object and is single-use; the
   authorization and lease derivation are stored on the repair attempt. Legacy
   unbound authorizations require an explicit `authorize-repair` rebind and are
-  never inferred. All other zone violations retain the existing quarantine
-  path.
+  never inferred. The narrow reconciliation command above may repair only the
+  already-recorded create-only compatibility mismatch; all other zone
+  violations retain the existing quarantine path.
 - Packet registration revision, immutable subject/publication revision,
   attempt-created revision, return source revision, and ingest-time current
   revision are separate facts. Return `source_revision` must equal the packet
