@@ -1,5 +1,5 @@
 {
-  "model_version": "1.0.10",
+  "model_version": "1.0.11",
   "initial": "PREFLIGHT/ACTIVE",
   "success_terminal": "ACCEPT/ACCEPTED",
   "failure_terminals": [
@@ -17,6 +17,7 @@
     {"id": "G6", "from": "ACCEPT/ACTIVE", "to": "ACCEPT/ACCEPTED", "guard": "G5 remains current; no blockers, leases, or unresolved effects"},
     {"id": "DESIGN_REPAIR", "from": "PLAN/BLOCKED", "to": "DESIGN/ACTIVE", "guard": "current publication requires revision and publication leases are closed"},
     {"id": "EXECUTION_REPAIR_VERIFY", "from": "VERIFY/BLOCKED", "to": "EXECUTE/ACTIVE", "guard": "finding is classified as implementation repair"},
+    {"id": "BLOCKED_CONTINUATION_CANDIDATE", "from": "EXECUTE/BLOCKED", "to": "EXECUTE/BLOCKED", "guard": "owner authorization, external/out-of-scope blocker, passing focused checks, exact same-ticket lease/provenance, and complete non-empty write-set audit; candidate remains continuation-only"},
     {"id": "EXECUTION_REPAIR_ACCEPT", "from": "ACCEPT/BLOCKED", "to": "EXECUTE/ACTIVE", "guard": "finding is classified as implementation repair"},
     {"id": "CONTRACT_REPAIR", "from": "EXECUTE/BLOCKED", "to": "DESIGN/ACTIVE", "guard": "finding is classified as contract/design repair"},
     {"id": "INTENT_REPAIR", "from": "DESIGN/BLOCKED", "to": "INTENT/ACTIVE", "guard": "finding is classified as intent repair"},

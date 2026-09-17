@@ -22,6 +22,23 @@ base, derives the immediate previous validated candidate, preserves the full
 attempt history, releases the lease, and restores `ticket.current_attempt`.
 Afterward create a changed repair contract and use normal `authorize-repair`.
 
+For a non-empty `BLOCKED`/`HANDOFF` return, use
+`preserve-blocked-candidate` only when the focused ticket checks pass, all
+remaining failed checks and unsatisfied BLOCKED criteria are explicitly bound to
+a typed external/out-of-scope blocker, the exact worker lease and any repair
+lineage still validate, and the complete write-set audit passes. The owner
+authorization file must cite the current blocker and exact return. Prepare a
+`candidate_commit` operation using that authorization as `authority_ref`, make
+one direct candidate commit on the attempt base through the approved Git
+boundary, then pass its exact receipt to the helper. The helper rechecks HEAD,
+tree, parent, clean checkout, packet return, lease, provenance, and actual
+base-to-candidate paths before publishing the hash-addressed audit receipt.
+It leaves the ticket and lifecycle `BLOCKED`, preserves the worker's original
+verdict and blocker, and makes the candidate available for review or a later
+authorized repair. A continuation-only candidate cannot be integrated. Any
+in-scope failed check, failed/empty audit, unauthorized path, stale provenance,
+or quarantined lease rejects the transition without a ledger publication.
+
 ## Cause-first repair
 
 `implementation` routes to a minimal worker repair with changed hypothesis and regression proof. `contract` or `user_intent` returns through versioned INTENT/DESIGN/PLAN. `oracle` reconstructs expected behavior independently. `environment`/`permission` performs a conditional preflight or records a user action. `ownership` quarantines and resolves the exact zone/base. `orchestration` reconciles ledger/attempt/effect state. `unknown` gets a fresh read-only diagnosis.

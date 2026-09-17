@@ -23,6 +23,18 @@ For every mutation, the helper acquires the fixed advisory owner lock, rereads t
 
 `ready-ticket` atomically materializes dependency/current-publication readiness. `dispatch` publishes the route, lease, packet ref/hash, and `PREPARED` attempt before spawn. `terminate-attempt` records LOST/INTERRUPTED plus stop evidence and releases or quarantines its lease. `close-blocked-attempt` (alias `restore-last-validated-candidate`) closes an exact returned no-write BLOCKED repair, audits the checkout, releases its active lease, and restores linkage to the derived immediate prior validated candidate without removing history. After G1, `adopt-requirements` may publish an explicit legacy requirements/criteria manifest, `migrate-review-currentness` may fence provably superseded legacy findings after fresh current G2/G3 PASS ingestion, and `publish-design-bundle` publishes the complete design bundle. `prepare-design-review` registers coverage or plan identity and immutable subject bindings. `validate-return` is a read-only state-bound preflight; accepted review returns release their lease in the same ingest transaction. `candidate` consumes the ingested worker return and Git operation receipt. `authorize-repair` binds a blocking finding to a changed repair contract. `integrate` accepts exact review evidence and integrity PASS, resolves the authorized repair finding, and publishes current integration. `publish-intent`, `gate`, `amend`, and `recover` are compound intent commands. `diagnose`, `brief`, and `status` are bounded reads.
 
+`preserve-blocked-candidate` is the only candidate path for a non-empty
+`BLOCKED`/`HANDOFF` worker return. It requires an exact current ticket/attempt,
+owner authorization bound to a current typed external/out-of-scope issue and
+the immutable return, passing focused checks, explicit attribution of any
+external failed checks/criteria, a current non-quarantined lease, and valid
+repair provenance. It verifies a clean direct commit on the exact base, reruns
+the complete checkout write-set audit against the Git base tree, and stores the
+receipt, commit receipt, authorization decision, and evidence atomically. It
+preserves `BLOCKED`, never accepts an in-scope failed check or lease/audit
+failure, and produces a continuation-only candidate that can be reviewed or
+used by a later authorized repair but cannot be integrated on its own.
+
 `reconcile-quarantined-attempt` is the sole mutating compatibility path for an
 already quarantined returned repair whose legacy lease encoded `create` where
 the authorized packet required `modify`. Under the owner lock it proves the

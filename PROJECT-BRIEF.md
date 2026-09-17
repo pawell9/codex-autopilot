@@ -1,6 +1,6 @@
 # Codex Autopilot — PROJECT BRIEF
 
-**Status:** CODEX-AUTOPILOT V1.0.10 — REPAIR AUTHORIZATION PROVENANCE PATCH RELEASE
+**Status:** CODEX-AUTOPILOT V1.0.11 — AUDITED BLOCKED CONTINUATION CANDIDATES
 **Purpose:** starting context for research and design of a Codex-native Autopilot skill
 **Working project name:** `codex-autopilot`
 

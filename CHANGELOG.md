@@ -1,5 +1,25 @@
 # Changelog
 
+## [v1.0.11] — 2026-09-17
+
+Audited BLOCKED/HANDOFF continuation candidate patch release.
+
+- Added owner-authorized `preserve-blocked-candidate` for non-empty BLOCKED or
+  HANDOFF returns with passing focused checks, typed external/out-of-scope
+  blockers, valid ticket lease/provenance, and a passing complete write-set
+  audit against the exact Git base.
+- Stored the exact audited paths, candidate/base/tree fingerprints, blocker,
+  return, authorization, repair provenance, and commit receipt in immutable
+  objects and decisions while retaining the BLOCKED verdict and blocker.
+- Allowed continuation candidates to receive independent review or serve as a
+  later authorized repair base; prohibited their direct integration.
+- Rejected failed in-scope checks, missing/stale provenance, quarantined or
+  mismatched leases, incomplete/empty audits, and any changed path outside the
+  authorized lease without publishing a ledger revision.
+- Added positive and negative lifecycle regression coverage, including
+  transitive create-to-modify provenance and the current external suite-blocker
+  shape.
+
 ## [v1.0.10] — 2026-09-17
 
 Repair authorization provenance patch release.

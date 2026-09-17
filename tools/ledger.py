@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.10"
+SKILL_VERSION = "1.0.11"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 COMPATIBILITY_FLOOR = "1.0.0"
@@ -1032,6 +1032,105 @@ def finding_matches_candidate(state: dict[str, Any], finding_ref: str, ticket_id
     return bool(source_review and source_review.get("subject_fingerprint") == candidate_sha and ticket_id in record.get("affected_refs", []))
 
 
+def continuation_candidate_receipt(
+    p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], attempt: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return an integrity-checked BLOCKED/HANDOFF candidate continuation record."""
+    receipt_ref = attempt.get("continuation_ref")
+    authorization_ref = attempt.get("continuation_authorization_ref")
+    if not receipt_ref or not authorization_ref:
+        return None
+    receipt = stored_payload(p, receipt_ref, "continuation candidate receipt")
+    authorization = next(
+        (
+            item for item in state.get("decisions", [])
+            if item.get("id") == authorization_ref
+            and item.get("type") == "continuation_candidate_authorization"
+            and item.get("status") == "applied"
+            and item.get("decision") == "PRESERVE_CONTINUATION"
+            and ticket.get("id") in item.get("affected_refs", [])
+            and attempt.get("id") in item.get("affected_refs", [])
+            and not item.get("invalidated_by")
+        ),
+        None,
+    )
+    if authorization is None:
+        fail("continuation candidate lacks its current owner authorization")
+    returned = stored_payload(p, attempt.get("return_ref"), "continuation candidate worker return")
+    expected = {
+        "run_id": state.get("run_id"),
+        "ticket_id": ticket.get("id"),
+        "attempt_id": attempt.get("id"),
+        "return_ref": attempt.get("return_ref"),
+        "authorization_ref": authorization_ref,
+        "blocker_ref": authorization.get("blocker_ref"),
+        "blocker_scope": authorization.get("blocker_scope"),
+        "base_sha": attempt.get("base_sha"),
+        "candidate_sha": attempt.get("candidate_sha"),
+        "candidate_tree_sha": attempt.get("candidate_tree_sha"),
+        "return_status": returned.get("status"),
+        "files": returned.get("files"),
+        "lease_zone": attempt.get("lease", {}).get("zone"),
+        "external_check_ids": sorted(authorization.get("external_check_ids", [])),
+        "external_criterion_ids": sorted(authorization.get("external_criterion_ids", [])),
+    }
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        fail("continuation candidate receipt does not match the attempt, return, authorization, or lease")
+    if returned.get("status") not in ("BLOCKED", "HANDOFF"):
+        fail("continuation candidate source is not a BLOCKED/HANDOFF worker return")
+    audit = receipt.get("write_set_audit")
+    if not isinstance(audit, dict) or audit.get("pass") is not True or not audit.get("changed_paths"):
+        fail("continuation candidate source has no passing non-empty write-set audit")
+    if receipt.get("audit_hash") != sha256_bytes(canonical_bytes(audit)):
+        fail("continuation candidate write-set audit hash does not match")
+    if receipt.get("blocker_ref") != authorization.get("blocker_ref"):
+        fail("continuation candidate blocker binding is discontinuous")
+    commit_ref = receipt.get("commit_receipt_ref")
+    commit_receipt = stored_payload(p, commit_ref, "continuation candidate commit receipt")
+    if (
+        commit_receipt.get("status") != "PASS"
+        or commit_receipt.get("authority_ref") != authorization_ref
+        or commit_receipt.get("base_sha") != attempt.get("base_sha")
+        or commit_receipt.get("commit_sha") != attempt.get("candidate_sha")
+        or commit_receipt.get("tree_sha") != attempt.get("candidate_tree_sha")
+    ):
+        fail("continuation candidate commit receipt no longer matches its authorization and Git object")
+    checkout = Path(attempt.get("checkout") or "").expanduser().resolve()
+    regular_directory(checkout, "continuation candidate checkout")
+    try:
+        tree_sha = git_output(checkout, "rev-parse", f"{attempt['candidate_sha']}^{{tree}}").decode().strip()
+        parents = git_output(checkout, "rev-list", "--parents", "-n", "1", attempt["candidate_sha"]).decode().split()
+    except (OSError, UnicodeError) as exc:
+        fail(f"cannot revalidate continuation candidate Git object: {exc}")
+    if tree_sha != attempt.get("candidate_tree_sha") or len(parents) != 2 or parents[1] != attempt.get("base_sha"):
+        fail("continuation candidate Git object has a missing or discontinuous base/tree edge")
+    return receipt
+
+
+def validated_candidate_worker_return(
+    p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], attempt: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate a current candidate return, including an authorized continuation."""
+    returned = stored_payload(p, attempt.get("return_ref"), "candidate worker return")
+    root = schema()
+    validate(returned, root["$defs"]["worker_return"], root, "$.candidate_worker_return")
+    identity = packet_identity(returned)
+    if (
+        identity.get("run_id") != state.get("run_id")
+        or identity.get("ticket_id") != ticket.get("id")
+        or identity.get("attempt_id") != attempt.get("id")
+        or identity.get("packet_hash") != attempt.get("packet_hash")
+        or identity.get("epoch") != attempt.get("epoch")
+    ):
+        fail("candidate worker return identity is not bound to its current attempt")
+    if returned.get("status") == "DONE":
+        return returned
+    if returned.get("status") in ("BLOCKED", "HANDOFF"):
+        if continuation_candidate_receipt(p, state, ticket, attempt) is not None:
+            return returned
+    fail("candidate worker return is neither DONE nor an authorized continuation")
+
+
 def repair_candidate_worker(
     state: dict[str, Any], ticket: dict[str, Any], repair: dict[str, Any], packet_base: str
 ) -> dict[str, Any]:
@@ -1087,19 +1186,7 @@ def repair_requires_transitive_create_modify_provenance(
     ):
         return False
 
-    returned = stored_payload(p, current["return_ref"], "current candidate worker return")
-    schema_root = schema()
-    validate(returned, schema_root["$defs"]["worker_return"], schema_root, "$.current_candidate_return")
-    identity = packet_identity(returned)
-    if (
-        returned.get("status") != "DONE"
-        or identity.get("run_id") != state.get("run_id")
-        or identity.get("ticket_id") != ticket.get("id")
-        or identity.get("attempt_id") != current.get("id")
-        or identity.get("packet_hash") != current.get("packet_hash")
-        or identity.get("epoch") != current.get("epoch")
-    ):
-        fail("repair authorization cannot prove the exact current validated candidate return")
+    returned = validated_candidate_worker_return(p, state, ticket, current)
 
     candidate_paths = {
         relative_path(item.get("path"), "current candidate return path")
@@ -1214,19 +1301,7 @@ def validated_repair_path_lineage(
         or source_attempt.get("lease", {}).get("state") == "quarantined"
     ):
         fail("repair lineage candidate is missing, foreign, stale, or quarantined")
-    returned = stored_payload(p, source_attempt.get("return_ref"), "repair lineage worker return")
-    root = schema()
-    validate(returned, root["$defs"]["worker_return"], root, "$.lineage_return")
-    identity = packet_identity(returned)
-    if (
-        identity.get("run_id") != state["run_id"]
-        or identity.get("ticket_id") != ticket["id"]
-        or identity.get("attempt_id") != attempt_id
-        or identity.get("packet_hash") != source_attempt.get("packet_hash")
-        or identity.get("epoch") != source_attempt.get("epoch")
-        or returned.get("status") != "DONE"
-    ):
-        fail("repair lineage requires an exact validated DONE worker return")
+    returned = validated_candidate_worker_return(p, state, ticket, source_attempt)
     operations = {
         item.get("operation")
         for item in returned.get("files", [])
@@ -1826,6 +1901,18 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
                 "preconditions": ["worker stopped", "actual write set audited", "candidate effect prepared"],
                 "read_refs": ["phases/execute.md", "references/safety.md"],
             }
+        if args.kind == "review" and payload.get("verdict") == "PASS":
+            ticket = next((item for item in next_state.get("tickets", []) if item.get("id") == target.get("subject_ref")), None)
+            worker = next((item for item in next_state.get("attempts", []) if item.get("id") == (ticket or {}).get("current_attempt") and item.get("kind") == "worker"), None)
+            if ticket and worker and worker.get("continuation_ref"):
+                next_state["lifecycle"]["control"] = "BLOCKED"
+                next_state["lifecycle"]["reason"] = "blocked_continuation_candidate_reviewed"
+                next_state["lifecycle"]["next_action"] = {
+                    "kind": "resolve_blocker_or_authorize_candidate_bound_repair",
+                    "subject_refs": [ticket["id"], worker["id"], *target.get("finding_refs", [])],
+                    "preconditions": ["external/out-of-scope blocker remains durable", "review PASS does not mark the ticket DONE or INTEGRATED"],
+                    "read_refs": ["phases/execute.md", "references/routing.md"],
+                }
         if args.kind == "review":
             review_id = f"REV-{digest[:16]}"
             if review_id not in {item.get("id") for item in next_state.get("reviews", [])}:
@@ -2044,6 +2131,23 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
                 if item.get("id") == ticket.get("current_attempt")
             )
             repair_candidate_worker(state, ticket, contract, current["candidate_sha"])
+        continuation_blocker_refs = {
+            decision.get("blocker_ref")
+            for decision in state.get("decisions", [])
+            if decision.get("type") == "continuation_candidate_authorization"
+            and decision.get("status") == "applied"
+            and args.ticket_id in decision.get("affected_refs", [])
+        }
+        preserve_blocked_control = bool(
+            state["lifecycle"].get("control") == "BLOCKED"
+            and continuation_blocker_refs
+            and any(
+                issue.get("id") in continuation_blocker_refs
+                and issue.get("impact") == "blocking"
+                and not issue.get("invalidated_by")
+                for issue in state.get("issues", [])
+            )
+        )
         for attempt in state.get("attempts", []):
             if attempt.get("subject_ref") == args.ticket_id and attempt.get("state") in ("PREPARED", "DISPATCHED"):
                 fail("repair authorization requires stopped attempts")
@@ -2058,9 +2162,12 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
         if finding is not None:
             finding["repair_contract_ref"] = args.authorization_id
         ticket["state"] = "READY"
-        state["lifecycle"]["control"] = "ACTIVE"
-        state["lifecycle"]["reason"] = "repair_authorized"
-        state["lifecycle"]["next_action"] = {"kind": "dispatch_repair", "subject_refs": [args.ticket_id, args.finding_ref], "preconditions": ["fresh attempt ID", "causally changed repair contract", "dependencies remain INTEGRATED"], "read_refs": ["phases/execute.md", "references/routing.md"]}
+        if preserve_blocked_control:
+            state["lifecycle"]["next_action"] = {"kind": "dispatch_repair_with_blocker_retained", "subject_refs": [args.ticket_id, args.finding_ref, *sorted(continuation_blocker_refs)], "preconditions": ["owner-authorized candidate-bound repair", "external/out-of-scope blocker remains unresolved", "do not widen the ticket lease"], "read_refs": ["phases/execute.md", "references/routing.md"]}
+        else:
+            state["lifecycle"]["control"] = "ACTIVE"
+            state["lifecycle"]["reason"] = "repair_authorized"
+            state["lifecycle"]["next_action"] = {"kind": "dispatch_repair", "subject_refs": [args.ticket_id, args.finding_ref], "preconditions": ["fresh attempt ID", "causally changed repair contract", "dependencies remain INTEGRATED"], "read_refs": ["phases/execute.md", "references/routing.md"]}
 
     result = transaction(p, args.owner_token, args.revision, change, "repair-authorized")
     return {"authorized": True, "authorization_id": args.authorization_id, "ticket_id": args.ticket_id, "finding_ref": args.finding_ref, "revision": result["revision"]}
@@ -2149,6 +2256,319 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
         state["lifecycle"]["next_action"] = {"kind": "review_change", "subject_refs": [args.attempt_id], "preconditions": ["candidate SHA frozen", "integrity baseline recorded"], "read_refs": ["contracts/reviewer.md", "references/safety.md"]}
     result = transaction(p, args.owner_token, args.revision, change)
     return {"candidate": receipt["commit_sha"], "idempotent": False, "revision": result["revision"], "next_action": result["lifecycle"]["next_action"]}
+
+
+def validate_continuation_provenance(
+    p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], attempt: dict[str, Any], packet: dict[str, Any]
+) -> None:
+    """Revalidate the attempt's ticket lease and repair lineage before preservation."""
+    requested = packet_write_zone(packet)
+    disallowed = [
+        {"path": entry["path"], "operation": operation}
+        for entry in requested
+        for operation in entry["operations"]
+        if not zone_allows(ticket.get("zone", []), entry["path"], operation)
+    ]
+    stored_zone = attempt.get("lease", {}).get("zone", [])
+    if attempt.get("mode") != "repair":
+        if packet.get("repair") or attempt.get("repair_lease_provenance"):
+            fail("non-repair continuation attempt contains repair provenance")
+        if stored_zone != requested or disallowed:
+            fail("continuation attempt lease does not exactly match the ticket-authorized packet allowlist")
+        return
+
+    repair = packet.get("repair")
+    if not isinstance(repair, dict) or attempt.get("repair_contract") != repair:
+        fail("continuation repair packet does not match the attempt's stored repair contract")
+    authorization_ref = attempt.get("repair_authorization_ref")
+    authorization = next(
+        (
+            item for item in state.get("decisions", [])
+            if item.get("id") == authorization_ref
+            and item.get("type") == "repair_authorization"
+            and item.get("status") == "authorized"
+            and item.get("decision") == "REPAIR"
+            and ticket.get("id") in item.get("affected_refs", [])
+            and repair.get("finding_ref") in item.get("affected_refs", [])
+            and not item.get("invalidated_by")
+        ),
+        None,
+    )
+    if authorization is None:
+        fail("continuation repair attempt has no current same-ticket repair authorization")
+    contract_refs = [ref for ref in authorization.get("evidence_refs", []) if isinstance(ref, str) and ref.startswith("objects/")]
+    if len(contract_refs) != 1 or stored_payload(p, contract_refs[0], "authorized repair contract") != repair:
+        fail("continuation repair authorization is not bound to the exact repair contract")
+    source_ref = repair.get("source_attempt_ref")
+    base_sha = attempt.get("base_sha")
+    source = next((item for item in state.get("attempts", []) if item.get("id") == source_ref), None)
+    if (
+        source is None
+        or source.get("kind") != "worker"
+        or source.get("subject_ref") != ticket.get("id")
+        or source.get("state") != "RETURNED"
+        or source.get("candidate_sha") != base_sha
+        or source.get("lease", {}).get("state") == "quarantined"
+    ):
+        fail("continuation repair source is missing, foreign, stale, or quarantined")
+    validated_candidate_worker_return(p, state, ticket, source)
+    if not finding_matches_candidate(state, repair.get("finding_ref"), ticket["id"], base_sha):
+        fail("continuation repair finding is not bound to the exact same-ticket source candidate")
+
+    provenance = attempt.get("repair_lease_provenance")
+    if not disallowed:
+        if stored_zone != requested or provenance is not None:
+            fail("continuation repair lease or provenance differs from its unexpanded packet allowlist")
+        return
+    if not isinstance(provenance, dict):
+        fail("continuation repair is missing its required lease provenance")
+    if (
+        provenance.get("authorization_ref") != authorization_ref
+        or provenance.get("finding_ref") != repair.get("finding_ref")
+        or provenance.get("source_attempt_ref") != source_ref
+        or provenance.get("candidate_sha") != base_sha
+        or provenance.get("packet_base_sha") != base_sha
+    ):
+        fail("continuation repair lease provenance is discontinuous")
+    denied = [relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])]
+    for item in disallowed:
+        path, operation = item["path"], item["operation"]
+        if operation != "modify" or not zone_allows(ticket.get("zone", []), path, "create"):
+            fail(f"continuation repair lease expansion is outside create-to-modify provenance: {path}")
+        if any(path == denied_path or path.startswith(denied_path + "/") for denied_path in denied):
+            fail(f"continuation repair lease expansion conflicts with packet deny list: {path}")
+    expected_expanded = [{"path": item["path"], "operations": ["modify"]} for item in disallowed]
+    if provenance.get("expanded_entries") != expected_expanded or stored_zone != requested:
+        fail("continuation repair lease does not match the exact authorized packet allowlist")
+    expected_lineage = [
+        {
+            "path": item["path"],
+            "attempts": validated_repair_path_lineage(p, state, ticket, source, item["path"], base_sha),
+        }
+        for item in disallowed
+    ]
+    if provenance.get("lineage") != expected_lineage:
+        fail("continuation repair provenance lineage does not match the validated source candidate")
+
+
+def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
+    """Preserve an owner-authorized, fully audited BLOCKED/HANDOFF write set."""
+    p = paths(args.control_root, args.run_id)
+    authorization = read_json(Path(args.authorization_file).expanduser().resolve(), "continuation owner authorization")
+    root_schema = schema()
+    validate(authorization, root_schema["$defs"]["continuation_candidate_authorization"], root_schema, "$.authorization")
+    commit_receipt = read_json(Path(args.commit_receipt).expanduser().resolve(), "continuation candidate commit receipt")
+    if (
+        commit_receipt.get("status") != "PASS"
+        or not GIT_SHA_RE.fullmatch(commit_receipt.get("commit_sha", ""))
+        or not GIT_SHA_RE.fullmatch(commit_receipt.get("tree_sha", ""))
+    ):
+        fail("continuation candidate requires a PASS receipt with commit_sha and tree_sha")
+    observed, _ = load_state(p)
+    if observed["owner"]["token"] != args.owner_token:
+        fail("owner token mismatch; stale orchestrator is fenced")
+    observed_attempt = attempt_by_id(observed, args.attempt_id)
+    observed_ticket = next((item for item in observed.get("tickets", []) if item.get("id") == args.ticket_id), None)
+    if observed_attempt.get("continuation_ref"):
+        existing = continuation_candidate_receipt(p, observed, observed_ticket or {}, observed_attempt)
+        if (
+            authorization.get("id") == observed_attempt.get("continuation_authorization_ref")
+            and commit_receipt.get("commit_sha") == observed_attempt.get("candidate_sha")
+            and commit_receipt.get("tree_sha") == observed_attempt.get("candidate_tree_sha")
+            and existing.get("operation_id") == args.operation_id
+        ):
+            return {"candidate": observed_attempt["candidate_sha"], "continuation_ref": observed_attempt["continuation_ref"], "idempotent": True, "revision": observed["revision"], "control": observed["lifecycle"]["control"]}
+        fail("attempt already has a different preserved continuation candidate")
+
+    def change(state: dict[str, Any]) -> None:
+        if state["lifecycle"].get("control") != "BLOCKED":
+            fail("continuation preservation requires lifecycle control BLOCKED")
+        attempt = attempt_by_id(state, args.attempt_id)
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == args.ticket_id), None)
+        if (
+            ticket is None
+            or ticket.get("state") != "BLOCKED"
+            or ticket.get("current_attempt") != attempt.get("id")
+            or attempt.get("subject_ref") != args.ticket_id
+        ):
+            fail("continuation preservation requires the exact current BLOCKED ticket attempt")
+        if attempt.get("epoch") != state["owner"]["epoch"]:
+            fail("continuation preservation requires a current-epoch worker attempt")
+        if attempt.get("kind") != "worker" or attempt.get("state") != "RETURNED":
+            fail("continuation preservation requires a validated RETURNED worker attempt")
+        if attempt.get("lease", {}).get("state") != "active":
+            fail("continuation preservation requires the worker's active, non-quarantined lease")
+        if attempt.get("candidate_sha") is not None or attempt.get("candidate_tree_sha") is not None:
+            fail("continuation preservation requires an attempt with no prior candidate")
+        if attempt.get("continuation_ref") or attempt.get("continuation_authorization_ref"):
+            fail("continuation candidate was already preserved")
+
+        blocker_ref = authorization["blocker_ref"]
+        blocker = next((item for item in state.get("issues", []) if item.get("id") == blocker_ref), None)
+        if (
+            blocker is None
+            or blocker.get("impact") != "blocking"
+            or blocker.get("invalidated_by")
+            or blocker.get("source_ref") != attempt.get("id")
+            or args.ticket_id not in blocker.get("affected_refs", [])
+        ):
+            fail("owner authorization must bind a current blocking issue from this exact attempt and ticket")
+        if authorization.get("blocker_scope") == "external":
+            if not (blocker.get("type", "").startswith("external_") or blocker.get("cause") == "environment"):
+                fail("external blocker authorization requires typed external/environment issue evidence")
+        elif not (blocker.get("type", "").startswith("scope_") or blocker.get("type", "").startswith("out_of_scope_")):
+            fail("out-of-scope authorization requires a typed scope blocker")
+        evidence_refs = set(authorization.get("evidence_refs", []))
+        if blocker_ref not in evidence_refs or attempt.get("return_ref") not in evidence_refs:
+            fail("owner authorization must cite both the blocker and exact validated worker return")
+        affected = set(authorization.get("affected_refs", []))
+        if not {args.ticket_id, attempt.get("id")}.issubset(affected):
+            fail("owner authorization must name the exact ticket and attempt")
+        if any(item.get("id") == authorization["id"] for item in state.get("decisions", [])):
+            fail("continuation authorization ID already exists")
+
+        worker_return = stored_payload(p, attempt.get("return_ref"), "worker return")
+        packet = stored_payload(p, attempt.get("packet_ref"), "worker packet")
+        validate_worker_return_semantics(worker_return, packet)
+        if worker_return.get("status") not in ("BLOCKED", "HANDOFF"):
+            fail("continuation preservation applies only to BLOCKED/HANDOFF worker returns")
+        if not worker_return.get("files"):
+            fail("continuation preservation requires a non-empty worker write-set")
+        validate_continuation_provenance(p, state, ticket, attempt, packet)
+        if worker_return_write_set_violations(worker_return, attempt.get("lease", {})):
+            fail("continuation worker return declares paths outside its lease")
+
+        checks = {item.get("check_id"): item for item in worker_return.get("checks", [])}
+        required = {
+            item.get("check_id") for item in packet.get("verification", [])
+            if item.get("required", True)
+        }
+        if not required:
+            fail("continuation preservation requires at least one required ticket check")
+        external_checks = set(authorization.get("external_check_ids", []))
+        check_failures = {check_id for check_id, item in checks.items() if item.get("outcome") == "fail"}
+        if check_failures != external_checks:
+            fail("every failed check must be explicitly attributed to the authorized external/out-of-scope blocker, with no own failures")
+        if not external_checks.issubset(required):
+            fail("only failed required ticket checks can be attributed to the continuation blocker")
+        if any(checks.get(check_id, {}).get("outcome") != "pass" for check_id in required - external_checks):
+            fail("all required ticket checks outside the proven blocker must PASS")
+        if any(item.get("outcome") in ("not_run", "unverifiable") for item in worker_return.get("checks", [])):
+            fail("continuation preservation rejects unchecked or unverifiable implementation checks")
+
+        criterion_outcomes = {item.get("criterion_id"): item.get("outcome") for item in worker_return.get("criteria", [])}
+        external_criteria = set(authorization.get("external_criterion_ids", []))
+        if not external_criteria.issubset(criterion_outcomes):
+            fail("owner authorization names an unknown externally blocked ticket criterion")
+        if worker_return.get("status") == "BLOCKED":
+            unsatisfied = {key for key, outcome in criterion_outcomes.items() if outcome != "satisfied"}
+            if unsatisfied != external_criteria:
+                fail("BLOCKED continuation criteria must all pass or be explicitly bound to the external/out-of-scope blocker")
+        if any(criterion_outcomes[item] == "satisfied" for item in external_criteria):
+            fail("owner authorization cannot classify a satisfied ticket criterion as externally blocked")
+
+        checkout = Path(attempt.get("checkout") or "").expanduser().resolve()
+        regular_directory(checkout, "worker checkout")
+        if commit_receipt.get("checkout") and Path(commit_receipt["checkout"]).expanduser().resolve() != checkout.resolve():
+            fail("continuation commit receipt checkout does not match the worker's exact checkout")
+        if commit_receipt.get("base_sha") != attempt.get("base_sha"):
+            fail("continuation candidate base SHA does not match the worker attempt")
+        if commit_receipt.get("authority_ref") != authorization.get("id"):
+            fail("continuation commit receipt is not bound to the owner authorization")
+        if not GIT_SHA_RE.fullmatch(attempt.get("base_sha") or ""):
+            fail("continuation preservation requires an exact Git base SHA")
+        try:
+            head = git_output(checkout, "rev-parse", "HEAD").decode().strip()
+            tree_sha = git_output(checkout, "rev-parse", "HEAD^{tree}").decode().strip()
+            parents = git_output(checkout, "rev-list", "--parents", "-n", "1", head).decode().split()
+        except (OSError, UnicodeError) as exc:
+            fail(f"cannot verify continuation candidate Git state: {exc}")
+        if head != commit_receipt["commit_sha"] or tree_sha != commit_receipt["tree_sha"]:
+            fail("continuation commit receipt does not match the checkout HEAD/tree")
+        if len(parents) != 2 or parents[1] != attempt.get("base_sha"):
+            fail("continuation candidate must be one direct commit on the exact worker base")
+        if git_output(checkout, "status", "--porcelain=v1", "-z", "--untracked-files=all"):
+            fail("continuation candidate checkout must be clean after its exact candidate commit")
+
+        operation = next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None)
+        if (
+            operation is None
+            or operation.get("kind") != "candidate_commit"
+            or operation.get("state") != "prepared"
+            or Path(operation.get("target", "")).expanduser().resolve() != checkout.resolve()
+            or operation.get("expected_before") != attempt.get("base_sha")
+            or operation.get("authority_ref") != authorization.get("id")
+            or operation.get("intended_after") not in (None, head)
+        ):
+            fail("continuation preservation requires a prepared candidate_commit operation bound to this authorization, base, and checkout")
+
+        baseline = git_tree_baseline(checkout, attempt["base_sha"])
+        audit = audit_write_set(checkout, baseline, worker_return.get("files", []), attempt["lease"].get("zone", []))
+        if not audit.get("pass"):
+            fail(f"continuation write-set audit failed: {json.dumps(audit, sort_keys=True)}")
+        if not audit.get("changed_paths"):
+            fail("continuation write-set audit is empty")
+        if set(audit.get("changed_paths", [])) != {
+            item["path"] for item in worker_return.get("files", [])
+        }:
+            fail("audited write-set differs from the exact validated worker return")
+
+        commit_ref = f"objects/{object_store(p, canonical_bytes(commit_receipt))}"
+        continuation = {
+            "run_id": state["run_id"], "ticket_id": args.ticket_id, "attempt_id": attempt["id"],
+            "return_ref": attempt["return_ref"], "return_status": worker_return["status"],
+            "blocker_ref": blocker_ref, "blocker_scope": authorization["blocker_scope"],
+            "authorization_ref": authorization["id"], "base_sha": attempt["base_sha"],
+            "candidate_sha": head, "candidate_tree_sha": tree_sha,
+            "files": worker_return["files"], "lease_zone": attempt["lease"]["zone"],
+            "repair_lease_provenance": attempt.get("repair_lease_provenance"),
+            "external_check_ids": sorted(external_checks),
+            "external_criterion_ids": sorted(external_criteria),
+            "write_set_audit": audit, "audit_hash": sha256_bytes(canonical_bytes(audit)),
+            "commit_receipt_ref": commit_ref, "operation_id": args.operation_id,
+            "introduced_revision": state["revision"] + 1,
+        }
+        continuation_ref = f"objects/{object_store(p, canonical_bytes(continuation))}"
+        auth_record = dict(authorization)
+        auth_record.update({
+            "status": "applied", "introduced_revision": str(state["revision"] + 1),
+            "intent_revision": state.get("intent", {}).get("current_revision"),
+            "evidence_refs": sorted(evidence_refs | {continuation_ref, commit_ref}),
+            "invalidated_by": [],
+        })
+        state.setdefault("decisions", []).append(auth_record)
+        attempt["candidate_sha"] = head
+        attempt["candidate_tree_sha"] = tree_sha
+        attempt["continuation_ref"] = continuation_ref
+        attempt["continuation_authorization_ref"] = authorization["id"]
+        operation["state"] = "applied"
+        operation["target"] = str(checkout)
+        operation["expected_before"] = attempt["base_sha"]
+        operation["intended_after"] = head
+        operation["receipt_ref"] = commit_ref
+        ev_id = f"ev-continuation-{sha256_bytes(canonical_bytes(continuation))[:16]}"
+        state.setdefault("evidence", []).append({
+            "id": ev_id, "hash": sha256_bytes(canonical_bytes(continuation)),
+            "source": "blocked_candidate_write_set_audit", "scenario": worker_return["status"],
+            "outcome": "PASS", "observer": "ledger-helper", "subject": attempt["id"],
+        })
+        state["lifecycle"]["control"] = "BLOCKED"
+        state["lifecycle"]["reason"] = state["lifecycle"].get("reason") or "blocked_continuation_candidate_preserved"
+        state["lifecycle"]["next_action"] = {
+            "kind": "review_or_repair_continuation_candidate",
+            "subject_refs": [args.ticket_id, attempt["id"], blocker_ref],
+            "preconditions": ["owner authorization recorded", "exact candidate write-set audit PASS", "blocker remains unresolved", "ticket verdict remains BLOCKED"],
+            "read_refs": ["phases/execute.md", "references/ledger.md", "references/safety.md"],
+        }
+
+    result = transaction(p, args.owner_token, args.revision, change, "blocked-continuation-candidate")
+    attempt = attempt_by_id(result, args.attempt_id)
+    return {
+        "candidate": attempt["candidate_sha"], "candidate_tree_sha": attempt["candidate_tree_sha"],
+        "continuation_ref": attempt["continuation_ref"], "idempotent": False,
+        "revision": result["revision"], "control": result["lifecycle"]["control"],
+        "ticket_state": next(item for item in result["tickets"] if item["id"] == args.ticket_id)["state"],
+    }
 
 
 def cmd_prepare_effect(args: argparse.Namespace) -> dict[str, Any]:
@@ -2244,11 +2664,17 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
     packet_hash = object_store(p, packet_path.read_bytes())
     def change(state: dict[str, Any]) -> None:
         ticket = next((t for t in state.get("tickets", []) if t.get("id") == args.ticket_id), None)
-        if ticket is None or ticket.get("state") not in ("CANDIDATE", "REVIEW"):
-            fail("review preparation requires a CANDIDATE or REVIEW ticket")
+        is_blocked_continuation = bool(ticket and ticket.get("state") == "BLOCKED" and state["lifecycle"].get("control") == "BLOCKED")
+        if ticket is None or (ticket.get("state") not in ("CANDIDATE", "REVIEW") and not is_blocked_continuation):
+            fail("review preparation requires a CANDIDATE/REVIEW ticket or a BLOCKED continuation candidate")
         worker = next((a for a in state.get("attempts", []) if a.get("id") == ticket.get("current_attempt") and a.get("kind") == "worker"), None)
         if worker is None or not worker.get("candidate_sha"):
             fail("review preparation requires a frozen worker candidate")
+        if is_blocked_continuation:
+            if continuation_candidate_receipt(p, state, ticket, worker) is None:
+                fail("BLOCKED review preparation requires an audited continuation candidate")
+        elif worker.get("continuation_ref"):
+            fail("continuation review requires the ticket to remain BLOCKED")
         if packet.get("subject_fingerprint") != worker.get("candidate_sha"):
             fail("review packet subject is not the current candidate")
         registration_revision = identity.get("registration_revision", identity.get("source_revision", state["revision"]))
@@ -2269,8 +2695,12 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
             attempt_record.update({"intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"]})
         state.setdefault("attempts", []).append(attempt_record)
         add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": packet_path.stat().st_size, "spawn_calls": 1})
-        ticket["state"] = "REVIEW"
-        state["lifecycle"]["next_action"] = {"kind": "await_review_return", "subject_refs": [args.review_attempt_id], "preconditions": ["reviewer stopped", "integrity baseline unchanged", "strict packet/subject match"], "read_refs": ["contracts/reviewer.md", "phases/execute.md"]}
+        if is_blocked_continuation:
+            state["lifecycle"]["control"] = "BLOCKED"
+            state["lifecycle"]["next_action"] = {"kind": "await_blocked_candidate_review", "subject_refs": [args.review_attempt_id, worker["id"]], "preconditions": ["review does not change the BLOCKED ticket verdict", "reviewed candidate remains continuation-only"], "read_refs": ["contracts/reviewer.md", "phases/execute.md"]}
+        else:
+            ticket["state"] = "REVIEW"
+            state["lifecycle"]["next_action"] = {"kind": "await_review_return", "subject_refs": [args.review_attempt_id], "preconditions": ["reviewer stopped", "integrity baseline unchanged", "strict packet/subject match"], "read_refs": ["contracts/reviewer.md", "phases/execute.md"]}
     result = transaction(p, args.owner_token, args.revision, change)
     return {"prepared": True, "attempt_id": args.review_attempt_id, "packet_hash": packet_hash, "revision": result["revision"]}
 
@@ -2421,6 +2851,10 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
         attempt = attempt_by_id(state, args.attempt_id)
         if attempt.get("kind") != "review" or attempt.get("mode") == "user_assisted":
             fail("integration requires a separate immutable reviewer attempt")
+        linked_ticket = next((item for item in state.get("tickets", []) if item.get("id") == attempt.get("subject_ref")), None)
+        linked_worker = next((item for item in state.get("attempts", []) if item.get("id") == (linked_ticket or {}).get("current_attempt") and item.get("kind") == "worker"), None)
+        if linked_worker and linked_worker.get("continuation_ref"):
+            fail("continuation-only candidate cannot be integrated; resolve its blocker through an authorized repair and fresh review")
         existing_review = next((item for item in state.get("reviews", []) if item.get("id") == args.review_id), None)
         if existing_review is not None:
             ticket = next((t for t in state.get("tickets", []) if t.get("id") == attempt.get("subject_ref")), None)
@@ -4619,6 +5053,7 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_quarantine = sub.add_parser("reconcile-quarantined-attempt"); reconcile_quarantine.add_argument("--control-root", required=True); reconcile_quarantine.add_argument("--run-id", required=True); reconcile_quarantine.add_argument("--owner-token", required=True); reconcile_quarantine.add_argument("--revision", type=int, required=True); reconcile_quarantine.add_argument("--ticket-id", required=True); reconcile_quarantine.add_argument("--attempt-id", required=True); reconcile_quarantine.add_argument("--prior-attempt-id", required=True); reconcile_quarantine.add_argument("--finding-ref", required=True); reconcile_quarantine.add_argument("--candidate-sha", required=True); reconcile_quarantine.add_argument("--base-sha", required=True); reconcile_quarantine.add_argument("--baseline", help="optional pre-attempt manifest; omitted means derive the complete baseline from the exact Git base tree"); reconcile_quarantine.add_argument("--reconciliation-id", required=True); reconcile_quarantine.add_argument("--actor", required=True)
     terminate = sub.add_parser("terminate-attempt"); terminate.add_argument("--control-root", required=True); terminate.add_argument("--run-id", required=True); terminate.add_argument("--owner-token", required=True); terminate.add_argument("--revision", type=int, required=True); terminate.add_argument("--attempt-id", required=True); terminate.add_argument("--state", choices=["LOST", "INTERRUPTED"], required=True); terminate.add_argument("--lease-state", choices=["released", "quarantined"], required=True); terminate.add_argument("--evidence", required=True)
     candidate = sub.add_parser("candidate"); candidate.add_argument("--control-root", required=True); candidate.add_argument("--run-id", required=True); candidate.add_argument("--owner-token", required=True); candidate.add_argument("--revision", type=int, required=True); candidate.add_argument("--attempt-id", required=True); candidate.add_argument("--commit-receipt", required=True); candidate.add_argument("--operation-id", required=True)
+    continuation_candidate = sub.add_parser("preserve-blocked-candidate"); continuation_candidate.add_argument("--control-root", required=True); continuation_candidate.add_argument("--run-id", required=True); continuation_candidate.add_argument("--owner-token", required=True); continuation_candidate.add_argument("--revision", type=int, required=True); continuation_candidate.add_argument("--ticket-id", required=True); continuation_candidate.add_argument("--attempt-id", required=True); continuation_candidate.add_argument("--authorization-file", required=True); continuation_candidate.add_argument("--commit-receipt", required=True); continuation_candidate.add_argument("--operation-id", required=True)
     effect = sub.add_parser("prepare-effect"); effect.add_argument("--control-root", required=True); effect.add_argument("--run-id", required=True); effect.add_argument("--owner-token", required=True); effect.add_argument("--revision", type=int, required=True); effect.add_argument("--operation-id", required=True); effect.add_argument("--kind", required=True); effect.add_argument("--target", required=True); effect.add_argument("--expected-before", default=None); effect.add_argument("--intended-after", default=None); effect.add_argument("--authority-ref", required=True)
     reconcile_effect = sub.add_parser("reconcile-effect"); reconcile_effect.add_argument("--control-root", required=True); reconcile_effect.add_argument("--run-id", required=True); reconcile_effect.add_argument("--owner-token", required=True); reconcile_effect.add_argument("--revision", type=int, required=True); reconcile_effect.add_argument("--operation-id", required=True); reconcile_effect.add_argument("--result", choices=["applied", "uncertain", "unchanged"], required=True); reconcile_effect.add_argument("--receipt")
     review = sub.add_parser("prepare-review"); review.add_argument("--control-root", required=True); review.add_argument("--run-id", required=True); review.add_argument("--owner-token", required=True); review.add_argument("--revision", type=int, required=True); review.add_argument("--ticket-id", required=True); review.add_argument("--review-attempt-id", required=True); review.add_argument("--lease-id", required=True); review.add_argument("--packet", required=True)
@@ -4658,6 +5093,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "reconcile-quarantined-attempt": result = cmd_reconcile_quarantined_attempt(args)
         elif args.command == "terminate-attempt": result = cmd_terminate_attempt(args)
         elif args.command == "candidate": result = cmd_candidate(args)
+        elif args.command == "preserve-blocked-candidate": result = cmd_preserve_blocked_candidate(args)
         elif args.command == "prepare-effect": result = cmd_prepare_effect(args)
         elif args.command == "reconcile-effect": result = cmd_reconcile_effect(args)
         elif args.command == "prepare-review": result = cmd_prepare_review(args)

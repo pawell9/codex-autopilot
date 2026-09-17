@@ -94,6 +94,18 @@ authorization missing this now-required source may be superseded with a fresh
 authorization, preserving and invalidating the prior decision rather than
 editing history.
 
+When a validated `BLOCKED` or `HANDOFF` worker return has a non-empty write-set,
+the focused ticket checks pass, every failed check is proven external or outside
+the ticket, and the complete write-set/provenance/lease audit passes, an owner
+may preserve it with `preserve-blocked-candidate`. Supply a typed owner
+authorization bound to the exact blocker, ticket, attempt, and return. The
+helper re-audits the exact Git base-to-candidate tree, records the audited
+write-set and authorization in immutable objects/decisions, and keeps both the
+ticket and lifecycle `BLOCKED`. The result is a continuation-only candidate for
+later review or an authorized repair; it cannot be integrated as `DONE`.
+Failed in-scope checks, failed audits, missing provenance, quarantined leases,
+or changed paths outside the lease remain blocking.
+
 For an already quarantined legacy repair return, do not edit the ledger or
 lease. The only normal reconciliation path is
 `reconcile-quarantined-attempt`, and only for the exact same-ticket
@@ -131,7 +143,7 @@ Read `references/ledger.md` before the first state mutation or any recovery ques
 4. Candidate Git commit precedes review. `INTEGRATED` requires the required independent PASS and a post-review integrity barrier.
 5. Final G5 is a fresh current-intent check. For V1 critical axes and every G5 round, use the user-assisted clean-input/session protocol in `phases/accept.md` and `references/safety.md`; setup/context receipts, exact structured return, and integrity checks are mandatory. User approval alone is never G5.
 6. Unknown authority, oracle, liveness, schema, or declared input-boundary evidence blocks only the dependent action and records an exact next action. Unobservable underlying host properties are residual trust, not silently promoted to `STRICT_FRESH`; never fill missing evidence with a green default.
-7. Materialize readiness with `ready-ticket`; dependencies must be current reviewed `INTEGRATED` outcomes. Enter repair only through `authorize-repair`. Close a no-write BLOCKED repair through `close-blocked-attempt`; close a lost/interrupted attempt through `terminate-attempt` with stop evidence and a released or quarantined lease.
+7. Materialize readiness with `ready-ticket`; dependencies must be current reviewed `INTEGRATED` outcomes. Enter repair only through `authorize-repair`. Close a no-write BLOCKED repair through `close-blocked-attempt`; preserve a proven external/out-of-scope BLOCKED/HANDOFF write-set only through owner-authorized `preserve-blocked-candidate`; close a lost/interrupted attempt through `terminate-attempt` with stop evidence and a released or quarantined lease.
 8. Never hand-release quarantine. `reconcile-quarantined-attempt` may restore
    candidate authority only for its fully proven, single-use compatibility
    case and must leave every failed proof unchanged.
