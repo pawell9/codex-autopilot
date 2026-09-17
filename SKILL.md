@@ -24,7 +24,11 @@ interfaces/contracts, manifest, implementation plan, tickets, routes, and
 dependency bindings with `tools/ledger.py publish-design-bundle`. The
 owner/epoch/revision-fenced transaction validates every source and the complete
 proposed ledger before making any canonical binding visible. Same-byte retries
-are idempotent; conflicting bundles or canonical documents are rejected. Then
+are idempotent; conflicting bundles or canonical documents are rejected.
+`ticket.contract_refs` are executable inputs only; outputs remain expressed by
+`contract.producer_refs`. A ticket may not require a contract it produces, and
+an older mixed bundle is rejected rather than silently reinterpreted or having
+its proposed contract activated. Then
 register each independent G2 coverage or G3 plan review with
 `prepare-design-review`, including reviewer identity and role. The attempt
 binds the bundle fingerprint, artifact versions, intent revision, and
@@ -62,6 +66,18 @@ does not establish ingestability. Preserve packet `source_revision` as its
 registration revision; publication/subject and attempt-created revisions are
 separate recorded bindings. Mixed coverage and plan verdicts are not reviewer
 disagreement.
+
+`await_worker_return` and `await_review_return` are internal orchestration
+actions, not user checkpoints. After native dispatch, keep the orchestration
+turn open for the exact registered attempt, using runtime wait primitives in
+bounded intervals. Three consecutive waits of at most 60 seconds with no
+observable progress trigger handle/inbox/liveness reconciliation; they never
+trigger a request for routine user confirmation. On a matching return, run
+`validate-return`, ingest it, and continue the ticket loop in the same turn.
+On timeout or a lost handle, stop or interrupt the producer, establish stop
+evidence, and use `terminate-attempt` with a released lease only when stopped
+is proven, otherwise a quarantined lease. Only an explicit authority-sensitive
+blocker or manual-review protocol may become a user checkpoint.
 
 ## Read-only dashboard
 

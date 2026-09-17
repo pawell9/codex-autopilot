@@ -1,6 +1,10 @@
 # Design status
 
-**CODEX-AUTOPILOT V1.0.5 — REVIEW CURRENTNESS PATCH RELEASE.**
+**CODEX-AUTOPILOT V1.0.6 — LIFECYCLE REPAIR PATCH RELEASE.**
+
+v1.0.6 separates contract inputs from producer outputs at publication/gates,
+defines worker-return waits as bounded internal orchestration, and permits only
+proven candidate-bound same-ticket create-to-modify repair leases.
 
 v1.0.5 adds a bounded compatibility migration for provably superseded legacy
 design-review findings. Historical records remain audit-visible; only

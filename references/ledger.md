@@ -50,6 +50,11 @@ record.
 DESIGN phase, current intent revision/document hash, all required design-stage
 artifact kinds, valid structured contracts/tickets/routes, an acyclic dependency
 graph, and regular non-symlink UTF-8 sources with matching hashes. The helper
+also treats `ticket.contract_refs` strictly as inputs and
+`contract.producer_refs` as output provenance. Their intersection for the same
+ticket is rejected before publication and again at G2/G3 for an already
+published legacy bundle; it is never repaired by activating a proposed
+contract or silently rewriting old bytes. The helper
 validates the complete proposed snapshot before installing canonical documents;
 the ledger is unchanged on every rejected input. Existing same-byte documents
 are adopted, same-byte publication retries are idempotent, and conflicting
@@ -66,7 +71,7 @@ fingerprint. A PLAN review repair may explicitly return to DESIGN while
 blocked; republish is rejected after a successful design gate or once
 execution has begun.
 
-The helper does not call models, spawn agents, hold a daemon loop, parse prose, or make substantive review decisions. It may validate a receipt from an approved native Git operation; it must not bypass approval by becoming an opaque shell wrapper.
+The helper does not call models, spawn agents, hold a daemon loop, parse prose, or make substantive review decisions. It may validate a receipt from an approved native Git operation; it must not bypass approval by becoming an opaque shell wrapper. It also does not own the orchestration turn or runtime wait loop. The skill-level orchestrator treats `await_worker_return` as internal, waits in bounded intervals, and uses `terminate-attempt` for proven lost/interrupted producers. A normal matching return advances `next_action` to write-set audit and candidate preparation instead of leaving a checkpoint-shaped wait action.
 
 ## Semantic guards
 
@@ -75,6 +80,15 @@ The helper does not call models, spawn agents, hold a daemon loop, parse prose, 
 - Only legal phase/control transitions are accepted. `ACCEPTED` requires a G5 PASS and G6 record. An amendment stales affected evidence; it does not reuse old acceptance.
 - Ticket dependencies must be current reviewed `INTEGRATED` outcomes. DAG validation rejects cycles. Active/quarantined leases and stale epochs cannot be reused.
 - A return is accepted only when attempt, packet hash, contract versions, owner epoch, subject fingerprint, and lease match. Late/stale payloads remain evidence without authority.
+- Worker leases are the normalized packet write allowlist, not the whole ticket
+  zone. Repair may add `modify` only for an exact path that the named same-ticket
+  source attempt declared as `create`, when its candidate SHA equals the repair
+  packet base and the authorized finding is bound to that candidate. The
+  authorization stores the exact repair-contract object and is single-use; the
+  authorization and lease derivation are stored on the repair attempt. Legacy
+  unbound authorizations require an explicit `authorize-repair` rebind and are
+  never inferred. All other zone violations retain the existing quarantine
+  path.
 - Packet registration revision, immutable subject/publication revision,
   attempt-created revision, return source revision, and ingest-time current
   revision are separate facts. Return `source_revision` must equal the packet

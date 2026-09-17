@@ -176,12 +176,16 @@ class Wave2Tests(unittest.TestCase):
             paths = ledger.paths(control, "run-2")
             state, previous = ledger.load_state(paths)
             state["findings"] = [{"id": "F-1", "axis": "correctness", "impact": "blocking", "claim": "fixture defect", "expected": "fixed", "actual": "broken", "evidence": "ev-1", "affected_refs": ["T-1"], "source_ref": "T-1"}]
+            state["tickets"][0]["state"] = "BLOCKED"
+            state["lifecycle"]["control"] = "BLOCKED"
             state["revision"] = 1; state["previous_publication_hash"] = ledger.sha256_bytes(previous)
             ledger.validate_ledger(state); ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
             repair = {"cause": "implementation", "finding_ref": "F-1", "hypothesis": "the branch condition is inverted", "expected_proof": "regression test observes the corrected branch", "stopping_condition": "stop when the regression remains green", "causal_change": "invert branch condition"}
-            self.dispatch(root, self.packet("run-2", "A-1", mode="repair", repair=repair), attempt_id="A-1")
+            contract_path = root / "repair.json"; write_json(contract_path, repair)
+            run("authorize-repair", "--control-root", str(control), "--run-id", "run-2", "--owner-token", "owner-a", "--revision", "1", "--ticket-id", "T-1", "--finding-ref", "F-1", "--authorization-id", "AUTH-1", "--repair-contract", str(contract_path))
+            self.dispatch(root, self.packet("run-2", "A-1", mode="repair", repair=repair), attempt_id="A-1", revision=2)
             state, _ = ledger.load_state(paths); state["tickets"][0]["state"] = "READY"; state["revision"] += 1; state["previous_publication_hash"] = ledger.sha256_bytes(paths["ledger"].read_bytes()); ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
-            result = self.dispatch(root, self.packet("run-2", "A-2", mode="repair", repair=repair), attempt_id="A-2", expect=2, revision=3)
+            result = self.dispatch(root, self.packet("run-2", "A-2", mode="repair", repair=repair), attempt_id="A-2", expect=2, revision=4)
             self.assertIn("unchanged repair retry", result.stderr)
 
 

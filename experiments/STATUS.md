@@ -1,6 +1,10 @@
 # Qualification status
 
-**CODEX-AUTOPILOT V1.0.5 — REVIEW CURRENTNESS PATCH RELEASE.**
+**CODEX-AUTOPILOT V1.0.6 — LIFECYCLE REPAIR PATCH RELEASE.**
+
+The v1.0.6 lifecycle regressions cover early self-produced contract rejection,
+bounded worker loss recovery, ordinary return ingestion without a user
+checkpoint, and provenance-bound create-to-modify repair leases.
 
 The v1.0.5 sanitized V12 regression is fully offline and does not read or
 modify the mounted Idea Scout production run. The older production-checkpoint

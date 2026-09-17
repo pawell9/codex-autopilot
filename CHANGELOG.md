@@ -1,5 +1,22 @@
 # Changelog
 
+## [v1.0.6] — 2026-09-17
+
+Lifecycle repair patch release.
+
+- Rejected self-produced contracts in `ticket.contract_refs` during design
+  publication and G2/G3 advancement while preserving `ready-ticket` active
+  input checks and leaving proposed contracts inactive.
+- Defined worker/reviewer waits as bounded internal orchestration actions;
+  successful worker ingest now advances to write-set audit/candidate work, and
+  lost/timeout recovery retains stop-evidence and quarantine requirements.
+- Derived worker leases from the packet allowlist and added an auditable,
+  candidate-bound exception for exact same-ticket
+  `create → candidate → repair modify` paths. Stale bases, foreign paths,
+  missing provenance, packet escapes, and quarantined sources remain blocked.
+- Added positive and negative lifecycle regression coverage for all three
+  repaired scenarios.
+
 ## [v1.0.5] — 2026-09-16
 
 Review-currentness and legacy-ledger migration patch release.

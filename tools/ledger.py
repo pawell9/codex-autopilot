@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.5"
+SKILL_VERSION = "1.0.6"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 COMPATIBILITY_FLOOR = "1.0.0"
@@ -818,6 +818,7 @@ def validate_design_bundle(bundle: dict[str, Any]) -> None:
         fail("design bundle contains duplicate immutable IDs")
     for route in bundle["routes"]:
         validate_route_eligibility(route)
+    validate_ticket_contract_bindings(bundle["contracts"], bundle["tickets"], "design bundle")
     ticket_ids = {item["id"] for item in bundle["tickets"]}
     graph = {item["id"]: set(item.get("dependency_refs", [])) for item in bundle["tickets"]}
     if any(ref not in ticket_ids for refs in graph.values() for ref in refs):
@@ -859,6 +860,36 @@ def validate_design_bundle(bundle: dict[str, Any]) -> None:
         for right in bundle["tickets"][index + 1:]:
             if zones_overlap(left, right) and not depends(left["id"], right["id"]) and not depends(right["id"], left["id"]):
                 fail(f"ticket zones overlap without dependency ordering: {left['id']} / {right['id']}")
+
+
+def validate_ticket_contract_bindings(contracts: list[dict[str, Any]], tickets: list[dict[str, Any]], label: str) -> None:
+    """Keep ticket inputs distinct from contracts produced by that ticket.
+
+    ``ticket.contract_refs`` has always fed readiness and is therefore an
+    input list.  ``contract.producer_refs`` is the existing output binding.
+    Rejecting their intersection avoids silently reinterpreting legacy mixed
+    bundles or activating a proposed output.
+    """
+    contract_by_id = {item.get("id"): item for item in contracts}
+    for ticket in tickets:
+        ticket_id = ticket.get("id")
+        for contract_ref in ticket.get("contract_refs", []):
+            contract = contract_by_id.get(contract_ref)
+            if contract is None:
+                continue
+            if ticket_id in contract.get("producer_refs", []):
+                fail(
+                    f"{label} ticket {ticket_id} requires self-produced contract {contract_ref} as an input; "
+                    "remove it from ticket.contract_refs and retain the explicit contract.producer_refs output binding"
+                )
+
+
+def validate_current_design_contract_bindings(state: dict[str, Any]) -> None:
+    """Apply the input/output guard to an already-published legacy bundle."""
+    publication = current_design_publication(state)
+    ticket_refs = set(publication.get("ticket_refs", []))
+    tickets = [item for item in state.get("tickets", []) if item.get("id") in ticket_refs]
+    validate_ticket_contract_bindings(state.get("contracts", []), tickets, "current design publication")
 
 
 def stored_payload(p: dict[str, Path], ref: str | None, label: str) -> dict[str, Any]:
@@ -927,6 +958,145 @@ def worker_return_write_set_violations(payload: dict[str, Any], lease: dict[str,
             if not allowed(path, claimed_operation):
                 violations.append({"path": path, "operation": claimed_operation})
     return violations
+
+
+def zone_allows(zone: list[dict[str, Any]], path: str, operation: str) -> bool:
+    clean = relative_path(path, "write allow path")
+    for entry in zone:
+        zone_path = relative_path(entry.get("path"), "ticket zone path").rstrip("/")
+        if (clean == zone_path or clean.startswith(zone_path + "/")) and operation in entry.get("operations", []):
+            return True
+    return False
+
+
+def packet_write_zone(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize the packet allowlist into the exact effective lease shape."""
+    merged: dict[str, set[str]] = {}
+    for entry in packet.get("write", {}).get("allow", []):
+        path = relative_path(entry.get("path"), "packet write allow path").rstrip("/")
+        merged.setdefault(path, set()).update(entry.get("operations", []))
+    return [{"path": path, "operations": sorted(operations)} for path, operations in sorted(merged.items())]
+
+
+def active_repair_authorization(state: dict[str, Any], ticket_id: str, finding_ref: str) -> dict[str, Any] | None:
+    matches = [
+        item for item in state.get("decisions", [])
+        if item.get("type") == "repair_authorization"
+        and item.get("status") == "authorized"
+        and item.get("decision") == "REPAIR"
+        and ticket_id in item.get("affected_refs", [])
+        and finding_ref in item.get("affected_refs", [])
+        and not item.get("invalidated_by")
+    ]
+    return matches[-1] if matches else None
+
+
+def validate_repair_authorization(
+    p: dict[str, Path], state: dict[str, Any], ticket_id: str, repair: dict[str, Any]
+) -> dict[str, Any]:
+    authorization = active_repair_authorization(state, ticket_id, repair.get("finding_ref"))
+    if authorization is None:
+        fail("repair dispatch requires an active authorize-repair decision for this ticket and finding")
+    if any(item.get("repair_authorization_ref") == authorization["id"] for item in state.get("attempts", [])):
+        fail("repair authorization was already consumed; authorize a changed repair before another dispatch")
+    contract_refs = [ref for ref in authorization.get("evidence_refs", []) if isinstance(ref, str) and ref.startswith("objects/")]
+    if len(contract_refs) != 1:
+        fail("repair authorization lacks one exact repair contract object binding")
+    authorized_contract = stored_payload(p, contract_refs[0], "authorized repair contract")
+    if authorized_contract != repair:
+        fail("repair packet contract does not match the authorized repair contract")
+    return authorization
+
+
+def finding_matches_candidate(state: dict[str, Any], finding_ref: str, ticket_id: str, candidate_sha: str) -> bool:
+    """Prove that the authorized finding was raised against this candidate."""
+    finding = next((item for item in state.get("findings", []) if item.get("id") == finding_ref), None)
+    issue = next((item for item in state.get("issues", []) if item.get("id") == finding_ref), None)
+    if issue and issue.get("finding_ref"):
+        finding = next((item for item in state.get("findings", []) if item.get("id") == issue.get("finding_ref")), finding)
+    record = finding or issue
+    if record is None or record.get("impact") != "blocking" or record.get("invalidated_by"):
+        return False
+    if ticket_id not in record.get("affected_refs", []):
+        return False
+    source_ref = record.get("source_ref")
+    source_attempt = next((item for item in state.get("attempts", []) if item.get("id") == source_ref), None)
+    if source_attempt is not None:
+        return (
+            source_attempt.get("kind") == "review"
+            and source_attempt.get("subject_ref") == ticket_id
+            and source_attempt.get("candidate_sha") == candidate_sha
+            and source_attempt.get("subject_fingerprint") in (None, candidate_sha)
+        )
+    source_review = next((item for item in state.get("reviews", []) if item.get("id") == source_ref), None)
+    return bool(source_review and source_review.get("subject_fingerprint") == candidate_sha and ticket_id in record.get("affected_refs", []))
+
+
+def effective_worker_lease(
+    p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], packet: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Derive a packet-scoped lease, with one provenance-bound repair exception."""
+    requested = packet_write_zone(packet)
+    ticket_zone = ticket.get("zone", [])
+    repair = packet.get("repair") if packet.get("mode") == "repair" else None
+    finding_ref = repair.get("finding_ref") if repair else None
+    authorization = validate_repair_authorization(p, state, ticket["id"], repair) if repair else None
+
+    disallowed = [
+        {"path": entry["path"], "operation": operation}
+        for entry in requested
+        for operation in entry["operations"]
+        if not zone_allows(ticket_zone, entry["path"], operation)
+    ]
+    if not disallowed:
+        return requested, None
+    if not repair:
+        fail(f"packet write allowlist exceeds the ticket zone: {json.dumps(disallowed, sort_keys=True)}")
+
+    source_attempt_ref = repair.get("source_attempt_ref")
+    source_attempt = next(
+        (item for item in state.get("attempts", []) if item.get("id") == source_attempt_ref),
+        None,
+    )
+    packet_base = packet.get("workspace", {}).get("expected_base")
+    if source_attempt is None or source_attempt.get("kind") != "worker" or source_attempt.get("subject_ref") != ticket["id"]:
+        fail("repair lease expansion requires same-ticket source_attempt_ref provenance")
+    if source_attempt.get("state") != "RETURNED" or not source_attempt.get("return_ref") or not source_attempt.get("candidate_sha"):
+        fail("repair lease expansion requires a validated prior candidate attempt")
+    if source_attempt.get("lease", {}).get("state") == "quarantined":
+        fail("repair lease expansion cannot use quarantined prior provenance")
+    if packet_base != source_attempt.get("candidate_sha"):
+        fail("repair lease expansion base SHA is stale or does not match the prior candidate")
+    if not finding_matches_candidate(state, finding_ref, ticket["id"], packet_base):
+        fail("repair lease expansion finding is not bound to the prior candidate")
+
+    prior_return = stored_payload(p, source_attempt.get("return_ref"), "prior worker return")
+    if prior_return.get("status") != "DONE":
+        fail("repair lease expansion requires a prior DONE worker return")
+    created_paths = {
+        relative_path(item.get("path"), "prior created path")
+        for item in prior_return.get("files", [])
+        if item.get("operation") == "create"
+    }
+    expanded: list[dict[str, Any]] = []
+    for violation in disallowed:
+        path, operation = violation["path"], violation["operation"]
+        if operation != "modify" or path not in created_paths or not zone_allows(ticket_zone, path, "create") or not zone_allows(source_attempt.get("lease", {}).get("zone", []), path, "create"):
+            fail(f"repair packet write allowlist lacks prior-create provenance: {path} ({operation})")
+        denied = [relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])]
+        if any(path == item or path.startswith(item + "/") for item in denied):
+            fail(f"repair lease expansion conflicts with packet deny list: {path}")
+        expanded.append({"path": path, "operations": ["modify"]})
+
+    provenance = {
+        "authorization_ref": authorization["id"],
+        "finding_ref": finding_ref,
+        "source_attempt_ref": source_attempt_ref,
+        "candidate_sha": source_attempt["candidate_sha"],
+        "packet_base_sha": packet_base,
+        "expanded_entries": expanded,
+    }
+    return requested, provenance
 
 
 def review_criterion_id(record: dict[str, Any]) -> str:
@@ -1397,6 +1567,13 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
             next_state["lifecycle"]["reason"] = f"{args.kind}_{payload.get('status').lower()}"
             next_state["lifecycle"]["issue_refs"] = sorted(set(next_state["lifecycle"].get("issue_refs", []) + target["finding_refs"]))
             next_state["lifecycle"]["next_action"] = {"kind": "triage_or_repair", "subject_refs": [args.attempt_id], "preconditions": ["durable cause/finding contract", "no unchanged retry"], "read_refs": ["phases/execute.md", "references/routing.md"]}
+        elif args.kind == "worker" and payload.get("status") == "DONE":
+            next_state["lifecycle"]["next_action"] = {
+                "kind": "audit_worker_return_and_prepare_candidate",
+                "subject_refs": [args.attempt_id],
+                "preconditions": ["worker stopped", "actual write set audited", "candidate effect prepared"],
+                "read_refs": ["phases/execute.md", "references/safety.md"],
+            }
         if args.kind == "review":
             review_id = f"REV-{digest[:16]}"
             if review_id not in {item.get("id") for item in next_state.get("reviews", [])}:
@@ -1503,13 +1680,17 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             dep = next(t for t in state.get("tickets", []) if t["id"] == dependency)
             if dep.get("state") != "INTEGRATED":
                 fail(f"dependency is not current INTEGRATED: {dependency}")
-        lease = {"id": args.lease_id, "state": "active", "zone": ticket.get("zone", [])}
+        lease_zone, repair_lease_provenance = effective_worker_lease(p, state, ticket, packet)
+        lease = {"id": args.lease_id, "state": "active", "zone": lease_zone}
         attempt_record = {"id": args.attempt_id, "kind": packet.get("kind", "worker"), "mode": packet.get("mode", "implement"), "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": lease, "route_ref": args.route_id, "checkout": packet.get("workspace", {}).get("root"), "base_sha": packet.get("workspace", {}).get("expected_base"), "candidate_sha": None, "candidate_tree_sha": None, "return_ref": None, "finding_refs": []}
         if binding:
             attempt_record.update({"intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"]})
         if repair:
             attempt_record["repair_contract"] = repair
             attempt_record["failure_signature"] = repair_signature(repair)
+            attempt_record["repair_authorization_ref"] = active_repair_authorization(state, args.ticket_id, repair["finding_ref"])["id"]
+        if repair_lease_provenance:
+            attempt_record["repair_lease_provenance"] = repair_lease_provenance
         state.setdefault("attempts", []).append(attempt_record)
         add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": len(packet_raw), "spawn_calls": 1})
         ticket["state"] = "RUNNING"
@@ -1518,7 +1699,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             route_record = dict(route)
             route_record.setdefault("id", args.route_id)
             state.setdefault("routes", []).append(route_record)
-        state["lifecycle"]["next_action"] = {"kind": "await_worker_return", "subject_refs": [args.attempt_id], "preconditions": ["native child started", "return matches packet"], "read_refs": ["contracts/worker.md", "phases/execute.md"]}
+        state["lifecycle"]["next_action"] = {"kind": "await_worker_return", "subject_refs": [args.attempt_id], "preconditions": ["internal orchestration wait; not a user checkpoint", "native child started", "bounded no-progress waits", "return matches packet"], "read_refs": ["contracts/worker.md", "phases/execute.md", "phases/recover.md"]}
     result = transaction(p, args.owner_token, args.revision, change)
     return {"prepared": True, "idempotent": False, "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": result["revision"]}
 
@@ -1556,14 +1737,30 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
     validate(contract, root["$defs"]["repair_contract"], root, "$.repair_contract")
     if contract.get("finding_ref") != args.finding_ref:
         fail("repair contract finding_ref does not match the command")
+    contract_ref = f"objects/{object_store(p, canonical_bytes(contract))}"
 
     def change(state: dict[str, Any]) -> None:
         ticket = next((item for item in state.get("tickets", []) if item.get("id") == args.ticket_id), None)
-        if ticket is None or ticket.get("state") not in ("REVIEW", "BLOCKED", "REPAIR"):
+        legacy_authorization = active_repair_authorization(state, args.ticket_id, args.finding_ref) if ticket else None
+        legacy_rebind = bool(
+            ticket
+            and ticket.get("state") == "READY"
+            and legacy_authorization
+            and not any(isinstance(ref, str) and ref.startswith("objects/") for ref in legacy_authorization.get("evidence_refs", []))
+            and not any(item.get("repair_authorization_ref") == legacy_authorization.get("id") for item in state.get("attempts", []))
+        )
+        if ticket is None or (ticket.get("state") not in ("REVIEW", "BLOCKED", "REPAIR") and not legacy_rebind):
             fail("repair authorization requires a REVIEW/BLOCKED/REPAIR ticket")
         known_findings = {item.get("id") for item in state.get("findings", [])} | {item.get("id") for item in state.get("issues", [])}
         if args.finding_ref not in known_findings:
             fail("repair authorization references an unknown finding/issue")
+        finding = next((item for item in state.get("findings", []) if item.get("id") == args.finding_ref), None)
+        issue = next((item for item in state.get("issues", []) if item.get("id") == args.finding_ref), None)
+        record = finding or issue
+        if record.get("impact") != "blocking" or record.get("invalidated_by"):
+            fail("repair authorization requires a current blocking finding/issue")
+        if args.ticket_id not in record.get("affected_refs", []):
+            fail("repair authorization finding/issue is not bound to this ticket")
         if any(item.get("id") == args.authorization_id for item in state.get("decisions", [])):
             fail("repair authorization ID already exists")
         for attempt in state.get("attempts", []):
@@ -1573,7 +1770,9 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
                 fail("repair authorization requires quarantine reconciliation")
             if attempt.get("subject_ref") == args.ticket_id and attempt.get("lease", {}).get("state") == "active":
                 attempt["lease"]["state"] = "released"
-        state.setdefault("decisions", []).append({"id": args.authorization_id, "type": "repair_authorization", "status": "authorized", "decision": "REPAIR", "reason": contract["hypothesis"], "evidence_refs": [args.finding_ref], "affected_refs": [args.ticket_id, args.finding_ref], "intent_revision": state.get("intent", {}).get("current_revision"), "invalidated_by": []})
+        state.setdefault("decisions", []).append({"id": args.authorization_id, "type": "repair_authorization", "status": "authorized", "decision": "REPAIR", "reason": contract["hypothesis"], "evidence_refs": [args.finding_ref, contract_ref], "affected_refs": [args.ticket_id, args.finding_ref], "intent_revision": state.get("intent", {}).get("current_revision"), "invalidated_by": []})
+        if finding is not None:
+            finding["repair_contract_ref"] = args.authorization_id
         ticket["state"] = "READY"
         state["lifecycle"]["control"] = "ACTIVE"
         state["lifecycle"]["reason"] = "repair_authorized"
@@ -3143,6 +3342,7 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
         known_criteria = {item["id"] for item in next_state.get("criteria", [])}
         known_contracts = {item["id"] for item in next_state.get("contracts", [])}
         known_tickets = {item["id"] for item in next_state.get("tickets", [])}
+        validate_ticket_contract_bindings(next_state.get("contracts", []), bundle["tickets"], "design bundle")
         for ticket in bundle["tickets"]:
             if not set(ticket.get("criterion_refs", [])).issubset(known_criteria):
                 fail(f"design ticket references an unknown criterion: {ticket['id']}")
@@ -3304,6 +3504,7 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
         g3_claim = control == "ACTIVE" and phase in ("PLAN", "EXECUTE") and ("g3" in action or "plan" in action or (current_phase == "PLAN" and phase == "EXECUTE"))
         if state.get("intent") and (g2_claim or g3_claim):
             current_design_publication(state)
+            validate_current_design_contract_bindings(state)
             if not design_review_pass(state, "coverage"):
                 fail("G2 cannot pass without a PASS coverage review of the current published design bundle")
             if g3_claim and not design_review_pass(state, "plan"):
@@ -3328,6 +3529,7 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
             fail(f"illegal phase jump: {current_phase} -> {phase}")
         if current_phase == "PLAN" and phase == "EXECUTE":
             publication = current_design_publication(state)
+            validate_current_design_contract_bindings(state)
             if not design_review_pass(state, "coverage") or not design_review_pass(state, "plan"):
                 fail("execution requires current G2 coverage PASS and G3 plan PASS")
             if any(ticket.get("id") in publication.get("ticket_refs", []) and ticket.get("state") not in ("PLANNED", "READY") for ticket in state.get("tickets", [])):

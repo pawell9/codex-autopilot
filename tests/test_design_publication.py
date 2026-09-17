@@ -310,6 +310,71 @@ class DesignPublicationTests(unittest.TestCase):
                 ledger.current_design_publication(state)
             ledger.validate_ledger(state)
 
+    def test_self_produced_proposed_contract_is_rejected_before_design_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, _ = self.setup_g1(root); bundle = self.bundle(root, control)
+            value = json.loads(bundle.read_text(encoding="utf-8"))
+            value["contracts"][0]["status"] = "proposed"
+            value["contracts"][0]["producer_refs"] = ["T-design"]
+            write_json(bundle, value)
+
+            rejected = self.publish(control, bundle, expect=2)
+
+            self.assertIn("requires self-produced contract", rejected.stderr)
+            state, _ = ledger.load_state(ledger.paths(control, "design-run"))
+            self.assertIsNone(state.get("design_publication"))
+            self.assertEqual("DESIGN", state["lifecycle"]["phase"])
+
+            value["tickets"][0]["contract_refs"] = []
+            write_json(bundle, value)
+            published = json.loads(self.publish(control, bundle).stdout)
+            self.assertEqual(3, published["revision"])
+            current, _ = ledger.load_state(ledger.paths(control, "design-run"))
+            contract = next(item for item in current["contracts"] if item["id"] == "K-design")
+            self.assertEqual("proposed", contract["status"])
+
+    def test_external_inactive_input_remains_a_ready_ticket_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, _ = self.setup_g1(root); bundle = self.bundle(root, control)
+            value = json.loads(bundle.read_text(encoding="utf-8"))
+            value["contracts"][0]["status"] = "proposed"
+            value["contracts"][0]["producer_refs"] = []
+            write_json(bundle, value)
+            self.publish(control, bundle)
+            paths = ledger.paths(control, "design-run")
+            state, previous = ledger.load_state(paths)
+            state["lifecycle"] = {"phase": "EXECUTE", "control": "ACTIVE", "reason": None, "issue_refs": [], "stop_target": None, "next_action": {"kind": "ready-ticket", "subject_refs": ["T-design"], "preconditions": [], "read_refs": []}}
+            state["revision"] += 1
+            state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+
+            rejected = run("ready-ticket", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--ticket-id", "T-design", expect=2)
+
+            self.assertIn("current contract bindings", rejected.stderr)
+            unchanged, _ = ledger.load_state(paths)
+            self.assertEqual("PLANNED", unchanged["tickets"][0]["state"])
+
+    def test_legacy_mixed_publication_is_not_silently_reinterpreted_at_g2(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); control, _, _ = self.setup_g1(root); bundle = self.bundle(root, control)
+            value = json.loads(bundle.read_text(encoding="utf-8"))
+            value["contracts"][0]["status"] = "proposed"
+            value["contracts"][0]["producer_refs"] = ["T-design"]
+            value["tickets"][0]["contract_refs"] = []
+            write_json(bundle, value)
+            self.publish(control, bundle)
+            paths = ledger.paths(control, "design-run")
+            state, _ = ledger.load_state(paths)
+            ticket = next(item for item in state["tickets"] if item["id"] == "T-design")
+            ticket["contract_refs"] = ["K-design"]  # Simulate a mixed bundle published by an older helper.
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+
+            rejected = run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "ACTIVE", "--next-action", "g2_pass", expect=2)
+
+            self.assertIn("requires self-produced contract", rejected.stderr)
+            unchanged, _ = ledger.load_state(paths)
+            self.assertEqual("proposed", next(item for item in unchanged["contracts"] if item["id"] == "K-design")["status"])
+
 
 if __name__ == "__main__":
     unittest.main()

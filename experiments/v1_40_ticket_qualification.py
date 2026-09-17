@@ -223,16 +223,11 @@ def run_qualification() -> dict[str, object]:
                 repair_seen = True
                 state, _ = ledger.load_state(paths)
                 issue_id = next(item["id"] for item in state["issues"] if item["type"] == "synthetic_failure")
-                def reopen(current: dict[str, object]) -> None:
-                    item = next(item for item in current["tickets"] if item["id"] == next_ticket["id"])
-                    item["state"] = "READY"
-                    current["lifecycle"]["control"] = "ACTIVE"
-                    for attempt in current["attempts"]:
-                        if attempt["subject_ref"] == next_ticket["id"] and attempt["lease"]["state"] in ("active", "quarantined"):
-                            attempt["lease"]["state"] = "released"
-                state = ledger.transaction(paths, "owner", int(state["revision"]), reopen)
-                next_ticket["state"] = "READY"
                 next_ticket["repair"] = {"cause": "implementation", "finding_ref": issue_id, "hypothesis": "synthetic first attempt is intentionally blocked", "expected_proof": "repair return and review pass", "stopping_condition": "one changed repair succeeds", "causal_change": "use repaired synthetic path"}
+                repair_contract = root / "qualification-repair.json"
+                write_json(repair_contract, next_ticket["repair"])
+                cli("authorize-repair", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--ticket-id", str(next_ticket["id"]), "--finding-ref", issue_id, "--authorization-id", "AUTH-qualification-repair", "--repair-contract", str(repair_contract))
+                next_ticket["state"] = "READY"
                 process_ticket(control, repo, run_id, next_ticket, root, repair=True)
             processed.append(str(next_ticket["id"]))
             authoritative, _ = ledger.load_state(paths)
