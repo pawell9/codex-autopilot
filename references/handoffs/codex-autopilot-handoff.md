@@ -1128,17 +1128,17 @@ CODEX AUTOPILOT
 
 ---
 
-# 32. Durable status: v1.1.0 hardening through Phase B
+# 32. Durable status: v1.1.0 hardening through Phase C
 
 Актуальное состояние для следующей сессии определяется Git и [`reports/v1.1.0-hardening-progress.md`](../../reports/v1.1.0-hardening-progress.md).
 
 - Ветка: `codex/v1.1.0-hardening`.
-- Phase A и Phase B завершены.
-- Phase B commits: `338e23d` — canonical state projections; `5adbbcc` — regression and qualification coverage.
-- Реализованы explicit current candidate, finding/obligation projection, fact-derived typed `next_action`, phase × control allowed events и shared transition tables.
-- Terminal lifecycle immutable; G2/G3/G6 требуют явной gate identity; BLOCKED repair и RECOVERING resume допускаются только по узким proof-carrying путям.
-- Полный suite: 142 tests, OK, skipped=1 (документированный opt-in production-checkpoint audit).
-- v1.0.4 и 40-ticket qualifications: 2/2, OK; isolated 40-ticket runtime 82.907 s при лимите `<90s`.
-- Финальный независимый architecture review: `SHIP`.
+- Phase A, Phase B и Phase C завершены.
+- Phase C implementation commit: `ee81b4d` — canonical grouped `RepairPlan`/`AttemptPlan`, shared authorize/dispatch preflight, single-use authorization lifecycle, total non-DONE attempt finalization и proof-carrying quarantine reconciliation.
+- `finalize-attempt` покрывает returned `BLOCKED`/`HANDOFF`/`FAILED` и terminated `LOST`/`INTERRUPTED`; no-change сохраняет explicit `DONE`/`CONTINUATION` candidate либо возвращает initial ticket к verified base без создания ложного candidate.
+- `reconcile-finalized-attempt` освобождает quarantine только по позднему PASS stop+cleanup proof и exact clean-baseline audit; failed proof zero-effect, replay остаётся valid после дальнейшего progress.
+- Полный suite: 159 tests, OK, skipped=1 (документированный opt-in production-checkpoint audit). Focused Phase C suite: 44/44.
+- v1.0.4 qualification: OK; isolated 40-ticket qualification: 84.814 s при лимите `<90s`, также прошла внутри final full suite.
+- `py_compile`, schema JSON parse и `git diff --check`: PASS.
 - Live Idea Scout не открывался и не изменялся; production R58 migration остаётся только Phase F.
-- Phase C не начата. Следующий шаг — Phase C из master hardening plan; push для Phase B не выполнялся.
+- Phase D не начата. Следующий шаг в новой сессии — Phase D из master hardening plan. Push не выполнялся.
