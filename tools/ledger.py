@@ -346,7 +346,7 @@ def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
                     "read_refs": ["phases/recover.md", "references/ledger.md"],
                     "human_input_required": True,
                 }
-        elif stranded and control in ("ACTIVE", "BLOCKED", "PAUSED"):
+        elif stranded and control in ("ACTIVE", "BLOCKED", "PAUSED") and lifecycle.get("reason") != "attempt_finalization_quarantined":
             action = {
                 "kind": "recover_attempt",
                 "subject_refs": [item["id"] for item in stranded if item.get("id")],
@@ -365,6 +365,27 @@ def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
                 "kind": "import_manual_review", "subject_refs": [item["id"] for item in user_assisted],
                 "preconditions": ["exact external return, clean environment/context receipts, and unchanged integrity baseline"],
                 "read_refs": ["phases/accept.md", "references/safety.md"],
+            }
+        elif control == "BLOCKED" and lifecycle.get("reason") == "attempt_finalized_no_candidate":
+            finalized = [
+                item for item in attempts
+                if item.get("finalization_ref") and item.get("subject_ref") in {ticket.get("id") for ticket in state.get("tickets", [])}
+            ]
+            latest = finalized[-1] if finalized else None
+            action = {
+                "kind": "retry_changed_attempt",
+                "subject_refs": [latest.get("subject_ref"), latest.get("id")] if latest else [],
+                "preconditions": ["use the verified baseline", "change the attempt plan or repair contract before retry", "use a fresh attempt ID"],
+                "read_refs": ["phases/execute.md", "references/routing.md", "references/ledger.md"],
+            }
+        elif control == "BLOCKED" and lifecycle.get("reason") == "attempt_finalization_quarantined":
+            finalized = [item for item in attempts if item.get("finalization_ref") and item.get("lease", {}).get("state") == "quarantined"]
+            latest = finalized[-1] if finalized else None
+            action = {
+                "kind": "recover_attempt",
+                "subject_refs": [latest.get("id")] if latest else [],
+                "preconditions": ["inspect the exact foreign or uncertain checkout write-set", "reconcile the quarantined lease only after writer stop and checkout ownership are proven"],
+                "read_refs": ["phases/recover.md", "references/ledger.md", "references/safety.md"],
             }
         elif control == "BLOCKED" and (blocked_repair_action := _blocked_repair_candidate_action(state)) is not None:
             action = blocked_repair_action
@@ -687,7 +708,7 @@ def _blocked_repair_candidate_action(state: dict[str, Any]) -> dict[str, Any] | 
         attempt_ref = ticket.get("last_worker_attempt")
         attempt = attempts.get(attempt_ref)
         contract = attempt.get("repair_contract") if attempt else None
-        finding_ref = contract.get("finding_ref") if isinstance(contract, dict) else None
+        finding_refs = repair_finding_refs(contract) if isinstance(contract, dict) else []
         if (
             attempt is None
             or attempt.get("kind") != "worker"
@@ -700,23 +721,24 @@ def _blocked_repair_candidate_action(state: dict[str, Any]) -> dict[str, Any] | 
             or attempt.get("subject_ref") != ticket.get("id")
             or ticket.get("current_attempt") != attempt_ref
             or ticket.get("current_worker_attempt") is not None
-            or not finding_ref
+            or not finding_refs
         ):
             continue
-        authorization = active_repair_authorization(state, ticket["id"], finding_ref)
-        record = findings.get(finding_ref) or issues.get(finding_ref)
+        authorization = repair_authorization_for_attempt(state, ticket["id"], contract, attempt["id"])
+        records = [findings.get(ref) or issues.get(ref) for ref in finding_refs]
         if (
             authorization is None
             or attempt.get("repair_authorization_ref") != authorization.get("id")
-            or record is None
-            or record.get("impact") != "blocking"
-            or record.get("invalidated_by")
-            or ticket["id"] not in record.get("affected_refs", [])
+            or any(
+                record is None or record.get("impact") != "blocking" or record.get("invalidated_by")
+                or ticket["id"] not in record.get("affected_refs", [])
+                for record in records
+            )
         ):
             continue
         return {
             "kind": "audit_worker_return_and_prepare_candidate",
-            "subject_refs": [ticket["id"], attempt["id"], finding_ref],
+            "subject_refs": [ticket["id"], attempt["id"], *finding_refs],
             "preconditions": ["exact latest authorized repair return is validated DONE", "audit its actual write set and prepare the candidate effect without clearing BLOCKED obligations"],
             "read_refs": ["phases/execute.md", "references/safety.md", "references/routing.md"],
         }
@@ -1052,7 +1074,7 @@ def schema() -> dict[str, Any]:
 
 def validate(value: Any, spec: dict[str, Any], root: dict[str, Any], path: str = "$", seen: set[str] | None = None) -> None:
     """Validate the closed subset used by this package; unknown keywords fail closed."""
-    supported = {"$schema", "$id", "$defs", "title", "$ref", "type", "required", "properties", "additionalProperties", "items", "enum", "const", "pattern", "minLength", "minItems", "minimum", "minProperties"}
+    supported = {"$schema", "$id", "$defs", "title", "$ref", "oneOf", "type", "required", "properties", "additionalProperties", "items", "enum", "const", "pattern", "minLength", "minItems", "maxItems", "uniqueItems", "minimum", "minProperties"}
     unknown = set(spec) - supported
     if unknown:
         fail(f"unsupported schema keyword(s) at {path}: {sorted(unknown)}")
@@ -1063,6 +1085,16 @@ def validate(value: Any, spec: dict[str, Any], root: dict[str, Any], path: str =
         name = ref.rsplit("/", 1)[-1]
         validate(value, root.get("$defs", {}).get(name, {}), root, path, seen)
         return
+    if "oneOf" in spec:
+        successes = 0
+        for branch in spec["oneOf"]:
+            try:
+                validate(value, branch, root, path, seen)
+            except LedgerError:
+                continue
+            successes += 1
+        if successes != 1:
+            fail(f"{path}: expected exactly one matching schema branch; matched {successes}")
     if "const" in spec and value != spec["const"]:
         fail(f"{path}: expected constant {spec['const']!r}")
     if "enum" in spec and value not in spec["enum"]:
@@ -1083,6 +1115,10 @@ def validate(value: Any, spec: dict[str, Any], root: dict[str, Any], path: str =
     if isinstance(value, list):
         if len(value) < spec.get("minItems", 0):
             fail(f"{path}: fewer than minItems")
+        if len(value) > spec.get("maxItems", len(value)):
+            fail(f"{path}: more than maxItems")
+        if spec.get("uniqueItems") and len({canonical_bytes(item) for item in value}) != len(value):
+            fail(f"{path}: duplicate array items")
         if "items" in spec:
             for index, item in enumerate(value):
                 validate(item, spec["items"], root, f"{path}[{index}]")
@@ -1633,10 +1669,6 @@ def validate_route_eligibility(route: dict[str, Any]) -> None:
             fail("route is not eligible for dispatch: fallback context is not usable")
 
 
-def repair_signature(contract: dict[str, Any]) -> str:
-    return sha256_bytes(canonical_bytes({key: contract.get(key) for key in ("cause", "finding_ref", "hypothesis", "expected_proof", "stopping_condition", "causal_change")}))
-
-
 def nonempty_string(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         fail(f"{label} must be a non-empty string")
@@ -1910,21 +1942,299 @@ def active_repair_authorization(state: dict[str, Any], ticket_id: str, finding_r
     return matches[-1] if matches else None
 
 
-def validate_repair_authorization(
-    p: dict[str, Path], state: dict[str, Any], ticket_id: str, repair: dict[str, Any]
+def repair_finding_refs(repair: dict[str, Any]) -> list[str]:
+    """Read both the v1.0 scalar contract and the canonical grouped contract."""
+    refs = repair.get("finding_refs")
+    if isinstance(refs, list):
+        return list(refs)
+    finding_ref = repair.get("finding_ref")
+    return [finding_ref] if isinstance(finding_ref, str) else []
+
+
+def repair_proofs(repair: dict[str, Any]) -> list[dict[str, str]]:
+    """Return one normalized hypothesis/proof pair for each selected finding."""
+    proofs = repair.get("finding_proofs")
+    if isinstance(proofs, list):
+        return [
+            {"finding_ref": item["finding_ref"], "hypothesis": item["hypothesis"], "expected_proof": item["expected_proof"]}
+            for item in proofs
+        ]
+    finding_ref = repair.get("finding_ref")
+    if not isinstance(finding_ref, str):
+        return []
+    return [{
+        "finding_ref": finding_ref,
+        "hypothesis": repair.get("hypothesis", ""),
+        "expected_proof": repair.get("expected_proof", ""),
+    }]
+
+
+def repair_signature(contract: dict[str, Any]) -> str:
+    """Hash the causal repair intent, treating a legacy singleton as a group."""
+    refs = repair_finding_refs(contract)
+    proofs = sorted(repair_proofs(contract), key=lambda item: item["finding_ref"])
+    payload = {
+        "cause": contract.get("cause"),
+        "finding_refs": sorted(refs),
+        "finding_proofs": proofs,
+        "stopping_condition": contract.get("stopping_condition"),
+        "causal_change": contract.get("causal_change"),
+    }
+    return sha256_bytes(canonical_bytes(payload))
+
+
+def normalize_repair_contract(
+    state: dict[str, Any], ticket: dict[str, Any], contract: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the bounded candidate-bound RepairPlan shared by authorization and dispatch."""
+    refs = repair_finding_refs(contract)
+    proofs = repair_proofs(contract)
+    if not refs or len(refs) > 16 or len(refs) != len(set(refs)):
+        fail("repair plan finding_refs must be bounded, non-empty, and unique")
+    proof_by_ref = {item.get("finding_ref"): item for item in proofs}
+    if len(proof_by_ref) != len(proofs) or set(proof_by_ref) != set(refs):
+        fail("repair plan requires exactly one hypothesis and expected_proof per selected finding")
+    proofs = [proof_by_ref[ref] for ref in sorted(refs)]
+    for item in proofs:
+        nonempty_string(item.get("hypothesis"), f"repair hypothesis for {item['finding_ref']}")
+        nonempty_string(item.get("expected_proof"), f"repair expected_proof for {item['finding_ref']}")
+    source_attempt = current_candidate_producer(state, ticket)
+    candidate = current_candidate_record(state, ticket)
+    if source_attempt is None or candidate is None or not source_attempt.get("candidate_sha"):
+        fail("repair plan requires an explicit current candidate binding and its producing worker")
+    source_ref = contract.get("source_attempt_ref")
+    if source_ref:
+        supplied = next((item for item in state.get("attempts", []) if item.get("id") == source_ref), None)
+        if supplied is None or supplied.get("subject_ref") != ticket.get("id"):
+            fail("repair requires same-ticket source_attempt_ref provenance for the current candidate worker or exact review")
+        if supplied.get("kind") == "review":
+            if (
+                supplied.get("candidate_sha") != candidate.get("sha")
+                or supplied.get("subject_fingerprint") not in (None, candidate.get("sha"))
+                or any(ref not in supplied.get("finding_refs", []) for ref in refs)
+            ):
+                fail("repair source review is not the exact same-ticket review for every selected current finding")
+        elif supplied.get("kind") != "worker" or supplied.get("id") != source_attempt.get("id"):
+            fail("repair source_attempt_ref provenance is stale or is not the current candidate producer")
+    proof_records: list[dict[str, Any]] = []
+    for finding_ref in sorted(refs):
+        finding = next((item for item in state.get("findings", []) if item.get("id") == finding_ref), None)
+        issue = next((item for item in state.get("issues", []) if item.get("id") == finding_ref), None)
+        record = finding or issue
+        if record is None or record.get("impact") != "blocking" or record.get("invalidated_by"):
+            fail(f"repair finding is not a current blocking finding/issue: {finding_ref}")
+        if ticket.get("id") not in record.get("affected_refs", []):
+            fail(f"repair finding is not bound to this ticket: {finding_ref}")
+        if not finding_matches_candidate(state, finding_ref, ticket["id"], candidate["sha"]):
+            fail(f"repair finding is not bound to the current candidate: {finding_ref}")
+        proof_records.append(proof_by_ref[finding_ref])
+    canonical = {
+        "cause": contract.get("cause"),
+        "finding_refs": sorted(refs),
+        "finding_proofs": proof_records,
+        "stopping_condition": contract.get("stopping_condition"),
+        "causal_change": contract.get("causal_change"),
+        "source_attempt_ref": source_attempt["id"],
+    }
+    repair_plan = {
+        "version": 1,
+        **canonical,
+        "source_candidate_ref": candidate["id"],
+        "source_candidate_sha": candidate["sha"],
+    }
+    root = schema()
+    validate(repair_plan, root["$defs"]["repair_plan"], root, "$.repair_plan")
+    return canonical, repair_plan
+
+
+def build_attempt_plan(
+    state: dict[str, Any], ticket: dict[str, Any], packet: dict[str, Any], route_id: str,
+    route: dict[str, Any] | None, packet_hash: str,
 ) -> dict[str, Any]:
-    authorization = active_repair_authorization(state, ticket_id, repair.get("finding_ref"))
-    if authorization is None:
-        fail("repair dispatch requires an active authorize-repair decision for this ticket and finding")
-    if any(item.get("repair_authorization_ref") == authorization["id"] for item in state.get("attempts", [])):
+    """Freeze the packet fields which define dispatch feasibility and identity."""
+    identity = packet_identity(packet)
+    if identity.get("run_id") != state.get("run_id") or identity.get("ticket_id") != ticket.get("id"):
+        fail("attempt plan packet must bind the current run and exact ticket")
+    if identity.get("epoch") != state.get("owner", {}).get("epoch"):
+        fail("attempt plan packet epoch does not match current owner")
+    base_sha = packet.get("workspace", {}).get("expected_base")
+    candidate = current_candidate_record(state, ticket)
+    if candidate is None or base_sha != candidate.get("sha"):
+        fail("attempt plan base SHA is stale or forked from the exact current candidate")
+    binding = current_intent_binding(state) if state.get("intent") else None
+    packet_intent = packet.get("intent_revision") or identity.get("intent_revision")
+    packet_hash_value = packet.get("intent_document_hash") or identity.get("intent_document_hash")
+    if binding and (packet_intent != binding["revision"] or packet_hash_value != binding["document_hash"]):
+        fail("attempt plan intent revision/hash must exactly match current intent")
+    if binding is None and (packet_intent or packet_hash_value):
+        fail("attempt plan carries an intent binding when the run has no current intent")
+    allow = packet_write_zone(packet)
+    deny = sorted({relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])})
+    for entry in allow:
+        for denied_path in deny:
+            if entry["path"] == denied_path or entry["path"].startswith(denied_path + "/") or denied_path.startswith(entry["path"] + "/"):
+                fail(f"packet write allow/deny overlap: {entry['path']} conflicts with {denied_path}")
+    criteria = [item.get("criterion_id") for item in packet.get("acceptance", [])]
+    if not criteria or len(criteria) != len(set(criteria)):
+        fail("attempt plan acceptance criteria must be non-empty and unique")
+    checks = packet.get("verification", [])
+    check_ids = [item.get("check_id") for item in checks]
+    if not check_ids or len(check_ids) != len(set(check_ids)):
+        fail("attempt plan verification checks must be non-empty and unique")
+    if route is not None:
+        validate_route_eligibility(route)
+    route_hash = sha256_bytes(canonical_bytes(route)) if route is not None else None
+    plan = {
+        "version": 1,
+        "run_id": state["run_id"],
+        "ticket_id": ticket["id"],
+        "attempt_id": identity.get("attempt_id"),
+        "route_id": route_id,
+        "route_hash": route_hash,
+        "packet_hash": packet_hash,
+        "base_sha": base_sha,
+        "epoch": identity.get("epoch"),
+        "intent_revision": binding["revision"] if binding else None,
+        "intent_document_hash": binding["document_hash"] if binding else None,
+        "allow": allow,
+        "deny": deny,
+        "risk": copy.deepcopy(packet.get("risk")),
+        "criterion_refs": sorted(criteria),
+        "checks": sorted((copy.deepcopy(item) for item in checks), key=lambda item: item.get("check_id", "")),
+    }
+    root = schema()
+    validate(plan, root["$defs"]["attempt_plan"], root, "$.attempt_plan")
+    return plan
+
+
+def repair_authorization_for_attempt(state: dict[str, Any], ticket_id: str, repair: dict[str, Any], attempt_id: str) -> dict[str, Any] | None:
+    refs = set(repair_finding_refs(repair))
+    matches = [
+        item for item in state.get("decisions", [])
+        if item.get("type") == "repair_authorization"
+        and item.get("decision") == "REPAIR"
+        and item.get("status") in ("authorized", "consumed")
+        and ticket_id in item.get("affected_refs", [])
+        and refs.issubset(set(item.get("affected_refs", [])))
+        and (item.get("status") == "authorized" or item.get("consumed_by") == attempt_id)
+        and not item.get("invalidated_by")
+    ]
+    return matches[-1] if matches else None
+
+
+def validate_repair_authorization(
+    p: dict[str, Path], state: dict[str, Any], ticket_id: str, repair: dict[str, Any],
+    *, attempt_id: str | None = None, authorization_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    refs = repair_finding_refs(repair)
+    authorizations = [active_repair_authorization(state, ticket_id, ref) for ref in refs]
+    if authorization_override is not None:
+        authorization = authorization_override
+    elif refs and all(authorizations) and len({item.get("id") for item in authorizations if item}) == 1:
+        authorization = authorizations[0]
+    else:
+        fail("repair dispatch requires one active authorization for the exact ticket and finding set")
+    if authorization.get("status") != "authorized":
+        fail("repair authorization is not unused and authorized")
+    if not set(refs).issubset(set(authorization.get("affected_refs", []))):
+        fail("repair authorization does not cover the exact selected finding set")
+    prior_uses = [item for item in state.get("attempts", []) if item.get("repair_authorization_ref") == authorization.get("id")]
+    if prior_uses:
         fail("repair authorization was already consumed; authorize a changed repair before another dispatch")
-    contract_refs = [ref for ref in authorization.get("evidence_refs", []) if isinstance(ref, str) and ref.startswith("objects/")]
-    if len(contract_refs) != 1:
-        fail("repair authorization lacks one exact repair contract object binding")
-    authorized_contract = stored_payload(p, contract_refs[0], "authorized repair contract")
-    if authorized_contract != repair:
-        fail("repair packet contract does not match the authorized repair contract")
+    if authorization_override is not None and authorization_override.get("id") == "preflight":
+        return authorization
+    repair_ref = authorization.get("repair_plan_ref")
+    if repair_ref:
+        authorized_plan = stored_payload(p, repair_ref, "authorized RepairPlan")
+        expected_contract, expected_plan = normalize_repair_contract(
+            state, next(item for item in state.get("tickets", []) if item.get("id") == ticket_id), repair
+        )
+        authorized_contract = {key: authorized_plan.get(key) for key in expected_plan if key != "version"}
+        if authorized_contract != {key: expected_plan.get(key) for key in expected_plan if key != "version"}:
+            fail("repair packet contract does not match the authorized canonical RepairPlan")
+    else:
+        contract_refs = [ref for ref in authorization.get("evidence_refs", []) if isinstance(ref, str) and ref.startswith("objects/")]
+        if len(contract_refs) != 1:
+            fail("legacy repair authorization lacks one exact repair contract object binding")
+        authorized_contract = stored_payload(p, contract_refs[0], "authorized repair contract")
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == ticket_id), None)
+        if ticket is None:
+            fail("repair authorization references an unknown ticket")
+        authorized_contract, _ = normalize_repair_contract(state, ticket, authorized_contract)
+        packet_contract, _ = normalize_repair_contract(state, ticket, repair)
+        if authorized_contract != packet_contract:
+            fail("repair packet contract does not match the authorized repair contract")
     return authorization
+
+
+def repair_preflight(
+    p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], repair: dict[str, Any],
+    *, packet: dict[str, Any] | None = None, route_id: str | None = None,
+    route: dict[str, Any] | None = None, packet_hash: str | None = None,
+    authorization: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None, tuple[list[dict[str, Any]], dict[str, Any] | None] | None]:
+    """Shared authorize/dispatch admission for repair and its exact AttemptPlan."""
+    canonical, repair_plan = normalize_repair_contract(state, ticket, repair)
+    for dependency in ticket.get("dependency_refs", []):
+        dependency_ticket = next((item for item in state.get("tickets", []) if item.get("id") == dependency), None)
+        if dependency_ticket is None or dependency_ticket.get("state") != "INTEGRATED":
+            fail(f"repair AttemptPlan dependency is not current INTEGRATED: {dependency}")
+    if any(
+        item.get("id") != ticket.get("id") and item.get("state") in ("RUNNING", "CANDIDATE", "REVIEW")
+        for item in state.get("tickets", [])
+    ):
+        fail("serial V1 product writer already active")
+    projection = finding_obligation_projection(state)
+    for finding_ref in repair_plan["finding_refs"]:
+        finding = next((item for item in state.get("findings", []) if item.get("id") == finding_ref), None)
+        if finding is not None:
+            projected = next((item for item in projection["items"] if item.get("finding_ref") == finding_ref), None)
+            unresolved = projected.get("unresolved_ticket_refs", projected.get("affected_ticket_refs", [])) if projected else []
+            if projected is None or not projected.get("repairable") or ticket["id"] not in unresolved:
+                fail(f"repair authorization requires a current repairable finding obligation: {finding_ref}")
+        else:
+            projected = next((item for item in projection["mirrored_issues"] if item.get("issue_ref") == finding_ref), None)
+            if projected is None or not projected.get("repairable"):
+                fail(f"repair authorization requires a current repairable issue obligation: {finding_ref}")
+    if (
+        not repair.get("source_attempt_ref")
+        and repair_requires_transitive_create_modify_provenance(p, state, ticket)
+    ):
+        fail("repair lease expansion requires explicit source_attempt_ref provenance")
+    if packet is None:
+        if len(repair_plan["finding_refs"]) != 1:
+            fail("grouped RepairPlan authorization requires --packet for dispatch preflight")
+        return canonical, repair_plan, None, None
+    if packet.get("kind") != "worker" or packet.get("mode") != "repair" or packet.get("repair") != repair:
+        fail("repair AttemptPlan requires a repair worker packet with the exact supplied repair contract")
+    if route_id is None:
+        fail("repair AttemptPlan authorization requires --route-id")
+    if packet_hash is None:
+        packet_hash = sha256_bytes(canonical_bytes(packet))
+    if authorization is not None and authorization.get("legacy_unbound_attempt_plan"):
+        lease_result = effective_worker_lease(
+            p, state, ticket, {**packet, "repair": canonical},
+            authorization_override=authorization,
+        )
+        return canonical, repair_plan, None, lease_result
+    attempt_plan = build_attempt_plan(state, ticket, packet, route_id, route, packet_hash)
+    normalized_packet = copy.deepcopy(packet)
+    normalized_packet["repair"] = canonical
+    lease_result = effective_worker_lease(
+        p, state, ticket, normalized_packet,
+        authorization_override=authorization or {
+            "id": "preflight", "status": "authorized",
+            "affected_refs": [ticket["id"], *repair_plan["finding_refs"]],
+        },
+    )
+    signature = repair_signature(canonical)
+    for previous in state.get("attempts", []):
+        if previous.get("subject_ref") != ticket.get("id") or not previous.get("repair_contract"):
+            continue
+        previous_signature = previous.get("failure_signature") or repair_signature(previous.get("repair_contract", {}))
+        if previous_signature == signature:
+            fail("unchanged repair retry rejected before READY: no causally meaningful change")
+    return canonical, repair_plan, attempt_plan, lease_result
 
 
 def finding_matches_candidate(state: dict[str, Any], finding_ref: str, ticket_id: str, candidate_sha: str) -> bool:
@@ -1941,12 +2251,23 @@ def finding_matches_candidate(state: dict[str, Any], finding_ref: str, ticket_id
     source_ref = record.get("source_ref")
     source_attempt = next((item for item in state.get("attempts", []) if item.get("id") == source_ref), None)
     if source_attempt is not None:
-        return (
-            source_attempt.get("kind") == "review"
-            and source_attempt.get("subject_ref") == ticket_id
-            and source_attempt.get("candidate_sha") == candidate_sha
-            and source_attempt.get("subject_fingerprint") in (None, candidate_sha)
-        )
+        if source_attempt.get("kind") == "review":
+            return (
+                source_attempt.get("subject_ref") == ticket_id
+                and source_attempt.get("candidate_sha") == candidate_sha
+                and source_attempt.get("subject_fingerprint") in (None, candidate_sha)
+            )
+        if source_attempt.get("kind") == "worker":
+            return (
+                source_attempt.get("subject_ref") == ticket_id
+                and (
+                    source_attempt.get("candidate_sha") == candidate_sha
+                    or record is issue
+                    and source_attempt.get("candidate_sha") is None
+                    and source_attempt.get("base_sha") == candidate_sha
+                )
+            )
+        return False
     source_review = next((item for item in state.get("reviews", []) if item.get("id") == source_ref), None)
     return bool(source_review and source_review.get("subject_fingerprint") == candidate_sha and ticket_id in record.get("affected_refs", []))
 
@@ -2395,7 +2716,6 @@ def repair_candidate_worker(
 ) -> dict[str, Any]:
     """Resolve the one current worker candidate authorized for this repair base."""
     source_ref = repair.get("source_attempt_ref")
-    source = next((item for item in state.get("attempts", []) if item.get("id") == source_ref), None)
     current = current_candidate_producer(state, ticket)
     if (
         current is None
@@ -2404,19 +2724,23 @@ def repair_candidate_worker(
         or current.get("candidate_sha") != packet_base
     ):
         fail("repair lease expansion base SHA is stale or forked from the current ticket candidate")
+    source = next((item for item in state.get("attempts", []) if item.get("id") == source_ref), None) if source_ref else current
     if source is None or source.get("subject_ref") != ticket["id"]:
         fail("repair lease expansion requires exact same-ticket source_attempt_ref provenance")
     if source.get("kind") == "worker":
         if source.get("id") != current.get("id"):
             fail("repair lease expansion source worker is stale or forked from the current ticket candidate")
     elif source.get("kind") == "review":
-        finding = next((item for item in state.get("findings", []) if item.get("id") == repair.get("finding_ref")), None)
+        refs = repair_finding_refs(repair)
         if (
-            finding is None
-            or finding.get("source_ref") != source.get("id")
-            or repair.get("finding_ref") not in source.get("finding_refs", [])
-            or source.get("candidate_sha") != packet_base
+            source.get("candidate_sha") != packet_base
             or source.get("subject_fingerprint") not in (None, packet_base)
+        ):
+            fail("repair lease expansion source review is not the exact candidate-bound finding review")
+        if any(
+            ref not in source.get("finding_refs", [])
+            or not any(item.get("id") == ref and item.get("source_ref") == source.get("id") for item in state.get("findings", []))
+            for ref in refs
         ):
             fail("repair lease expansion source review is not the exact candidate-bound finding review")
     else:
@@ -2468,17 +2792,19 @@ def historical_repair_authorization(
     provenance = attempt.get("repair_lease_provenance")
     if not isinstance(repair, dict):
         fail("repair lineage contains a repair attempt without a repair contract")
-    finding_ref = repair.get("finding_ref")
+    finding_refs = repair_finding_refs(repair)
+    finding_ref = finding_refs[0] if finding_refs else None
     authorization = next(
         (
             item
             for item in state.get("decisions", [])
             if item.get("id") == authorization_ref
             and item.get("type") == "repair_authorization"
-            and item.get("status") == "authorized"
+            and item.get("status") in ("authorized", "consumed")
             and item.get("decision") == "REPAIR"
             and ticket_id in item.get("affected_refs", [])
-            and finding_ref in item.get("affected_refs", [])
+            and set(finding_refs).issubset(set(item.get("affected_refs", [])))
+            and (item.get("status") == "authorized" or item.get("consumed_by") == attempt.get("id"))
             and not item.get("invalidated_by")
         ),
         None,
@@ -2490,12 +2816,25 @@ def historical_repair_authorization(
         or provenance.get("finding_ref") != finding_ref
     ):
         fail("repair lineage authorization/finding provenance is discontinuous")
-    contract_refs = [
-        ref
-        for ref in authorization.get("evidence_refs", [])
-        if isinstance(ref, str) and ref.startswith("objects/")
-    ]
-    contract_bound = len(contract_refs) == 1 and stored_payload(p, contract_refs[0], "lineage repair contract") == repair
+    repair_plan_ref = authorization.get("repair_plan_ref")
+    authorized_plan = stored_payload(p, repair_plan_ref, "lineage RepairPlan") if repair_plan_ref else None
+    canonical_fields = {
+        "cause": repair.get("cause"),
+        "finding_refs": sorted(finding_refs),
+        "finding_proofs": sorted(repair_proofs(repair), key=lambda item: item["finding_ref"]),
+        "stopping_condition": repair.get("stopping_condition"),
+        "causal_change": repair.get("causal_change"),
+        "source_attempt_ref": repair.get("source_attempt_ref"),
+    }
+    contract_bound = bool(
+        authorized_plan
+        and attempt.get("repair_plan_ref") == repair_plan_ref
+        and {key: authorized_plan.get(key) for key in canonical_fields} == canonical_fields
+        and authorized_plan.get("source_candidate_sha") == attempt.get("base_sha")
+    )
+    if not repair_plan_ref:
+        legacy_refs = [ref for ref in authorization.get("evidence_refs", []) if isinstance(ref, str) and ref.startswith("objects/")]
+        contract_bound = len(legacy_refs) == 1 and stored_payload(p, legacy_refs[0], "legacy lineage repair contract") == repair
     if not contract_bound and attempt.get("quarantine_reconciliation_ref"):
         receipt = stored_payload(p, attempt.get("quarantine_reconciliation_ref"), "lineage reconciliation receipt")
         receipt_contract_ref = receipt.get("repair_contract_ref")
@@ -2620,14 +2959,26 @@ def validated_repair_path_lineage(
 
 
 def effective_worker_lease(
-    p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], packet: dict[str, Any]
+    p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], packet: dict[str, Any],
+    *, authorization_override: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     """Derive a packet-scoped lease, with one provenance-bound repair exception."""
     requested = packet_write_zone(packet)
     ticket_zone = ticket.get("zone", [])
     repair = packet.get("repair") if packet.get("mode") == "repair" else None
-    finding_ref = repair.get("finding_ref") if repair else None
-    authorization = validate_repair_authorization(p, state, ticket["id"], repair) if repair else None
+    finding_refs = repair_finding_refs(repair) if repair else []
+    finding_ref = finding_refs[0] if finding_refs else None
+    authorization = validate_repair_authorization(
+        p, state, ticket["id"], repair, authorization_override=authorization_override
+    ) if repair else None
+    denied = [relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])]
+    deny_conflicts = [
+        {"path": entry["path"], "denied": denied_path}
+        for entry in requested for denied_path in denied
+        if entry["path"] == denied_path or entry["path"].startswith(denied_path + "/") or denied_path.startswith(entry["path"] + "/")
+    ]
+    if deny_conflicts:
+        fail(f"packet write allowlist conflicts with deny list: {json.dumps(deny_conflicts, sort_keys=True)}")
 
     disallowed = [
         {"path": entry["path"], "operation": operation}
@@ -2658,7 +3009,6 @@ def effective_worker_lease(
         path, operation = violation["path"], violation["operation"]
         if operation != "modify" or not zone_allows(ticket_zone, path, "create"):
             fail(f"repair packet write allowlist lacks prior-create provenance: {path} ({operation})")
-        denied = [relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])]
         if any(path == item or path.startswith(item + "/") for item in denied):
             fail(f"repair lease expansion conflicts with packet deny list: {path}")
         attempts = validated_repair_path_lineage(
@@ -2759,6 +3109,8 @@ def validate_return_against_attempt(p: dict[str, Path], state: dict[str, Any], a
     identity = packet_identity(payload)
     if identity.get("run_id") != state["run_id"] or identity.get("attempt_id") != attempt["id"]:
         fail("return identity does not match the registered run/attempt")
+    if kind == "worker" and identity.get("ticket_id") != attempt.get("subject_ref"):
+        fail("worker return ticket_id does not match the registered ticket subject")
     if identity.get("packet_hash") != attempt.get("packet_hash"):
         fail("return packet hash mismatch")
     if identity.get("epoch") != attempt.get("epoch") or attempt.get("epoch") != state["owner"]["epoch"]:
@@ -2766,6 +3118,8 @@ def validate_return_against_attempt(p: dict[str, Path], state: dict[str, Any], a
     packet = stored_payload(p, attempt.get("packet_ref"), f"{kind} packet")
     packet_id = packet_identity(packet)
     if kind == "worker":
+        if packet_id.get("ticket_id") != attempt.get("subject_ref"):
+            fail("registered worker packet ticket_id does not match the attempt subject")
         validate_worker_return_semantics(payload, packet)
     elif kind == "review":
         validate_review_return_semantics(payload, packet)
@@ -3612,6 +3966,12 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
     existing_attempt = next((item for item in observed.get("attempts", []) if item.get("id") == args.attempt_id), None)
     if existing_attempt:
         if existing_attempt.get("packet_hash") == packet_hash and existing_attempt.get("subject_ref") == args.ticket_id and existing_attempt.get("route_ref") == args.route_id:
+            # Deny is an admission predicate, including exact replay. Validate its path syntax and overlap before returning.
+            packet_write_zone(packet)
+            denied_paths = [relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])]
+            for entry in packet_write_zone(packet):
+                if any(entry["path"] == path or entry["path"].startswith(path + "/") or path.startswith(entry["path"] + "/") for path in denied_paths):
+                    fail(f"packet write allow/deny overlap: {entry['path']}")
             return {"prepared": True, "idempotent": True, "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": observed["revision"]}
         fail("attempt ID already exists with conflicting dispatch")
     def change(state: dict[str, Any]) -> None:
@@ -3631,25 +3991,51 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             fail("attempt ID already exists")
         if any(t.get("state") in ("RUNNING", "CANDIDATE", "REVIEW") and t.get("id") != args.ticket_id for t in state.get("tickets", [])):
             fail("serial V1 product writer already active")
-        binding = current_intent_binding(state) if state.get("intent") else None
-        packet_intent = packet.get("intent_revision") or identity.get("intent_revision")
-        if binding and packet_intent and packet_intent != binding["revision"]:
-            fail("dispatch packet intent revision is stale")
-        if binding and packet.get("intent_document_hash") and packet.get("intent_document_hash") != binding["document_hash"]:
-            fail("dispatch packet intent document hash is stale")
         repair = packet.get("repair")
+        repair_plan = None
+        attempt_plan = None
+        repair_authorization = None
+        repair_lease_provenance = None
+        binding = current_intent_binding(state) if state.get("intent") else None
         if packet.get("mode") == "repair" and repair:
-            if repair.get("finding_ref") not in {item.get("id") for item in state.get("findings", [])} and repair.get("finding_ref") not in {item.get("id") for item in state.get("issues", [])}:
-                fail("repair contract references an unknown finding")
-            signature = repair_signature(repair)
-            prior = [attempt for attempt in state.get("attempts", []) if attempt.get("subject_ref") == args.ticket_id and attempt.get("repair_contract")]
-            if any(attempt.get("failure_signature") == signature or repair_signature(attempt["repair_contract"]) == signature for attempt in prior):
-                fail("unchanged repair retry rejected: no causally meaningful change")
+            refs = repair_finding_refs(repair)
+            auths = [active_repair_authorization(state, args.ticket_id, ref) for ref in refs]
+            if not refs or not all(auths) or len({item.get("id") for item in auths if item}) != 1:
+                signature = repair_signature(repair)
+                if any(
+                    item.get("subject_ref") == args.ticket_id
+                    and item.get("repair_contract")
+                    and (item.get("failure_signature") or repair_signature(item["repair_contract"])) == signature
+                    for item in state.get("attempts", [])
+                ):
+                    fail("unchanged repair retry rejected before READY: no causally meaningful change")
+                fail("repair dispatch requires one active authorization for the exact ticket and finding set")
+            repair_authorization = auths[0]
+            canonical_repair, repair_plan, attempt_plan, lease_result = repair_preflight(
+                p, state, ticket, repair, packet=packet, route_id=args.route_id, route=route,
+                packet_hash=packet_hash, authorization=repair_authorization,
+            )
+            if not repair_authorization.get("legacy_unbound_attempt_plan") and repair_authorization.get("attempt_plan_ref"):
+                stored_attempt_plan = stored_payload(p, repair_authorization.get("attempt_plan_ref"), "authorized AttemptPlan")
+                if stored_attempt_plan != attempt_plan:
+                    fail("dispatch AttemptPlan differs from the plan approved before ticket READY")
+            repair = canonical_repair
+            lease_zone, repair_lease_provenance = lease_result
+        else:
+            packet_intent = packet.get("intent_revision") or identity.get("intent_revision")
+            packet_hash_value = packet.get("intent_document_hash") or identity.get("intent_document_hash")
+            if binding and (
+                packet_intent is not None and packet_intent != binding["revision"]
+                or packet_hash_value is not None and packet_hash_value != binding["document_hash"]
+            ):
+                fail("dispatch packet intent revision/hash is stale")
+            lease_zone, repair_lease_provenance = effective_worker_lease(p, state, ticket, packet)
         for dependency in ticket.get("dependency_refs", []):
             dep = next(t for t in state.get("tickets", []) if t["id"] == dependency)
             if dep.get("state") != "INTEGRATED":
                 fail(f"dependency is not current INTEGRATED: {dependency}")
-        lease_zone, repair_lease_provenance = effective_worker_lease(p, state, ticket, packet)
+        if repair and repair_authorization is None:
+            fail("repair worker packet lacks a current repair authorization")
         object_store(p, packet_raw)
         lease = {"id": args.lease_id, "state": "active", "zone": lease_zone}
         attempt_record = {"id": args.attempt_id, "kind": packet.get("kind", "worker"), "mode": packet.get("mode", "implement"), "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": lease, "route_ref": args.route_id, "checkout": packet.get("workspace", {}).get("root"), "base_sha": packet.get("workspace", {}).get("expected_base"), "candidate_sha": None, "candidate_tree_sha": None, "return_ref": None, "finding_refs": []}
@@ -3658,7 +4044,14 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         if repair:
             attempt_record["repair_contract"] = repair
             attempt_record["failure_signature"] = repair_signature(repair)
-            attempt_record["repair_authorization_ref"] = active_repair_authorization(state, args.ticket_id, repair["finding_ref"])["id"]
+            attempt_record["repair_authorization_ref"] = repair_authorization["id"]
+            attempt_record["repair_plan_ref"] = repair_authorization.get("repair_plan_ref")
+            if repair_authorization.get("attempt_plan_ref"):
+                attempt_record["attempt_plan_ref"] = repair_authorization["attempt_plan_ref"]
+            elif attempt_plan is not None:
+                attempt_record["attempt_plan_ref"] = f"objects/{object_store(p, canonical_bytes(attempt_plan))}"
+            repair_authorization["status"] = "consumed"
+            repair_authorization["consumed_by"] = args.attempt_id
         if repair_lease_provenance:
             attempt_record["repair_lease_provenance"] = repair_lease_provenance
         state.setdefault("attempts", []).append(attempt_record)
@@ -3709,80 +4102,105 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
     contract = read_json(Path(args.repair_contract).expanduser().resolve(), "repair contract")
     root = schema()
     validate(contract, root["$defs"]["repair_contract"], root, "$.repair_contract")
-    if contract.get("finding_ref") != args.finding_ref:
+    finding_refs = repair_finding_refs(contract)
+    if args.finding_ref and (len(finding_refs) != 1 or contract.get("finding_ref") != args.finding_ref):
         fail("repair contract finding_ref does not match the command")
+    grouped = "finding_refs" in contract
+    packet = None
+    route = None
+    packet_raw = None
+    packet_hash = None
+    if args.packet:
+        packet_path = Path(args.packet).expanduser().resolve()
+        packet = read_json(packet_path, "repair worker packet")
+        packet_raw = packet_path.read_bytes()
+        validate(packet, root["$defs"]["worker_packet"], root, "$.packet")
+        if packet.get("mode") != "repair" or packet.get("repair") != contract:
+            fail("authorization packet must contain the exact repair contract from --repair-contract")
+        packet_identity_value = packet_identity(packet)
+        if packet_identity_value.get("run_id") != args.run_id or packet_identity_value.get("ticket_id") != args.ticket_id:
+            fail("authorization packet identity does not match run/ticket")
+        packet_hash = sha256_bytes(packet_raw)
+        if args.route:
+            route = read_json(Path(args.route).expanduser().resolve(), "route")
+            validate(route, root["$defs"]["route"], root, "$.route")
+            validate_route_eligibility(route)
+            if route.get("id") not in (None, args.route_id):
+                fail("route ID does not match authorization route-id")
+    if grouped and (packet is None or not args.route_id):
+        fail("grouped RepairPlan authorization requires --packet and --route-id")
+    requested_shape = {
+        "cause": contract.get("cause"), "finding_refs": sorted(finding_refs),
+        "finding_proofs": sorted(repair_proofs(contract), key=lambda item: item["finding_ref"]),
+        "stopping_condition": contract.get("stopping_condition"), "causal_change": contract.get("causal_change"),
+    }
+    observed, _ = load_state(p)
+    if observed.get("owner", {}).get("token") != args.owner_token:
+        fail("owner token mismatch; stale orchestrator is fenced")
+    replay = next((item for item in observed.get("decisions", []) if item.get("id") == args.authorization_id), None)
+    if replay is not None:
+        if replay.get("type") != "repair_authorization":
+            fail("authorization ID already belongs to another decision")
+        replay_plan = stored_payload(p, replay.get("repair_plan_ref"), "prior RepairPlan") if replay.get("repair_plan_ref") else None
+        replay_shape = {key: replay_plan.get(key) for key in requested_shape} if replay_plan else None
+        replay_attempt_plan = stored_payload(p, replay.get("attempt_plan_ref"), "prior AttemptPlan") if replay.get("attempt_plan_ref") else None
+        same_attempt_plan = (
+            replay_attempt_plan is None and packet is None
+            or replay_attempt_plan is not None and packet is not None
+            and replay_attempt_plan.get("packet_hash") == packet_hash
+            and replay_attempt_plan.get("route_id") == args.route_id
+            and replay_attempt_plan.get("route_hash") == (sha256_bytes(canonical_bytes(route)) if route is not None else None)
+        )
+        if replay_shape == requested_shape and same_attempt_plan:
+            return {"authorized": True, "idempotent": True, "authorization_id": args.authorization_id, "ticket_id": args.ticket_id, "finding_refs": sorted(finding_refs), "revision": observed["revision"]}
+        fail("authorization ID already exists with a different canonical RepairPlan/AttemptPlan")
 
     def change(state: dict[str, Any]) -> None:
         admit_event(state, "repair.authorize")
         ticket = next((item for item in state.get("tickets", []) if item.get("id") == args.ticket_id), None)
-        prior_authorization = active_repair_authorization(state, args.ticket_id, args.finding_ref) if ticket else None
-        authorization_consumed = bool(
-            prior_authorization
-            and any(
-                item.get("repair_authorization_ref") == prior_authorization.get("id")
-                for item in state.get("attempts", [])
-            )
-        )
-        prior_contract_refs = [
-            ref for ref in prior_authorization.get("evidence_refs", [])
-            if isinstance(ref, str) and ref.startswith("objects/")
-        ] if prior_authorization else []
-        legacy_rebind = bool(
-            ticket
-            and ticket.get("state") == "READY"
-            and prior_authorization
-            and not prior_contract_refs
-            and not authorization_consumed
-        )
-        provenance_rebind = bool(
-            ticket
-            and ticket.get("state") == "READY"
-            and prior_authorization
-            and len(prior_contract_refs) == 1
-            and not authorization_consumed
-            and repair_requires_transitive_create_modify_provenance(p, state, ticket)
-            and not stored_payload(p, prior_contract_refs[0], "prior authorized repair contract").get("source_attempt_ref")
-        )
-        if ticket is None or (
-            ticket.get("state") not in ("REVIEW", "BLOCKED", "REPAIR")
-            and not legacy_rebind
-            and not provenance_rebind
-        ):
+        existing_id = next((item for item in state.get("decisions", []) if item.get("id") == args.authorization_id), None)
+        if existing_id is not None:
+            if existing_id.get("type") != "repair_authorization":
+                fail("authorization ID already belongs to another decision")
+            prior_plan = stored_payload(p, existing_id.get("repair_plan_ref"), "prior RepairPlan") if existing_id.get("repair_plan_ref") else None
+            prior_shape = {key: prior_plan.get(key) for key in requested_shape} if prior_plan else None
+            same_attempt_plan = True
+            if packet is not None:
+                prior_attempt_plan = stored_payload(p, existing_id.get("attempt_plan_ref"), "prior AttemptPlan") if existing_id.get("attempt_plan_ref") else None
+                same_attempt_plan = bool(prior_attempt_plan and prior_attempt_plan.get("packet_hash") == packet_hash and prior_attempt_plan.get("route_id") == args.route_id)
+            elif existing_id.get("attempt_plan_ref"):
+                same_attempt_plan = False
+            if prior_shape == requested_shape and same_attempt_plan:
+                raise IdempotentResult({"authorized": True, "idempotent": True, "authorization_id": args.authorization_id, "ticket_id": args.ticket_id, "finding_refs": sorted(finding_refs), "revision": state["revision"]})
+            fail("authorization ID already exists with a different canonical RepairPlan/AttemptPlan")
+        if ticket is None:
             fail("repair authorization requires a REVIEW/BLOCKED/REPAIR ticket")
-        known_findings = {item.get("id") for item in state.get("findings", [])} | {item.get("id") for item in state.get("issues", [])}
-        if args.finding_ref not in known_findings:
-            fail("repair authorization references an unknown finding/issue")
-        finding = next((item for item in state.get("findings", []) if item.get("id") == args.finding_ref), None)
-        issue = next((item for item in state.get("issues", []) if item.get("id") == args.finding_ref), None)
-        record = finding or issue
-        if record.get("impact") != "blocking" or record.get("invalidated_by"):
-            fail("repair authorization requires a current blocking finding/issue")
-        if args.ticket_id not in record.get("affected_refs", []):
-            fail("repair authorization finding/issue is not bound to this ticket")
+        prior_unused = [
+            item for item in state.get("decisions", [])
+            if item.get("type") == "repair_authorization" and item.get("status") == "authorized"
+            and ticket["id"] in item.get("affected_refs", [])
+            and set(finding_refs) & set(item.get("affected_refs", []))
+            and not any(attempt.get("repair_authorization_ref") == item.get("id") for attempt in state.get("attempts", []))
+        ]
+        if ticket.get("state") not in ("REVIEW", "BLOCKED", "REPAIR") and not (ticket.get("state") == "READY" and prior_unused):
+            fail("repair authorization requires a REVIEW/BLOCKED/REPAIR ticket or an unused READY authorization")
+        canonical, repair_plan, attempt_plan, lease_result = repair_preflight(
+            p, state, ticket, contract, packet=packet, route_id=args.route_id,
+            route=route, packet_hash=packet_hash,
+        )
         projection = finding_obligation_projection(state)
-        projected_finding = next((item for item in projection["items"] if item.get("finding_ref") == args.finding_ref), None)
-        projected_issue = next((item for item in projection["mirrored_issues"] if item.get("issue_ref") == args.finding_ref), None)
-        if finding is not None:
-            unresolved_ticket_refs = projected_finding.get(
-                "unresolved_ticket_refs", projected_finding.get("affected_ticket_refs", [])
-            ) if projected_finding else []
-            if (
-                projected_finding is None or not projected_finding.get("repairable")
-                or args.ticket_id not in unresolved_ticket_refs
-            ):
-                fail("repair authorization requires a current repairable finding obligation in the shared projection")
-        elif (
-            projected_issue is None or not projected_issue.get("repairable")
-            or args.ticket_id not in record.get("affected_refs", [])
-        ):
-            fail("repair authorization requires a current repairable issue in the shared projection")
-        if any(item.get("id") == args.authorization_id for item in state.get("decisions", [])):
-            fail("repair authorization ID already exists")
-        if repair_requires_transitive_create_modify_provenance(p, state, ticket):
-            current = current_candidate_producer(state, ticket)
-            if current is None:
-                fail("repair authorization requires an explicit current candidate producer")
-            repair_candidate_worker(state, ticket, contract, current["candidate_sha"])
+        for previous in state.get("decisions", []):
+            if previous.get("type") != "repair_authorization" or previous.get("status") != "authorized":
+                continue
+            if ticket["id"] not in previous.get("affected_refs", []) or not (set(finding_refs) & set(previous.get("affected_refs", []))):
+                continue
+            if any(item.get("repair_authorization_ref") == previous.get("id") for item in state.get("attempts", [])):
+                fail("consumed repair authorization cannot be replaced")
+            previous["status"] = "superseded"
+            previous["superseded_by"] = args.authorization_id
+            previous.setdefault("invalidated_by", [])
+            if args.authorization_id not in previous["invalidated_by"]:
+                previous["invalidated_by"].append(args.authorization_id)
         continuation_blocker_refs = {
             decision.get("blocker_ref")
             for decision in state.get("decisions", [])
@@ -3800,16 +4218,17 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
                 for issue in state.get("issues", [])
             )
         )
+        selected_refs = set(repair_plan["finding_refs"])
         unrelated_blockers = [
             item for item in state.get("issues", [])
             if item.get("impact") == "blocking"
             and not item.get("invalidated_by")
-            and item.get("id") != args.finding_ref
-            and item.get("finding_ref") != args.finding_ref
+            and item.get("id") not in selected_refs
+            and item.get("finding_ref") not in selected_refs
         ]
         unrelated_obligations = [
             item for item in projection["obligations"]
-            if item.get("status") != "closed" and item.get("finding_ref") != args.finding_ref
+            if item.get("status") != "closed" and item.get("finding_ref") not in selected_refs
         ]
         preserve_blocked_control = preserve_blocked_control or bool(unrelated_blockers or unrelated_obligations)
         for attempt in state.get("attempts", []):
@@ -3819,22 +4238,77 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
                 fail("repair authorization requires quarantine reconciliation")
             if attempt.get("subject_ref") == args.ticket_id and attempt.get("lease", {}).get("state") == "active":
                 attempt["lease"]["state"] = "released"
-        if provenance_rebind:
-            prior_authorization.setdefault("invalidated_by", []).append(args.authorization_id)
-        contract_ref = f"objects/{object_store(p, canonical_bytes(contract))}"
-        state.setdefault("decisions", []).append({"id": args.authorization_id, "type": "repair_authorization", "status": "authorized", "decision": "REPAIR", "reason": contract["hypothesis"], "evidence_refs": [args.finding_ref, contract_ref], "affected_refs": [args.ticket_id, args.finding_ref], "intent_revision": state.get("intent", {}).get("current_revision"), "invalidated_by": []})
-        if finding is not None:
-            finding["repair_contract_ref"] = args.authorization_id
+        repair_plan_ref = f"objects/{object_store(p, canonical_bytes(repair_plan))}"
+        attempt_plan_ref = f"objects/{object_store(p, canonical_bytes(attempt_plan))}" if attempt_plan is not None else None
+        evidence_refs = [*repair_plan["finding_refs"], repair_plan_ref]
+        if attempt_plan_ref:
+            evidence_refs.append(attempt_plan_ref)
+        state.setdefault("decisions", []).append({
+            "id": args.authorization_id, "type": "repair_authorization", "status": "authorized", "decision": "REPAIR",
+            "reason": repair_plan["finding_proofs"][0]["hypothesis"], "evidence_refs": evidence_refs,
+            "affected_refs": [args.ticket_id, *repair_plan["finding_refs"]], "candidate_ref": repair_plan["source_candidate_ref"],
+            "repair_plan_ref": repair_plan_ref, "attempt_plan_ref": attempt_plan_ref,
+            "legacy_unbound_attempt_plan": attempt_plan is None,
+            "supersedes": [item.get("id") for item in state.get("decisions", []) if item.get("type") == "repair_authorization" and item.get("superseded_by") == args.authorization_id],
+            "intent_revision": state.get("intent", {}).get("current_revision"), "invalidated_by": [],
+        })
+        for finding in state.get("findings", []):
+            if finding.get("id") in selected_refs:
+                finding["repair_contract_ref"] = args.authorization_id
         ticket["state"] = "READY"
         if preserve_blocked_control:
-            state["lifecycle"]["next_action"] = {"kind": "dispatch_repair_with_blocker_retained", "subject_refs": [args.ticket_id, args.finding_ref, *sorted(continuation_blocker_refs)], "preconditions": ["owner-authorized candidate-bound repair", "external/out-of-scope blocker remains unresolved", "do not widen the ticket lease"], "read_refs": ["phases/execute.md", "references/routing.md"]}
+            state["lifecycle"]["next_action"] = {"kind": "dispatch_repair_with_blocker_retained", "subject_refs": [args.ticket_id, *repair_plan["finding_refs"], *sorted(continuation_blocker_refs)], "preconditions": ["owner-authorized candidate-bound repair", "external/out-of-scope blocker remains unresolved", "do not widen the ticket lease"], "read_refs": ["phases/execute.md", "references/routing.md"]}
         else:
             state["lifecycle"]["control"] = "ACTIVE"
             state["lifecycle"]["reason"] = "repair_authorized"
-            state["lifecycle"]["next_action"] = {"kind": "dispatch_repair", "subject_refs": [args.ticket_id, args.finding_ref], "preconditions": ["fresh attempt ID", "causally changed repair contract", "dependencies remain INTEGRATED"], "read_refs": ["phases/execute.md", "references/routing.md"]}
+            state["lifecycle"]["next_action"] = {"kind": "dispatch_repair", "subject_refs": [args.ticket_id, *repair_plan["finding_refs"]], "preconditions": ["preflighted AttemptPlan", "dependencies remain INTEGRATED"], "read_refs": ["phases/execute.md", "references/routing.md"]}
 
-    result = transaction(p, args.owner_token, args.revision, change, "repair-authorized")
-    return {"authorized": True, "authorization_id": args.authorization_id, "ticket_id": args.ticket_id, "finding_ref": args.finding_ref, "revision": result["revision"]}
+    try:
+        result = transaction(p, args.owner_token, args.revision, change, "repair-authorized")
+    except IdempotentResult as prior:
+        return prior.result
+    return {"authorized": True, "idempotent": False, "authorization_id": args.authorization_id, "ticket_id": args.ticket_id, "finding_refs": sorted(finding_refs), "revision": result["revision"]}
+
+
+def cmd_revoke_repair(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    reason = nonempty_string(args.reason, "revocation reason")
+    observed, _ = load_state(p)
+    if observed.get("owner", {}).get("token") != args.owner_token:
+        fail("owner token mismatch; stale orchestrator is fenced")
+    prior_event = next((item for item in observed.get("decisions", []) if item.get("id") == args.revocation_id), None)
+    if prior_event is not None:
+        if prior_event.get("type") == "repair_authorization_lifecycle" and prior_event.get("decision") == "REVOKE" and prior_event.get("affected_refs") == [args.authorization_id] and prior_event.get("reason") == reason:
+            return {"revoked": True, "idempotent": True, "authorization_id": args.authorization_id, "revocation_id": args.revocation_id, "revision": observed["revision"]}
+        fail("revocation ID already exists with conflicting lifecycle evidence")
+
+    def change(state: dict[str, Any]) -> None:
+        admit_event(state, "repair.authorize")
+        prior_event = next((item for item in state.get("decisions", []) if item.get("id") == args.revocation_id), None)
+        authorization = next((item for item in state.get("decisions", []) if item.get("id") == args.authorization_id), None)
+        if prior_event is not None:
+            if prior_event.get("type") == "repair_authorization_lifecycle" and prior_event.get("decision") == "REVOKE" and prior_event.get("affected_refs") == [args.authorization_id] and prior_event.get("reason") == reason:
+                raise IdempotentResult({"revoked": True, "idempotent": True, "authorization_id": args.authorization_id, "revocation_id": args.revocation_id, "revision": state["revision"]})
+            fail("revocation ID already exists with conflicting lifecycle evidence")
+        if authorization is None or authorization.get("type") != "repair_authorization":
+            fail("unknown repair authorization")
+        if authorization.get("status") != "authorized":
+            fail("only an unused authorized repair may be revoked")
+        if any(item.get("repair_authorization_ref") == authorization.get("id") for item in state.get("attempts", [])):
+            fail("consumed repair authorization cannot be revoked")
+        authorization["status"] = "revoked"
+        authorization["revoked_by"] = args.revocation_id
+        authorization["revocation_reason"] = reason
+        state.setdefault("decisions", []).append({
+            "id": args.revocation_id, "type": "repair_authorization_lifecycle", "status": "applied",
+            "decision": "REVOKE", "reason": reason, "evidence_refs": [args.authorization_id],
+            "affected_refs": [args.authorization_id], "invalidated_by": [],
+        })
+    try:
+        result = transaction(p, args.owner_token, args.revision, change, "repair-revoked")
+    except IdempotentResult as prior:
+        return prior.result
+    return {"revoked": True, "idempotent": False, "authorization_id": args.authorization_id, "revocation_id": args.revocation_id, "revision": result["revision"]}
 
 
 def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
@@ -3854,8 +4328,10 @@ def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
         if attempt.get("epoch") != state["owner"]["epoch"] and args.lease_state == "released":
             fail("stale-epoch attempt may only be quarantined until takeover reconciliation")
         object_store(p, evidence_raw)
+        evidence_ref = f"objects/{evidence_digest}"
         attempt["state"] = args.state
         attempt["lease"]["state"] = args.lease_state
+        attempt["termination_evidence_ref"] = evidence_ref
         ticket = next((item for item in state.get("tickets", []) if item.get("current_attempt") == args.attempt_id), None)
         if ticket and ticket.get("state") not in ("INTEGRATED", "CANCELLED", "STALE"):
             ticket["state"] = "BLOCKED"
@@ -3915,8 +4391,8 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
             blocked_ticket = next((item for item in state.get("tickets", []) if blocked_attempt and item.get("id") == blocked_attempt.get("subject_ref")), None)
             blocked_operation = next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None)
             repair_contract = blocked_attempt.get("repair_contract") if blocked_attempt else None
-            repair_finding_ref = repair_contract.get("finding_ref") if isinstance(repair_contract, dict) else None
-            authorization = active_repair_authorization(state, blocked_ticket.get("id"), repair_finding_ref) if blocked_ticket and repair_finding_ref else None
+            repair_finding_refs_value = repair_finding_refs(repair_contract) if isinstance(repair_contract, dict) else []
+            authorization = repair_authorization_for_attempt(state, blocked_ticket.get("id"), repair_contract, blocked_attempt.get("id")) if blocked_ticket and repair_finding_refs_value else None
             same_checkout = bool(
                 blocked_attempt and isinstance(blocked_attempt.get("checkout"), str) and blocked_attempt.get("checkout")
                 and blocked_operation and isinstance(blocked_operation.get("target"), str) and blocked_operation.get("target")
@@ -3982,6 +4458,12 @@ def validate_continuation_provenance(
 ) -> None:
     """Revalidate the attempt's ticket lease and repair lineage before preservation."""
     requested = packet_write_zone(packet)
+    denied = [relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])]
+    if any(
+        entry["path"] == path or entry["path"].startswith(path + "/") or path.startswith(entry["path"] + "/")
+        for entry in requested for path in denied
+    ):
+        fail("continuation packet write allowlist conflicts with its deny list")
     disallowed = [
         {"path": entry["path"], "operation": operation}
         for entry in requested
@@ -3996,27 +4478,35 @@ def validate_continuation_provenance(
             fail("continuation attempt lease does not exactly match the ticket-authorized packet allowlist")
         return
 
-    repair = packet.get("repair")
-    if not isinstance(repair, dict) or attempt.get("repair_contract") != repair:
-        fail("continuation repair packet does not match the attempt's stored repair contract")
+    packet_repair = packet.get("repair")
+    if not isinstance(packet_repair, dict):
+        fail("continuation repair packet has no durable repair contract")
+    legacy_plan = False
+    if current_candidate_record(state, ticket) is None and not attempt.get("repair_plan_ref"):
+        # Compatibility for pre-1.1 attempts whose only candidate pointer is an older worker attempt.
+        repair = packet_repair
+        repair_plan = None
+        legacy_plan = attempt.get("repair_contract") == packet_repair
+    else:
+        repair, repair_plan = normalize_repair_contract(state, ticket, packet_repair)
+        if attempt.get("repair_contract") != repair or attempt.get("repair_plan_ref") is None:
+            fail("continuation repair packet does not match the attempt's stored repair contract")
+    if not legacy_plan:
+        candidate = current_candidate_record(state, ticket)
+        if candidate is None or attempt.get("base_sha") != candidate.get("sha"):
+            fail("continuation repair source candidate is no longer current")
     authorization_ref = attempt.get("repair_authorization_ref")
-    authorization = next(
-        (
-            item for item in state.get("decisions", [])
-            if item.get("id") == authorization_ref
-            and item.get("type") == "repair_authorization"
-            and item.get("status") == "authorized"
-            and item.get("decision") == "REPAIR"
-            and ticket.get("id") in item.get("affected_refs", [])
-            and repair.get("finding_ref") in item.get("affected_refs", [])
-            and not item.get("invalidated_by")
-        ),
-        None,
-    )
+    authorization = repair_authorization_for_attempt(state, ticket["id"], repair, attempt["id"])
+    if authorization and authorization.get("id") != authorization_ref:
+        authorization = None
     if authorization is None:
         fail("continuation repair attempt has no current same-ticket repair authorization")
-    contract_refs = [ref for ref in authorization.get("evidence_refs", []) if isinstance(ref, str) and ref.startswith("objects/")]
-    if len(contract_refs) != 1 or stored_payload(p, contract_refs[0], "authorized repair contract") != repair:
+    authorized_plan = stored_payload(p, authorization.get("repair_plan_ref"), "authorized RepairPlan") if authorization.get("repair_plan_ref") else None
+    if legacy_plan:
+        legacy_refs = [ref for ref in authorization.get("evidence_refs", []) if isinstance(ref, str) and ref.startswith("objects/")]
+        if len(legacy_refs) != 1 or stored_payload(p, legacy_refs[0], "legacy authorized repair contract") != repair:
+            fail("legacy continuation repair authorization is not bound to the exact repair contract")
+    elif authorized_plan != repair_plan:
         fail("continuation repair authorization is not bound to the exact repair contract")
     source_ref = repair.get("source_attempt_ref")
     base_sha = attempt.get("base_sha")
@@ -4031,8 +4521,8 @@ def validate_continuation_provenance(
     ):
         fail("continuation repair source is missing, foreign, stale, or quarantined")
     validated_candidate_worker_return(p, state, ticket, source)
-    if not finding_matches_candidate(state, repair.get("finding_ref"), ticket["id"], base_sha):
-        fail("continuation repair finding is not bound to the exact same-ticket source candidate")
+    if any(not finding_matches_candidate(state, ref, ticket["id"], base_sha) for ref in repair_finding_refs(repair)):
+        fail("continuation repair finding set is not bound to the exact same-ticket source candidate")
 
     provenance = attempt.get("repair_lease_provenance")
     if not disallowed:
@@ -4043,13 +4533,12 @@ def validate_continuation_provenance(
         fail("continuation repair is missing its required lease provenance")
     if (
         provenance.get("authorization_ref") != authorization_ref
-        or provenance.get("finding_ref") != repair.get("finding_ref")
+        or provenance.get("finding_ref") != repair_finding_refs(repair)[0]
         or provenance.get("source_attempt_ref") != source_ref
         or provenance.get("candidate_sha") != base_sha
         or provenance.get("packet_base_sha") != base_sha
     ):
         fail("continuation repair lease provenance is discontinuous")
-    denied = [relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])]
     for item in disallowed:
         path, operation = item["path"], item["operation"]
         if operation != "modify" or not zone_allows(ticket.get("zone", []), path, "create"):
@@ -4175,9 +4664,11 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
         external_checks = set(authorization.get("external_check_ids", []))
         check_failures = {check_id for check_id, item in checks.items() if item.get("outcome") == "fail"}
         if check_failures != external_checks:
-            fail("every failed check must be explicitly attributed to the authorized external/out-of-scope blocker, with no own failures")
+            fail("every failed check must be explicitly attributed to the authorized external/out-of-scope blocker; continuation permits no own failures")
         if not external_checks.issubset(required):
             fail("only failed required ticket checks can be attributed to the continuation blocker")
+        if not required - external_checks:
+            fail("continuation preservation requires at least one passing required check outside the blocker; an all-external classification cannot erase worker-owned proof failures")
         if any(checks.get(check_id, {}).get("outcome") != "pass" for check_id in required - external_checks):
             fail("all required ticket checks outside the proven blocker must PASS")
         if any(item.get("outcome") in ("not_run", "unverifiable") for item in worker_return.get("checks", [])):
@@ -4191,6 +4682,14 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
             unsatisfied = {key for key, outcome in criterion_outcomes.items() if outcome != "satisfied"}
             if unsatisfied != external_criteria:
                 fail("BLOCKED continuation criteria must all pass or be explicitly bound to the external/out-of-scope blocker")
+        failed_external_evidence = {
+            item.get("evidence_ref") for item in checks.values()
+            if item.get("check_id") in external_checks and item.get("outcome") == "fail"
+        }
+        for criterion_id in external_criteria:
+            criterion = next((item for item in worker_return.get("criteria", []) if item.get("criterion_id") == criterion_id), None)
+            if criterion is None or not set(criterion.get("evidence_refs", [])) & failed_external_evidence:
+                fail("external criterion classification must be evidenced by the exact authorized external failed check")
         if any(criterion_outcomes[item] == "satisfied" for item in external_criteria):
             fail("owner authorization cannot classify a satisfied ticket criterion as externally blocked")
 
@@ -4358,9 +4857,9 @@ def cmd_prepare_effect(args: argparse.Namespace) -> dict[str, Any]:
                     item for item in state.get("tickets", [])
                     if repair_attempt and item.get("id") == repair_attempt.get("subject_ref")
                 ), None)
-                authorization = active_repair_authorization(
-                    state, repair_ticket.get("id"), repair_contract.get("finding_ref")
-                ) if repair_ticket and repair_contract.get("finding_ref") else None
+                authorization = repair_authorization_for_attempt(
+                    state, repair_ticket.get("id"), repair_contract, repair_attempt.get("id")
+                ) if repair_ticket and repair_contract and repair_attempt else None
                 if (
                     repair_attempt is None
                     or repair_ticket is None
@@ -5081,8 +5580,7 @@ def cmd_close_blocked_attempt(args: argparse.Namespace) -> dict[str, Any]:
     closure_id = safe_id(f"blocked-close-{attempt_id}", "blocked closure ID")
 
     with Lock(p["lock"]):
-        state, previous_raw = load_mutation_state(p, args.owner_token)
-        admit_event(state, "attempt.reconcile")
+        state, previous_raw = load_state(p)
         if state["owner"]["token"] != args.owner_token:
             fail("owner token mismatch; stale orchestrator is fenced")
         attempt = attempt_by_id(state, attempt_id)
@@ -5280,6 +5778,617 @@ def cmd_close_blocked_attempt(args: argparse.Namespace) -> dict[str, Any]:
         }
 
 
+def cmd_finalize_attempt(args: argparse.Namespace) -> dict[str, Any]:
+    """Record the safe terminal disposition of a returned or stopped worker attempt."""
+    p = paths(args.control_root, args.run_id)
+    ticket_id = safe_id(args.ticket_id, "ticket_id")
+    attempt_id = safe_id(args.attempt_id, "attempt_id")
+    finalization_id = safe_id(f"attempt-finalized-{attempt_id}", "attempt finalization ID")
+
+    def validate_replay(state: dict[str, Any], attempt: dict[str, Any], ticket: dict[str, Any] | None) -> dict[str, Any]:
+        receipt_ref = attempt.get("finalization_ref")
+        if not receipt_ref:
+            fail("attempt has no finalization receipt")
+        receipt = stored_payload(p, receipt_ref, "attempt finalization receipt")
+        decision = next((item for item in state.get("decisions", []) if item.get("id") == finalization_id), None)
+        expected_decision = {
+            "id": finalization_id,
+            "type": "attempt_finalization",
+            "status": "applied",
+            "decision": receipt.get("decision"),
+            "evidence_refs": [receipt_ref, *([receipt.get("return_ref")] if receipt.get("return_ref") else []), *([receipt.get("termination_evidence_ref")] if receipt.get("termination_evidence_ref") else [])],
+            "affected_refs": [ticket_id, attempt_id, *([receipt.get("prior_attempt_ref")] if receipt.get("prior_attempt_ref") else [])],
+        }
+        if (
+            receipt.get("kind") != "attempt_finalization"
+            or receipt.get("run_id") != state.get("run_id")
+            or receipt.get("ticket_id") != ticket_id
+            or receipt.get("attempt_id") != attempt_id
+            or receipt.get("finalization_id") != finalization_id
+            or attempt.get("subject_ref") != ticket_id
+            or decision is None
+            or any(decision.get(key) != value for key, value in expected_decision.items())
+            or ticket is None
+        ):
+            fail("attempt finalization receipt or immutable decision binding is incomplete or conflicting")
+        return receipt
+
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state["owner"]["token"] != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        attempt = attempt_by_id(state, attempt_id)
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == ticket_id), None)
+        if attempt.get("finalization_ref"):
+            receipt = validate_replay(state, attempt, ticket)
+            return {
+                "closed": True,
+                "idempotent": True,
+                "attempt_id": attempt_id,
+                "restored_attempt_id": receipt.get("prior_attempt_ref"),
+                "candidate_sha": receipt.get("prior_candidate_sha"),
+                "disposition": receipt.get("disposition"),
+                "receipt_ref": attempt["finalization_ref"],
+                "revision": state["revision"],
+                "next_action": state.get("lifecycle", {}).get("next_action"),
+            }
+        state, previous_raw = load_mutation_state(p, args.owner_token, verified=(state, previous_raw))
+        admit_event(state, "attempt.reconcile")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        if state["lifecycle"].get("control") in TERMINAL_CONTROLS:
+            fail("terminal run is immutable; start a successor run")
+        if ticket is None or ticket.get("current_attempt") != attempt_id or attempt.get("subject_ref") != ticket_id:
+            fail("attempt finalization requires the exact current attempt of the same ticket")
+        if attempt.get("kind") != "worker":
+            fail("attempt finalization applies only to worker attempts")
+        if attempt.get("candidate_sha") is not None or attempt.get("candidate_tree_sha") is not None:
+            fail("attempt finalization cannot rewrite or withdraw an already-published candidate")
+
+        return_payload: dict[str, Any] | None = None
+        termination: dict[str, Any] | None = None
+        declared_files: list[dict[str, Any]] = []
+        evidence_known = False
+        if attempt.get("state") == "RETURNED":
+            if not attempt.get("return_ref"):
+                fail("returned attempt finalization requires its durable worker return")
+            return_payload = stored_payload(p, attempt["return_ref"], "worker return")
+            schema_root = schema()
+            validate(return_payload, schema_root["$defs"]["worker_return"], schema_root, "$.worker_return")
+            packet = stored_payload(p, attempt.get("packet_ref"), "worker packet")
+            identity = packet_identity(return_payload)
+            if (
+                identity.get("run_id") != state["run_id"]
+                or identity.get("ticket_id") != ticket_id
+                or identity.get("attempt_id") != attempt_id
+                or identity.get("packet_hash") != attempt.get("packet_hash")
+                or identity.get("epoch") != attempt.get("epoch")
+            ):
+                fail("worker return identity is not bound to the exact attempt")
+            validate_worker_return_semantics(return_payload, packet)
+            if return_payload.get("status") not in ("BLOCKED", "HANDOFF", "FAILED"):
+                fail("attempt finalization handles only durable BLOCKED, HANDOFF, or FAILED returns")
+            declared_files = return_payload.get("files", [])
+            evidence_known = attempt.get("lease", {}).get("state") == "active"
+        elif attempt.get("state") in ("LOST", "INTERRUPTED"):
+            termination_ref = attempt.get("termination_evidence_ref")
+            if termination_ref:
+                termination = stored_payload(p, termination_ref, "attempt termination evidence")
+            evidence_known = bool(
+                termination
+                and termination.get("status") == "PASS"
+                and termination.get("writer_stopped") is True
+                and attempt.get("lease", {}).get("state") == "released"
+            )
+        else:
+            fail("attempt finalization requires a RETURNED, LOST, or INTERRUPTED worker attempt")
+
+        prior_candidate = current_candidate_record(state, ticket)
+        prior_producer = current_candidate_producer(state, ticket)
+        prior_quality: str | None = None
+        prior_attempt_ref: str | None = None
+        prior_candidate_sha: str | None = None
+        prior_candidate_tree: str | None = None
+        baseline_valid = False
+        if prior_candidate is not None:
+            prior_quality = prior_candidate.get("quality")
+            prior_attempt_ref = prior_candidate.get("producer_attempt_ref")
+            prior_candidate_sha = prior_candidate.get("sha")
+            prior_candidate_tree = prior_candidate.get("tree_sha")
+            baseline_valid = bool(
+                prior_quality in ("DONE", "CONTINUATION")
+                and prior_producer is not None
+                and prior_producer.get("id") == prior_attempt_ref
+                and prior_producer.get("state") == "RETURNED"
+                and prior_producer.get("lease", {}).get("state") == "released"
+                and prior_producer.get("candidate_sha") == prior_candidate_sha
+                and prior_producer.get("candidate_tree_sha") == prior_candidate_tree
+                and attempt.get("base_sha") == prior_candidate_sha
+            )
+            if baseline_valid and prior_quality == "DONE":
+                producer_return = stored_payload(p, prior_producer.get("return_ref"), "prior DONE candidate return")
+                producer_identity = packet_identity(producer_return)
+                baseline_valid = bool(
+                    producer_return.get("status") == "DONE"
+                    and producer_identity.get("run_id") == state["run_id"]
+                    and producer_identity.get("ticket_id") == ticket_id
+                    and producer_identity.get("attempt_id") == prior_attempt_ref
+                    and producer_identity.get("packet_hash") == prior_producer.get("packet_hash")
+                    and producer_identity.get("epoch") == prior_producer.get("epoch")
+                )
+            elif baseline_valid and prior_quality == "CONTINUATION":
+                continuation = continuation_candidate_receipt(p, state, ticket, prior_producer)
+                baseline_valid = bool(
+                    continuation
+                    and continuation.get("candidate_sha") == prior_candidate_sha
+                    and continuation.get("candidate_tree_sha") == prior_candidate_tree
+                )
+        else:
+            baseline_sha = state.get("repository", {}).get("initial_head")
+            baseline_valid = bool(baseline_sha and attempt.get("base_sha") == baseline_sha)
+
+        checkout = None
+        audit: dict[str, Any] = {
+            "pass": False, "changed_paths": [], "foreign_changes": [], "error": "checkout audit unavailable",
+        }
+        head: str | None = None
+        tree: str | None = None
+        expected_tree: str | None = None
+        try:
+            if not isinstance(attempt.get("checkout"), str) or not attempt.get("checkout"):
+                fail("attempt finalization requires an exact worker checkout")
+            checkout = safe_root(attempt["checkout"], "attempt finalization checkout")
+            top_level = Path(git_output(checkout, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+            if not checkout.samefile(top_level):
+                fail("attempt finalization checkout is not the exact Git worktree root")
+            head = git_output(checkout, "rev-parse", "HEAD").decode().strip()
+            tree = git_output(checkout, "rev-parse", "HEAD^{tree}").decode().strip()
+            expected_tree = prior_candidate_tree if prior_candidate is not None else git_output(
+                checkout, "rev-parse", f"{attempt.get('base_sha')}^{{tree}}"
+            ).decode().strip()
+            baseline = git_tree_baseline(checkout, attempt.get("base_sha"))
+            audit = audit_write_set(checkout, baseline, declared_files, attempt.get("lease", {}).get("zone", []))
+        except (LedgerError, OSError) as exc:
+            audit = {"pass": False, "changed_paths": [], "foreign_changes": [], "error": str(exc)}
+
+        pending_checkout_effects = [
+            item.get("id") for item in state.get("operations", [])
+            if item.get("state") in ("prepared", "uncertain")
+            and checkout is not None
+            and Path(item.get("target", "")).expanduser().resolve() == checkout.resolve()
+        ]
+        unchanged = bool(
+            evidence_known
+            and not declared_files
+            and not pending_checkout_effects
+            and baseline_valid
+            and checkout is not None
+            and head == attempt.get("base_sha")
+            and tree == expected_tree
+            and audit.get("pass") is True
+            and audit.get("changed_paths") == []
+        )
+        if not evidence_known:
+            disposition_reason = "writer stop is unknown or lease remains quarantined"
+        elif pending_checkout_effects:
+            disposition_reason = f"prepared or uncertain checkout effects require reconciliation: {pending_checkout_effects}"
+        elif not baseline_valid:
+            disposition_reason = "candidate pointer, repair base, or verified initial baseline do not match"
+        elif not unchanged:
+            foreign = audit.get("foreign_changes", [])
+            changed = audit.get("changed_paths", [])
+            disposition_reason = f"checkout contains foreign or uncertain writes (foreign={foreign}, changed={changed})"
+        else:
+            disposition_reason = "durable non-DONE outcome returned against an unchanged verified baseline"
+
+        prior_open = [
+            item.get("id") for item in state.get("attempts", [])
+            if item.get("subject_ref") == ticket_id
+            and item.get("id") != attempt_id
+            and item.get("lease", {}).get("state") in ("active", "quarantined")
+        ]
+        if prior_open:
+            unchanged = False
+            disposition_reason = f"other same-ticket leases remain open: {prior_open}"
+
+        quarantine = not unchanged
+        closure_decision = "QUARANTINE_FOR_RECONCILIATION" if quarantine else (
+            "RETAIN_CURRENT_CANDIDATE" if prior_candidate is not None else "RETRY_FROM_VERIFIED_BASELINE"
+        )
+        disposition = "quarantined" if quarantine else (
+            "prior_candidate_retained" if prior_candidate is not None else "verified_baseline_retry"
+        )
+        lease_before = attempt.get("lease", {}).get("state")
+        lease_after = "quarantined" if quarantine else "released"
+        receipt = {
+            "kind": "attempt_finalization",
+            "finalization_id": finalization_id,
+            "run_id": state["run_id"],
+            "ticket_id": ticket_id,
+            "attempt_id": attempt_id,
+            "source_revision": state["revision"],
+            "source_ledger_hash": sha256_bytes(previous_raw),
+            "return_ref": attempt.get("return_ref"),
+            "return_status": return_payload.get("status") if return_payload else None,
+            "termination_evidence_ref": attempt.get("termination_evidence_ref"),
+            "attempt_state": attempt.get("state"),
+            "declared_files": declared_files,
+            "prior_candidate_ref": ticket.get("current_candidate"),
+            "prior_attempt_ref": prior_attempt_ref,
+            "prior_candidate_quality": prior_quality,
+            "prior_candidate_sha": prior_candidate_sha,
+            "prior_candidate_tree_sha": prior_candidate_tree,
+            "base_sha": attempt.get("base_sha"),
+            "checkout": str(checkout) if checkout else attempt.get("checkout"),
+            "observed_head": head,
+            "observed_tree": tree,
+            "write_set_audit": audit,
+            "pending_checkout_effects": pending_checkout_effects,
+            "baseline_valid": baseline_valid,
+            "writer_stop_proven": evidence_known,
+            "lease_before": lease_before,
+            "lease_after": lease_after,
+            "decision": closure_decision,
+            "disposition": disposition,
+            "reason": disposition_reason,
+            "owner_epoch": state.get("owner", {}).get("epoch"),
+        }
+        receipt_digest = object_store(p, canonical_bytes(receipt))
+        receipt_ref = f"objects/{receipt_digest}"
+        attempt["lease"]["state"] = lease_after
+        attempt["finalization_ref"] = receipt_ref
+        decision_evidence = [receipt_ref]
+        if attempt.get("return_ref"):
+            decision_evidence.append(attempt["return_ref"])
+        if attempt.get("termination_evidence_ref"):
+            decision_evidence.append(attempt["termination_evidence_ref"])
+        decision_affected = [ticket_id, attempt_id]
+        if prior_attempt_ref:
+            decision_affected.append(prior_attempt_ref)
+        state.setdefault("decisions", []).append({
+            "id": finalization_id,
+            "type": "attempt_finalization",
+            "status": "applied",
+            "decision": closure_decision,
+            "reason": disposition_reason,
+            "evidence_refs": decision_evidence,
+            "affected_refs": decision_affected,
+            "intent_revision": state.get("intent", {}).get("current_revision"),
+            "invalidated_by": [],
+        })
+        evidence_id = f"ev-attempt-finalized-{receipt_digest[:16]}"
+        state.setdefault("evidence", []).append({
+            "id": evidence_id,
+            "hash": receipt_digest,
+            "source": "attempt_finalization",
+            "scenario": attempt.get("state"),
+            "outcome": disposition,
+            "observer": "ledger-helper",
+            "subject": attempt_id,
+        })
+        retry_from_initial_baseline = bool(not quarantine and prior_candidate is None)
+        resolved_retry_issue_refs: set[str] = set()
+        if retry_from_initial_baseline:
+            for issue in state.get("issues", []):
+                if (
+                    issue.get("source_ref") == attempt_id
+                    and issue.get("cause") in ("implementation", "orchestration", "ownership")
+                    and not issue.get("invalidated_by")
+                ):
+                    issue["impact"] = "advisory"
+                    issue["disposition"] = f"superseded by verified baseline retry {finalization_id}"
+                    issue.setdefault("invalidated_by", []).append(finalization_id)
+                    resolved_retry_issue_refs.add(issue["id"])
+            state["lifecycle"]["issue_refs"] = [
+                ref for ref in state["lifecycle"].get("issue_refs", [])
+                if ref not in resolved_retry_issue_refs
+            ]
+        ticket["state"] = "READY" if retry_from_initial_baseline else "BLOCKED"
+        ticket["current_worker_attempt"] = None
+        if state.get("candidate_model_version") == "1.1":
+            # current_attempt and last_worker_attempt identify the latest worker;
+            # current_candidate independently retains the explicit quality pointer.
+            ticket["current_attempt"] = attempt_id
+            ticket["last_worker_attempt"] = attempt_id
+        state["lifecycle"]["control"] = "ACTIVE" if retry_from_initial_baseline else "BLOCKED"
+        state["lifecycle"]["reason"] = "attempt_finalization_quarantined" if quarantine else (
+            "attempt_finalized_prior_candidate" if prior_candidate is not None else "attempt_finalized_no_candidate"
+        )
+        state["lifecycle"]["next_action"] = {
+            "kind": "recover_attempt" if quarantine else ("authorize_repair" if prior_candidate is not None else "retry_changed_attempt"),
+            "subject_refs": [attempt_id, *([ticket_id] if not quarantine else [])],
+            "preconditions": [
+                "inspect exact foreign/uncertain checkout writes and reconcile quarantine" if quarantine
+                else ("retain the explicit prior candidate quality" if prior_candidate is not None else "use verified baseline and a changed attempt plan or repair contract"),
+                "use a fresh attempt ID",
+            ],
+            "read_refs": ["phases/recover.md", "phases/execute.md", "references/ledger.md"],
+        }
+        state["revision"] += 1
+        state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        state["updated_at"] = now()
+        publish(p, state, previous_raw, "attempt-finalized")
+        return {
+            "closed": True,
+            "idempotent": False,
+            "attempt_id": attempt_id,
+            "restored_attempt_id": prior_attempt_ref,
+            "candidate_sha": prior_candidate_sha,
+            "disposition": disposition,
+            "reason": disposition_reason,
+            "receipt_ref": receipt_ref,
+            "revision": state["revision"],
+            "next_action": state["lifecycle"]["next_action"],
+        }
+
+
+def cmd_reconcile_finalized_attempt(args: argparse.Namespace) -> dict[str, Any]:
+    """Release a finalized quarantine only after stop proof and baseline cleanup."""
+    p = paths(args.control_root, args.run_id)
+    ticket_id = safe_id(args.ticket_id, "ticket_id")
+    attempt_id = safe_id(args.attempt_id, "attempt_id")
+    reconciliation_id = safe_id(
+        f"attempt-finalization-reconciled-{attempt_id}",
+        "attempt finalization reconciliation ID",
+    )
+    evidence_path = Path(args.evidence).expanduser().resolve()
+    evidence = read_json(evidence_path, "attempt finalization reconciliation evidence")
+    evidence_raw = evidence_path.read_bytes()
+    if (
+        evidence.get("status") != "PASS"
+        or evidence.get("writer_stopped") is not True
+        or evidence.get("reconciled") is not True
+        or evidence.get("disposition") != "discarded_to_verified_baseline"
+    ):
+        fail(
+            "finalized quarantine reconciliation requires PASS writer_stopped, "
+            "reconciled, and discarded_to_verified_baseline evidence"
+        )
+
+    def replay(state: dict[str, Any], attempt: dict[str, Any]) -> dict[str, Any]:
+        receipt_ref = attempt.get("finalization_reconciliation_ref")
+        if not receipt_ref:
+            fail("attempt has no finalization reconciliation receipt")
+        receipt = stored_payload(p, receipt_ref, "attempt finalization reconciliation receipt")
+        decision = next(
+            (item for item in state.get("decisions", []) if item.get("id") == reconciliation_id),
+            None,
+        )
+        expected_evidence_hash = sha256_bytes(evidence_raw)
+        if (
+            receipt.get("kind") != "attempt_finalization_reconciliation"
+            or receipt.get("reconciliation_id") != reconciliation_id
+            or receipt.get("run_id") != state.get("run_id")
+            or receipt.get("ticket_id") != ticket_id
+            or receipt.get("attempt_id") != attempt_id
+            or receipt.get("reconciliation_evidence_hash") != expected_evidence_hash
+            or decision is None
+            or decision.get("type") != "attempt_finalization_reconciliation"
+            or decision.get("decision") != "RELEASE_VERIFIED_BASELINE"
+            or decision.get("evidence_refs") != [
+                receipt.get("original_finalization_ref"),
+                receipt.get("reconciliation_evidence_ref"),
+                receipt_ref,
+            ]
+            or decision.get("affected_refs") != [ticket_id, attempt_id]
+        ):
+            fail("attempt finalization reconciliation replay is incomplete or conflicting")
+        return receipt
+
+    with Lock(p["lock"]):
+        state, previous_raw = load_state(p)
+        if state.get("owner", {}).get("token") != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        attempt = attempt_by_id(state, attempt_id)
+        if attempt.get("finalization_reconciliation_ref"):
+            receipt = replay(state, attempt)
+            return {
+                "reconciled": True,
+                "idempotent": True,
+                "attempt_id": attempt_id,
+                "disposition": receipt.get("disposition"),
+                "receipt_ref": attempt["finalization_reconciliation_ref"],
+                "revision": state["revision"],
+                "next_action": state.get("lifecycle", {}).get("next_action"),
+            }
+
+        state, previous_raw = load_mutation_state(
+            p, args.owner_token, verified=(state, previous_raw)
+        )
+        admit_event(state, "attempt.reconcile")
+        if state["revision"] != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        if state.get("lifecycle", {}).get("control") in TERMINAL_CONTROLS:
+            fail("terminal run is immutable; start a successor run")
+        ticket = next(
+            (item for item in state.get("tickets", []) if item.get("id") == ticket_id),
+            None,
+        )
+        attempt = attempt_by_id(state, attempt_id)
+        if (
+            ticket is None
+            or ticket.get("current_attempt") != attempt_id
+            or attempt.get("subject_ref") != ticket_id
+        ):
+            fail("reconciliation requires the exact current attempt of the same ticket")
+        if attempt.get("lease", {}).get("state") != "quarantined":
+            fail("reconciliation requires a finalized quarantined lease")
+        finalization_ref = attempt.get("finalization_ref")
+        if not finalization_ref:
+            fail("reconciliation requires an immutable attempt finalization receipt")
+        finalization = stored_payload(p, finalization_ref, "attempt finalization receipt")
+        if (
+            finalization.get("kind") != "attempt_finalization"
+            or finalization.get("ticket_id") != ticket_id
+            or finalization.get("attempt_id") != attempt_id
+            or finalization.get("disposition") != "quarantined"
+            or finalization.get("lease_after") != "quarantined"
+        ):
+            fail("reconciliation source is not the exact quarantined finalization")
+        if not finalization.get("baseline_valid"):
+            fail("quarantine cannot be released without a previously verified candidate/base binding")
+
+        prior_candidate_ref = finalization.get("prior_candidate_ref")
+        prior_candidate = current_candidate_record(state, ticket)
+        if prior_candidate_ref:
+            if (
+                prior_candidate is None
+                or prior_candidate.get("id") != prior_candidate_ref
+                or prior_candidate.get("sha") != finalization.get("prior_candidate_sha")
+                or prior_candidate.get("tree_sha") != finalization.get("prior_candidate_tree_sha")
+            ):
+                fail("current candidate changed before quarantine reconciliation")
+            expected_tree = prior_candidate.get("tree_sha")
+        else:
+            if prior_candidate is not None or ticket.get("current_candidate") is not None:
+                fail("candidate appeared before initial-baseline quarantine reconciliation")
+            expected_tree = None
+
+        checkout_value = attempt.get("checkout")
+        if not isinstance(checkout_value, str) or not checkout_value:
+            fail("reconciliation requires the exact worker checkout")
+        checkout = safe_root(checkout_value, "attempt finalization reconciliation checkout")
+        top_level = Path(git_output(checkout, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+        if not checkout.samefile(top_level):
+            fail("reconciliation checkout is not the exact Git worktree root")
+        head = git_output(checkout, "rev-parse", "HEAD").decode().strip()
+        tree = git_output(checkout, "rev-parse", "HEAD^{tree}").decode().strip()
+        if expected_tree is None:
+            expected_tree = git_output(
+                checkout, "rev-parse", f"{attempt.get('base_sha')}^{{tree}}"
+            ).decode().strip()
+        baseline = git_tree_baseline(checkout, attempt.get("base_sha"))
+        audit = audit_write_set(checkout, baseline, [], [])
+        if (
+            head != attempt.get("base_sha")
+            or tree != expected_tree
+            or audit.get("pass") is not True
+            or audit.get("changed_paths")
+        ):
+            fail(
+                "reconciliation requires the checkout to be discarded to the exact verified baseline: "
+                f"{json.dumps(audit, sort_keys=True)}"
+            )
+        pending_effects = [
+            item.get("id") for item in state.get("operations", [])
+            if item.get("state") in ("prepared", "uncertain")
+            and Path(item.get("target", "")).expanduser().resolve() == checkout.resolve()
+        ]
+        if pending_effects:
+            fail(f"reconciliation requires all checkout effects to be resolved: {pending_effects}")
+        other_open = [
+            item.get("id") for item in state.get("attempts", [])
+            if item.get("id") != attempt_id
+            and item.get("subject_ref") == ticket_id
+            and item.get("lease", {}).get("state") in ("active", "quarantined")
+        ]
+        if other_open:
+            fail(f"reconciliation found other open same-ticket leases: {other_open}")
+
+        evidence_digest = object_store(p, evidence_raw)
+        evidence_ref = f"objects/{evidence_digest}"
+        receipt = {
+            "kind": "attempt_finalization_reconciliation",
+            "reconciliation_id": reconciliation_id,
+            "run_id": state["run_id"],
+            "ticket_id": ticket_id,
+            "attempt_id": attempt_id,
+            "source_revision": state["revision"],
+            "source_ledger_hash": sha256_bytes(previous_raw),
+            "original_finalization_ref": finalization_ref,
+            "reconciliation_evidence_ref": evidence_ref,
+            "reconciliation_evidence_hash": evidence_digest,
+            "checkout": str(checkout),
+            "base_sha": attempt.get("base_sha"),
+            "observed_head": head,
+            "observed_tree": tree,
+            "write_set_audit": audit,
+            "prior_candidate_ref": prior_candidate_ref,
+            "lease_before": "quarantined",
+            "lease_after": "released",
+            "decision": "RELEASE_VERIFIED_BASELINE",
+            "disposition": (
+                "prior_candidate_retained" if prior_candidate_ref else "verified_baseline_retry"
+            ),
+            "owner_epoch": state.get("owner", {}).get("epoch"),
+        }
+        receipt_digest = object_store(p, canonical_bytes(receipt))
+        receipt_ref = f"objects/{receipt_digest}"
+        attempt["lease"]["state"] = "released"
+        attempt["finalization_reconciliation_ref"] = receipt_ref
+
+        resolved_issue_refs: set[str] = set()
+        for issue in state.get("issues", []):
+            if (
+                issue.get("source_ref") == attempt_id
+                and issue.get("type") in ("attempt_termination", "write_set_violation")
+                and not issue.get("invalidated_by")
+            ):
+                issue["impact"] = "advisory"
+                issue["disposition"] = f"resolved by {reconciliation_id}"
+                issue.setdefault("invalidated_by", []).append(reconciliation_id)
+                resolved_issue_refs.add(issue["id"])
+        state["lifecycle"]["issue_refs"] = [
+            ref for ref in state["lifecycle"].get("issue_refs", [])
+            if ref not in resolved_issue_refs
+        ]
+        state.setdefault("decisions", []).append({
+            "id": reconciliation_id,
+            "type": "attempt_finalization_reconciliation",
+            "status": "applied",
+            "decision": "RELEASE_VERIFIED_BASELINE",
+            "reason": "writer stop and exact baseline cleanup were proven after quarantine",
+            "evidence_refs": [finalization_ref, evidence_ref, receipt_ref],
+            "affected_refs": [ticket_id, attempt_id],
+            "intent_revision": state.get("intent", {}).get("current_revision"),
+            "invalidated_by": [],
+        })
+        state.setdefault("evidence", []).append({
+            "id": f"ev-attempt-reconciled-{receipt_digest[:16]}",
+            "hash": receipt_digest,
+            "source": "attempt_finalization_reconciliation",
+            "scenario": attempt.get("state"),
+            "outcome": receipt["disposition"],
+            "observer": "ledger-helper",
+            "subject": attempt_id,
+        })
+        ticket["current_worker_attempt"] = None
+        if prior_candidate_ref:
+            ticket["state"] = "BLOCKED"
+            state["lifecycle"]["control"] = "BLOCKED"
+            state["lifecycle"]["reason"] = "attempt_finalized_prior_candidate"
+            next_action = {
+                "kind": "authorize_repair",
+                "subject_refs": [ticket_id, attempt_id],
+                "preconditions": ["retain the explicit prior candidate quality", "use a fresh attempt ID"],
+                "read_refs": ["phases/execute.md", "references/ledger.md"],
+            }
+        else:
+            ticket["state"] = "READY"
+            state["lifecycle"]["control"] = "ACTIVE"
+            state["lifecycle"]["reason"] = "attempt_finalized_no_candidate"
+            next_action = {
+                "kind": "retry_changed_attempt",
+                "subject_refs": [ticket_id, attempt_id],
+                "preconditions": ["use the verified baseline", "change the attempt plan", "use a fresh attempt ID"],
+                "read_refs": ["phases/execute.md", "references/ledger.md"],
+            }
+        state["lifecycle"]["next_action"] = next_action
+        state["revision"] += 1
+        state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        state["updated_at"] = now()
+        publish(p, state, previous_raw, "attempt-finalization-reconciled")
+        return {
+            "reconciled": True,
+            "idempotent": False,
+            "attempt_id": attempt_id,
+            "disposition": receipt["disposition"],
+            "receipt_ref": receipt_ref,
+            "revision": state["revision"],
+            "next_action": state["lifecycle"]["next_action"],
+        }
+
+
 def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any]:
     """Reconcile one legacy create-only repair lease without weakening quarantine."""
     p = paths(args.control_root, args.run_id)
@@ -5317,8 +6426,7 @@ def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any
     }
 
     with Lock(p["lock"]):
-        state, previous_raw = load_mutation_state(p, args.owner_token)
-        admit_event(state, "attempt.reconcile")
+        state, previous_raw = load_state(p)
         if state["owner"]["token"] != args.owner_token:
             fail("owner token mismatch; stale orchestrator is fenced")
         attempt = attempt_by_id(state, attempt_id)
@@ -5326,18 +6434,31 @@ def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any
         if existing_ref:
             existing = stored_payload(p, existing_ref, "quarantine reconciliation receipt")
             observed_binding = {key: existing.get(key) for key in base_binding}
+            prior = next((item for item in state.get("attempts", []) if item.get("id") == prior_attempt_id), None)
+            decision = next((item for item in state.get("decisions", []) if item.get("id") == reconciliation_id), None)
             baseline_matches = (
                 existing.get("baseline_sha256") == baseline_hash
                 if baseline_hash is not None
                 else existing.get("baseline_source") == "git_base"
             )
-            if observed_binding != base_binding or not baseline_matches:
-                fail("quarantined attempt was already reconciled with different evidence")
+            expected_decision = {
+                "id": reconciliation_id,
+                "type": "quarantine_reconciliation",
+                "status": "applied",
+                "decision": "RECONCILE",
+                "evidence_refs": [finding_ref, existing.get("baseline_ref"), existing_ref],
+                "affected_refs": [ticket_id, attempt_id, prior_attempt_id, finding_ref],
+            }
             if (
-                attempt.get("lease", {}).get("state") != "active"
-                or not any(item.get("id") == reconciliation_id and item.get("type") == "quarantine_reconciliation" for item in state.get("decisions", []))
+                observed_binding != base_binding
+                or not baseline_matches
+                or existing.get("kind") != "quarantined_attempt_reconciliation"
+                or attempt.get("quarantine_reconciliation_ref") != existing_ref
+                or prior is None
+                or decision is None
+                or any(decision.get(key) != value for key, value in expected_decision.items())
             ):
-                fail("quarantine reconciliation receipt exists but ledger effects are incomplete")
+                fail("quarantined attempt was already reconciled with different evidence")
             return {
                 "reconciled": True,
                 "idempotent": True,
@@ -5346,6 +6467,8 @@ def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any
                 "receipt_ref": existing_ref,
                 "revision": state["revision"],
             }
+        state, previous_raw = load_mutation_state(p, args.owner_token, verified=(state, previous_raw))
+        admit_event(state, "attempt.reconcile")
         if state["revision"] != args.revision:
             fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
@@ -7135,8 +8258,11 @@ def build_parser() -> argparse.ArgumentParser:
     ingest = sub.add_parser("ingest-return"); ingest.add_argument("--control-root", required=True); ingest.add_argument("--run-id", required=True); ingest.add_argument("--owner-token", required=True); ingest.add_argument("--revision", type=int, required=True); ingest.add_argument("--attempt-id", required=True); ingest.add_argument("--return-file", required=True); ingest.add_argument("--kind", default="worker")
     dispatch = sub.add_parser("dispatch"); dispatch.add_argument("--control-root", required=True); dispatch.add_argument("--run-id", required=True); dispatch.add_argument("--owner-token", required=True); dispatch.add_argument("--revision", type=int, required=True); dispatch.add_argument("--ticket-id", required=True); dispatch.add_argument("--attempt-id", required=True); dispatch.add_argument("--lease-id", required=True); dispatch.add_argument("--route-id", required=True); dispatch.add_argument("--packet", required=True); dispatch.add_argument("--route")
     ready = sub.add_parser("ready-ticket"); ready.add_argument("--control-root", required=True); ready.add_argument("--run-id", required=True); ready.add_argument("--owner-token", required=True); ready.add_argument("--revision", type=int, required=True); ready.add_argument("--ticket-id", required=True)
-    repair = sub.add_parser("authorize-repair"); repair.add_argument("--control-root", required=True); repair.add_argument("--run-id", required=True); repair.add_argument("--owner-token", required=True); repair.add_argument("--revision", type=int, required=True); repair.add_argument("--ticket-id", required=True); repair.add_argument("--finding-ref", required=True); repair.add_argument("--authorization-id", required=True); repair.add_argument("--repair-contract", required=True)
+    repair = sub.add_parser("authorize-repair"); repair.add_argument("--control-root", required=True); repair.add_argument("--run-id", required=True); repair.add_argument("--owner-token", required=True); repair.add_argument("--revision", type=int, required=True); repair.add_argument("--ticket-id", required=True); repair.add_argument("--finding-ref"); repair.add_argument("--authorization-id", required=True); repair.add_argument("--repair-contract", required=True); repair.add_argument("--packet"); repair.add_argument("--route-id"); repair.add_argument("--route")
+    revoke_repair = sub.add_parser("revoke-repair"); revoke_repair.add_argument("--control-root", required=True); revoke_repair.add_argument("--run-id", required=True); revoke_repair.add_argument("--owner-token", required=True); revoke_repair.add_argument("--revision", type=int, required=True); revoke_repair.add_argument("--authorization-id", required=True); revoke_repair.add_argument("--revocation-id", required=True); revoke_repair.add_argument("--reason", required=True)
     close_blocked = sub.add_parser("close-blocked-attempt", aliases=["restore-last-validated-candidate"]); close_blocked.add_argument("--control-root", required=True); close_blocked.add_argument("--run-id", required=True); close_blocked.add_argument("--owner-token", required=True); close_blocked.add_argument("--revision", type=int, required=True); close_blocked.add_argument("--ticket-id", required=True); close_blocked.add_argument("--attempt-id", required=True)
+    finalize_attempt = sub.add_parser("finalize-attempt"); finalize_attempt.add_argument("--control-root", required=True); finalize_attempt.add_argument("--run-id", required=True); finalize_attempt.add_argument("--owner-token", required=True); finalize_attempt.add_argument("--revision", type=int, required=True); finalize_attempt.add_argument("--ticket-id", required=True); finalize_attempt.add_argument("--attempt-id", required=True)
+    reconcile_finalized = sub.add_parser("reconcile-finalized-attempt"); reconcile_finalized.add_argument("--control-root", required=True); reconcile_finalized.add_argument("--run-id", required=True); reconcile_finalized.add_argument("--owner-token", required=True); reconcile_finalized.add_argument("--revision", type=int, required=True); reconcile_finalized.add_argument("--ticket-id", required=True); reconcile_finalized.add_argument("--attempt-id", required=True); reconcile_finalized.add_argument("--evidence", required=True)
     reconcile_quarantine = sub.add_parser("reconcile-quarantined-attempt"); reconcile_quarantine.add_argument("--control-root", required=True); reconcile_quarantine.add_argument("--run-id", required=True); reconcile_quarantine.add_argument("--owner-token", required=True); reconcile_quarantine.add_argument("--revision", type=int, required=True); reconcile_quarantine.add_argument("--ticket-id", required=True); reconcile_quarantine.add_argument("--attempt-id", required=True); reconcile_quarantine.add_argument("--prior-attempt-id", required=True); reconcile_quarantine.add_argument("--finding-ref", required=True); reconcile_quarantine.add_argument("--candidate-sha", required=True); reconcile_quarantine.add_argument("--base-sha", required=True); reconcile_quarantine.add_argument("--baseline", help="optional pre-attempt manifest; omitted means derive the complete baseline from the exact Git base tree"); reconcile_quarantine.add_argument("--reconciliation-id", required=True); reconcile_quarantine.add_argument("--actor", required=True)
     terminate = sub.add_parser("terminate-attempt"); terminate.add_argument("--control-root", required=True); terminate.add_argument("--run-id", required=True); terminate.add_argument("--owner-token", required=True); terminate.add_argument("--revision", type=int, required=True); terminate.add_argument("--attempt-id", required=True); terminate.add_argument("--state", choices=["LOST", "INTERRUPTED"], required=True); terminate.add_argument("--lease-state", choices=["released", "quarantined"], required=True); terminate.add_argument("--evidence", required=True)
     candidate = sub.add_parser("candidate"); candidate.add_argument("--control-root", required=True); candidate.add_argument("--run-id", required=True); candidate.add_argument("--owner-token", required=True); candidate.add_argument("--revision", type=int, required=True); candidate.add_argument("--attempt-id", required=True); candidate.add_argument("--commit-receipt", required=True); candidate.add_argument("--operation-id", required=True)
@@ -7177,7 +8303,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "dispatch": result = cmd_dispatch(args)
         elif args.command == "ready-ticket": result = cmd_ready_ticket(args)
         elif args.command == "authorize-repair": result = cmd_authorize_repair(args)
+        elif args.command == "revoke-repair": result = cmd_revoke_repair(args)
         elif args.command in ("close-blocked-attempt", "restore-last-validated-candidate"): result = cmd_close_blocked_attempt(args)
+        elif args.command == "finalize-attempt": result = cmd_finalize_attempt(args)
+        elif args.command == "reconcile-finalized-attempt": result = cmd_reconcile_finalized_attempt(args)
         elif args.command == "reconcile-quarantined-attempt": result = cmd_reconcile_quarantined_attempt(args)
         elif args.command == "terminate-attempt": result = cmd_terminate_attempt(args)
         elif args.command == "candidate": result = cmd_candidate(args)

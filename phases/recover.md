@@ -22,9 +22,12 @@ Pause preserves worktree and changes. Cancel records the goal termination, prese
 Do not hand-edit a quarantined lease. A returned legacy repair attempt may be
 restored to candidate authority only through `reconcile-quarantined-attempt`
 and only for the provenance-bound same-ticket create-to-modify case documented
-in `phases/execute.md`. Lost/interrupted, stale-base, foreign-path, non-DONE,
-non-write-set, deny-listed, or incompletely evidenced quarantine is outside
-that command and remains blocked.
+in `phases/execute.md`. A general quarantine already recorded by
+`finalize-attempt` may use `reconcile-finalized-attempt` only after a later PASS
+writer-stop/cleanup receipt and a fresh audit prove the checkout is exactly the
+verified base or retained candidate. This path discards partial work; it never
+turns unknown or foreign writes into a candidate. Failed proof, stale base,
+pending effects, or incomplete cleanup remains explicitly quarantined.
 
 Use `tools/ledger.py recover` for deterministic publication. If current JSON is corrupt, validate verified previous snapshots newest-first; do not overwrite the namespace with a guessed reconstruction. Use `diagnose` for an unknown schema; it is strictly read-only. If no safe recovery exists, remain `BLOCKED` or `FAILED` after all in-flight activity is stopped; a successor run needs an explicit new scope decision.
 

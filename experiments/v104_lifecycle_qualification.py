@@ -210,7 +210,14 @@ class Qualification:
         authority_ref = "synthetic-run"
         if repair:
             state, _ = self.state()
-            authorization = next((item for item in state.get("decisions", []) if item.get("type") == "repair_authorization" and item.get("status") == "authorized" and ticket_id in item.get("affected_refs", []) and repair.get("finding_ref") in item.get("affected_refs", [])), None)
+            authorization = next((
+                item for item in state.get("decisions", [])
+                if item.get("type") == "repair_authorization"
+                and item.get("status") in ("authorized", "consumed")
+                and item.get("consumed_by") in (None, attempt_id)
+                and ticket_id in item.get("affected_refs", [])
+                and repair.get("finding_ref") in item.get("affected_refs", [])
+            ), None)
             if authorization is None:
                 raise AssertionError("repair candidate commit has no exact active authorization")
             authority_ref = authorization["id"]

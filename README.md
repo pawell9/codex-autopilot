@@ -119,8 +119,13 @@ authority to create-only zones; stale/forked candidates, foreign tickets or
 paths, broken provenance, and missing original creates remain blocked.
 
 Before `authorize-repair` moves a ticket to `READY`, it inspects the exact
-current validated candidate. If the repair continues a create-only ticket path
-as a modify, the contract must already contain a current same-ticket
+current validated candidate. A grouped contract may bind up to sixteen current
+same-ticket findings in `finding_refs[]`, with one hypothesis and expected
+proof per finding. Authorization stores a canonical `RepairPlan` plus the
+packet/route/base/epoch/write/check/risk-bound `AttemptPlan`; dispatch reruns
+the same preflight and consumes that authorization once. If the repair
+continues a create-only ticket path as a modify, the contract must already
+contain a current same-ticket
 `source_attempt_ref`; missing, foreign, and stale sources are rejected without
 publishing a ledger revision. Dispatch still requires byte-for-byte equality
 with that authorized contract. A single unused `READY` authorization created
@@ -141,6 +146,17 @@ receipt/decision/evidence record, and restores `ticket.current_attempt` so a
 fresh `authorize-repair` cycle can proceed. Dirty, stale, ambiguous,
 non-BLOCKED, already-candidate, quarantined, or otherwise open states remain
 unchanged.
+
+Use `finalize-attempt` for returned `BLOCKED`/`HANDOFF`/`FAILED` workers and
+terminated `LOST`/`INTERRUPTED` workers. Its disposition matrix combines
+writer-stop evidence, the actual Git write-set, and the explicit prior
+candidate: a clean baseline releases the lease and retains a
+`DONE`/`CONTINUATION` candidate or makes an initial ticket dispatchable from
+its verified base; useful writes are never silently promoted, and uncertain
+or foreign writes remain quarantined. If stop/cleanup proof arrives later,
+`reconcile-finalized-attempt` requires a PASS stopped-writer receipt and a new
+exact-baseline audit. Failed proof is zero-effect and exact replay remains
+valid after later progress.
 
 ## Presets
 

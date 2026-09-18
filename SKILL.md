@@ -146,7 +146,10 @@ Read `references/ledger.md` before the first state mutation or any recovery ques
 7. Materialize readiness with `ready-ticket`; dependencies must be current reviewed `INTEGRATED` outcomes. Enter repair only through `authorize-repair`. Close a no-write BLOCKED repair through `close-blocked-attempt`; preserve a proven external/out-of-scope BLOCKED/HANDOFF write-set only through owner-authorized `preserve-blocked-candidate`; close a lost/interrupted attempt through `terminate-attempt` with stop evidence and a released or quarantined lease.
 8. Never hand-release quarantine. `reconcile-quarantined-attempt` may restore
    candidate authority only for its fully proven, single-use compatibility
-   case and must leave every failed proof unchanged.
+   case. A quarantine produced by general `finalize-attempt` may be released
+   through `reconcile-finalized-attempt` only with PASS writer-stop evidence
+   and an exact audit proving disposal to the verified baseline. Every failed
+   proof leaves the ledger and quarantine unchanged.
 
 After compaction, resume, owner transfer, or doubt about the retained protocol, reread this entry, obtain a fresh `brief`, reread the current phase and its safety/recovery pointers, and only then perform a state-changing action. The summary and old conversation are hints, not authority.
 

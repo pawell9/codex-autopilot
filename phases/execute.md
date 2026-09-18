@@ -71,6 +71,15 @@ idempotent for the same evidence, and leaves every failed proof quarantined.
 
 Retry only after a confirmed transient cause and effect reconciliation. A repeat requires a changed causal input, approach, capability, or evidence and an expected distinguishing result. Repeated same-class failure first gets a diagnostic checkpoint; no arbitrary repair counter or automatic success exists. Fresh context is required after amendment, lost/context-saturated worker, or repeated causal defect after substantive repair.
 
+For every returned `BLOCKED`/`HANDOFF`/`FAILED` or terminated
+`LOST`/`INTERRUPTED` worker, use `finalize-attempt`. A clean no-change result
+retains the explicit current `DONE`/`CONTINUATION` candidate, or returns an
+initial no-candidate ticket to dispatchable `READY` at the verified base.
+Owned non-empty work still needs the continuation/candidate path; unknown stop,
+foreign writes, pending effects, or a broken base binding quarantine instead
+of fabricating success. A later clean-disposal proof uses
+`reconcile-finalized-attempt`, never a lease edit.
+
 ## G4
 
 When required tickets are current `INTEGRATED`, all leases are closed/reserved correctly, the changeset is frozen, and integration checks pass, publish G4. Any unresolved blocking issue, stale criterion, unexpected write, missing oracle, or pending effect keeps the run in `VERIFY`/`BLOCKED` as appropriate. Then route to `phases/accept.md` for G5; G4 is not final acceptance.
