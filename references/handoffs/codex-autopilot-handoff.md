@@ -1142,3 +1142,19 @@ CODEX AUTOPILOT
 - `py_compile`, contracts/lifecycle JSON parse и `git diff --check`: PASS.
 - Live Idea Scout не открывался и не изменялся; production R58 migration остаётся только Phase F.
 - Phase E не начата. Следующий шаг в новой сессии — Phase E из master hardening plan. Push не выполнялся.
+
+# 33. Durable status: v1.1.0 hardening through Phase E
+
+Актуальное состояние после завершения Phase E:
+
+- Ветка: `codex/v1.1.0-hardening`.
+- Phases A–E завершены; Phase F не начата.
+- Phase E implementation commit: `b5b5352` — immutable accepted review facts, `ReviewQualification`, purpose-separated manual review, qualification-ref integration и final-G5 repair waves.
+- Явный Phase E review принимает exact return только один раз через `ingest-return` с current-ledger/candidate/stop integrity receipt. `integrate` для нового пути принимает только `--qualification-ref`; conflicting return bytes и incomplete/BLOCK qualification не проходят.
+- `ticket_review`, `critical_axis` и `final_g5` не смешиваются с transport. Явный manual handoff требует fresh PREPARED reviewer attempt, согласованный packet kind/purpose, полный immutable export inventory, clean context, reviewer stop и exact integrity binding. Critical-axis PASS не переводит run в ACCEPT.
+- Manual BLOCK/UNVERIFIABLE создаёт durable findings/issues и repair action. Final-G5 BLOCK дополнительно создаёт OPEN repair wave; он закрывается только на другом repaired candidate после resolution source findings и fresh full final-G5 PASS. G6 связан с exact acceptance qualification и запрещён при OPEN wave.
+- Purpose-less legacy handoff/integration остаётся compatibility adapter и не повышает старые records до новой qualification автоматически.
+- Финальный suite: `181 tests in 394.893s, OK, skipped=1`. Skip — прежний документированный opt-in production-checkpoint audit. Real-Git 40-ticket qualification и v1.0.4 end-to-end qualification прошли внутри suite.
+- Focused evidence: dedicated Phase E modules `11/11`; Phase E + state-machine/legacy G6 `16/16`; isolated v1.0.4 + Phase E compatibility `12/12`. `py_compile`, оба JSON parse и `git diff --check` — PASS.
+- Live Idea Scout не открывался и не изменялся. Production R58 migration/recovery остаётся исключительно Phase F.
+- Следующая сессия начинает только Phase F из master hardening plan. Push не выполнялся.
