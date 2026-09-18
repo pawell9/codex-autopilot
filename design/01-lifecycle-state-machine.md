@@ -48,16 +48,16 @@ Compact path допустим, если весь run содержит ≤2 routi
 | User product amendment | Любая nonterminal phase после PREFLIGHT → INTENT | Quiesce affected work; current intent revision повышается; G1 и последующие affected gates пересмотрены |
 | Только runtime environment change | Phase сохраняется | Control→RECOVERING, conditional preflight; product intent не переписывается |
 
-Все иные phase jumps запрещены. Same-phase correction тоже transaction с reason; self-loop не заменяет gate. Amendment в PREFLIGHT сохраняется до INTENT. Terminal run amendment создаёт successor run.
+Все иные phase jumps запрещены. Same-phase correction тоже transaction с reason; self-loop не заменяет gate. Amendment в PREFLIGHT сохраняется до INTENT. Terminal run amendment создаёт successor в свежем namespace через `init-successor` с типизированным manifest, привязанным к точной terminal publication и принятому evidence; live attempts/reservations не переносятся.
 
 ## Control transitions
 
 | From | Event → to | Guard / exact next action |
 |---|---|---|
-| ACTIVE | pause, quota, cancellation, unsafe activity, material amendment → QUIESCING | Persist stop reason/target control; stop new dispatch; interrupt existing agents и дождаться подтверждения остановки |
+| ACTIVE | pause, quota, cancellation, unsafe activity, material amendment → QUIESCING | Persist stop reason/target control; stop new dispatch; interrupt existing agents and request external runtime stop receipts |
 | ACTIVE | missing authority/environment при отсутствии in-flight → BLOCKED | Есть конкретный blocker и условие снятия |
 | ACTIVE | detected state mismatch → RECOVERING | Freeze dispatch; только чтение/reconciliation |
-| QUIESCING | all agents/commands stopped, partial state recorded → PAUSED / BLOCKED / CANCELLED / FAILED | Цель задана событием; cancellation/failure не требуют cleanup или destructive rollback |
+| QUIESCING | all agents/commands stopped, partial state recorded → PAUSED / BLOCKED / CANCELLED / FAILED | Цель задана событием; cancellation/failure не требуют cleanup или destructive rollback. Exact receipt, not timeout/attestation, proves stop for safe reuse |
 | QUIESCING | amendment safely fenced → ACTIVE/INTENT | Новый intent принят, affected returns stale; не требуется отпускать repository ownership |
 | QUIESCING | невозможно доказать остановку → BLOCKED | Leases остаются quarantined; `agent_liveness_unknown` блокирует повторное использование checkout; точное снятие через takeover/reuse protocol в 02 |
 | PAUSED/BLOCKED | resume либо blocker resolved → RECOVERING | Нет автоматического продолжения по истечении времени |
@@ -85,12 +85,28 @@ Ticket: `PLANNED → READY → RUNNING → CANDIDATE → REVIEW → INTEGRATED`.
 
 Attempt: `PREPARED → DISPATCHED → RETURNED | LOST | INTERRUPTED`; до spawn PREPARED также может перейти в INTERRUPTED с reason `cancelled_before_dispatch` или `spawn_rejected`. RETURNED хранит role-specific structured result из [05](05-task-and-return-contracts.md): worker status, reviewer verdict либо research result. Attempt и side-effect operation — разные записи: valid return не доказывает commit/integration. Один intent helper call может последовательно validate DISPATCHED и RETURNED в одной publication при наличии matching dispatch/return evidence; отсутствие отдельного dispatch receipt не разрешает fabricated timestamps или повтор spawn. При unknown фактическом spawn применяется recovery 02.
 
+Runtime liveness and checkout reservation are orthogonal to `attempt.state`:
+the lease is only an active/quarantined/released reservation, while the
+optional per-attempt runtime record is `unknown`, `running`, `stopped`, or
+`not_started` and points to immutable, exact-bound receipts. Dispatch and
+review preparation register a stable spawn request and increment
+`attempt_registrations`; they do not spawn or increment `spawn_calls`. The
+external runtime's first valid `start` does that exactly once. The receipt
+flow is `start` → optional `heartbeat`/`return_observed` → `stop`; a return,
+timeout, missing heartbeat, or missing runtime record never implies stop.
+`not_started` is only valid when no process or return exists. Exact stop must
+cover descendant writers before candidate/review qualification or reservation
+release/reuse; otherwise liveness stays unknown and the reservation stays
+quarantined. Exact event replay is idempotent and cannot authorize a second
+spawn. These are observed external claims; the helper does not physically
+spawn, supervise, enumerate, or kill native descendants.
+
 ## Failure/event dispatch
 
 | Event | Поведение | Возобновление |
 |---|---|---|
 | Quota/context limit | Proactive checkpoint; QUIESCING→PAUSED с cause `quota`/`context`. Abrupt cutoff оставляет last committed ledger | Recovery проверяет незавершённые attempts/operations; quota availability conditional check; лимит не означает DONE |
-| Lost worker | Attempt LOST только после observation; checkout quarantine; inspect actual changes | После stop/reuse qualification по 02 новый retry/repair на проверенном base; old handle не обязателен |
+| Lost worker | Attempt outcome is recorded, but runtime stays `unknown` absent an exact stop/not-started receipt; checkout reservation remains quarantined | После exact stop/reuse qualification по 02 новый retry/repair на проверенном base; old handle не обязателен |
 | Failed verification | Classify evidence: implementation/contract/oracle/environment | Cause-first path [04](04-routing-and-escalation.md); зелёная нерелевантная suite не снимает finding |
 | Contract defect/zone missing | Ticket BLOCKED; orchestrator исправляет contract, а не worker сам расширяет scope | New version + G2/G3 affected checks + fresh packet |
 | Environment/permission failure | Block affected work; независимые safe read tasks могут продолжаться, пока control ACTIVE | Устранить tool/authority cause; model upgrade не remedy |
@@ -107,7 +123,7 @@ Pause сохраняет проект и worktree. Cancel прекращает �
 
 ## Human decision points
 
-Только material intent ambiguity; новая внешняя/необратимая/cost authority; выбор относительно пересекающихся user changes; принятие scope reduction; ручной checkpoint spec/plan/final, если потребован; attestation при abrupt recovery, когда runtime stop evidence недоступно; setup/transfer/receipt для выбранного user-assisted critical/G5 transport по [05](05-task-and-return-contracts.md#user-assisted-criticalg5-handoff). Последний — доставка независимого review, а не дополнительное user approval результата. Пока ответ необходим, dependent work не идёт. Reversible technical choices, ordinary repair, fresh worker, local branch/commit в уже разрешённом run не требуют ритуального подтверждения; runtime approval остаётся отдельным control.
+Только material intent ambiguity; новая внешняя/необратимая/cost authority; выбор относительно пересекающихся user changes; принятие scope reduction; ручной checkpoint spec/plan/final, если потребован; attestation может разрешить owner takeover при abrupt recovery, но не заменяет runtime stop receipt и не освобождает lease; setup/transfer/receipt для выбранного user-assisted critical/G5 transport по [05](05-task-and-return-contracts.md#user-assisted-criticalg5-handoff). Последний — доставка независимого review, а не дополнительное user approval результата. Пока ответ необходим, dependent work не идёт. Reversible technical choices, ordinary repair, fresh worker, local branch/commit в уже разрешённом run не требуют ритуального подтверждения; runtime approval остаётся отдельным control.
 
 ## End-to-end walkthroughs (design checks)
 

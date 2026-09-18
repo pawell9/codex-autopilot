@@ -1,6 +1,6 @@
 # Run ledger and artifacts
 
-**DECISION — OD-01, targeted revision.** JSON хранит structured orchestration state; canonical prose/spec/interfaces остаются Markdown. Один authoritative источник на каждый факт, один orchestrator writer. JSONL replay, executable JS и вручную синхронизируемые status blocks не нужны. [Adjudication](11-review-adjudication.md) объясняет изменения; runtime schema/helper создаются только после E02/E03/E04a.
+**DECISION — OD-01, targeted revision.** JSON хранит structured orchestration state; canonical prose/spec/interfaces остаются Markdown. Один authoritative источник на каждый факт, один orchestrator writer. JSONL replay, executable JS и вручную синхронизируемые status blocks не нужны. [Adjudication](11-review-adjudication.md) объясняет исходное решение; Phase G ships the ledger schema/helper protocol described below. This does not qualify native runtime spawn, supervision, or stop behavior (reserved follow-up).
 
 ## Canonical namespace
 
@@ -20,13 +20,13 @@
 
 `control-root` — постоянный canonical primary checkout из Git inventory, записанный при bootstrap. Greenfield bootstrap — [06](06-safety-write-git-model.md). Nested/bare repos не поддерживаются. Execution worktree может отличаться, ledger остаётся в control-root. Agents получают exact paths; поиск «ближайшей .autopilot» по CWD не разрешает state selection. Review/source copies располагаются по 06, вне primary source tree по умолчанию; scratch inbox не означает вложенный checkout.
 
-Run ID path-safe и exclusive. Под repository-wide `owner.lock` bootstrap проверяет отсутствие другого nonterminal run. Сначала создаётся owned namespace, затем initial ledger; до публикации product effects не запускаются. Incomplete namespace после сбоя направляется на recovery, не overwrite. Нет mutable current/index.json и альтернативного store после потери control-root. Terminal runs read-only.
+Run ID path-safe и exclusive. Repository-identity owner registry plus lock allows only one nonterminal owner. Bootstrap checks for another nonterminal run before publishing. For a new scope after a terminal run, `init-successor` creates a fresh namespace from a schema-validated manifest bound to the exact predecessor control root/run/revision/terminal status/ledger hash. It records accepted decisions/qualifications, scope authority, candidate/resources, unknowns, and explicitly excludes attempts, live reservations, repair authorizations, and current pointers. A fresh owner token is required. First-time bootstrap creates the owned namespace and initial ledger; no product effect precedes publication. Incomplete namespace after failure is recovered, not overwritten. Нет mutable current/index.json и альтернативного store после потери control-root. Terminal runs read-only.
 
 `.autopilot` исключён из product commits exact path lists. Bootstrap с имеющейся scope authority добавляет только собственную строку `.autopilot/` в resolved `.git/info/exclude`, сохраняя остальные bytes; runtime permission обрабатывается по 06. При denied exclusion фиксируется ограничение, scoped staging остаётся обязательным. `.gitignore` не редактируется автоматически. Tracked/legacy/foreign `.autopilot` требует namespace/migration решения. Exclude не backup: `git clean -fdx`/`git stash --all` и удаление checkout могут удалить/переместить state. До exclusion `stash -u` также затрагивает untracked state. Report сообщает canonical path и эти конкретные ограничения; remote backup не обещается.
 
 ## Schema and authority
 
-Будущая `schemas/contracts.schema.json` — structural SSOT, versioned definitions для ledger/packet/return/review/acceptance. Runtime helper на Python stdlib проверяет только используемый закрытый subset: types, required/unknown fields, enums, refs, arrays/maps и discriminated branches. Неизвестный keyword/schema version → diagnostic без writes; general JSON Schema engine не строится. Dev-time oracle и parity fixtures проверяют subset. Semantic checks: IDs/refs, DAG, gates, owner/epoch, lease, legal transitions и evidence hashes.
+`schemas/contracts.schema.json` is the shipped structural SSOT with versioned definitions for ledger/packet/return/review/acceptance and typed runtime observations. The Python stdlib helper checks the supported closed subset: types, required/unknown fields, enums, refs, arrays/maps, and discriminated branches. Unknown keyword/schema version → read-only diagnostic; no general JSON Schema engine. Dev-time oracle/parity fixtures check the subset. Semantic checks include IDs/refs, DAG, gates, owner/epoch, reservation/liveness boundaries, legal transitions, and evidence hashes.
 
 - Envelope: `schema_version`, `run_id`, `revision`, previous publication hash, timestamps UTC, skill/policy versions. Monotonic revision задаёт порядок; timestamp не stop proof.
 - Unknown major/minor принимается только явно совместимым validator; migration — отдельное versioned действие с backup. Legacy JS import вне V1.
@@ -45,7 +45,7 @@ Run ID path-safe и exclusive. Под repository-wide `owner.lock` bootstrap п�
 | `requirements`, `criteria`, `contracts` | IDs/version/status, provenance/document section refs and hashes, criterion membership, producer/consumer/dependency refs. Exact wording/oracle/signatures в canonical Markdown; packet включает нужный exact slice |
 | `decisions` | ID/type/status, concise decision/reason, authority/evidence refs, affected refs, introduced revision, supersession; large rationale → doc ref |
 | `tickets` | ID/goal ref, criteria/contracts/dependencies, state, verification ref, risk/complexity, versioned `zone` (literal paths/operations/denies), current attempt, replacement refs |
-| `attempts` | ID/kind/mode/subject, packet ref/hash, epoch, state из 01, route ref, exact `checkout`/base/candidate SHA, timestamps/handle observation; embedded `lease` (ID, frozen scope, active/quarantined/released); return ref; repair cause/finding/hypothesis/regression refs; handoff completed/remaining/next action when needed |
+| `attempts` | ID/kind/mode/subject, packet ref/hash, epoch, state из 01, route ref, exact `checkout`/base/candidate SHA, immutable execution binding/hash; optional runtime record with stable spawn request, liveness, runtime instance and observation refs; embedded lease is a separate reservation (ID, frozen scope, active/quarantined/released); return ref; repair cause/finding/hypothesis/regression refs; handoff completed/remaining/next action when needed |
 | `issues` | ID/type/cause, affected refs, blocking/advisory impact, expected/actual evidence, disposition, resolution condition/owner. Unverifiable criterion не превращается в PASS при accepted risk |
 | `reviews`, `acceptance` | mandate/subject SHA or doc hashes, context/isolation fact refs, verdict and immutable return refs; findings promoted to issues once; acceptance rounds reference exact intent/candidate, per-criterion outcome evidence and optional human decision |
 | `operations` | Только dangerous-to-repeat effects: ID/kind/target/expected_before/intended_after/authority, prepared/applied/abandoned/uncertain, receipt/evidence refs |
@@ -62,7 +62,39 @@ Orchestrator пишет новую immutable Markdown revision в docs, helper �
 
 Views содержат run ID/source revision/hash/generated marker, регенерируются по status/report и gate, не на каждой transaction. Drift view не меняет intent. Потеря view не блокирует чтение canonical docs.
 
-Successor intake читает final report, approved contracts и decisions последнего релевантного ACCEPTED run по repository identity/явной ссылке. Их refs/hashes становятся prior decisions; current user intent выше. Несовместимое прежнее решение явно superseded. Missing prior artifacts отмечаются unknown; material gap решается targeted read/question, не выдуманной памятью. Экспорт в project docs — отдельный requested deliverable; AGENTS не обновляется.
+Successor intake is not an informal read-only convention: `init-successor` verifies the schema-validated manifest against one exact, terminal, quiescent predecessor publication under predecessor/repository/target locks, stores the manifest by hash in the new ledger, claims fresh repository ownership, and initializes a clean run namespace. Current user intent remains higher authority; unavailable prior artifacts stay explicitly unknown. Экспорт в project docs — отдельный requested deliverable; AGENTS не обновляется.
+
+## Runtime observation protocol (Phase G)
+
+`dispatch`, `prepare-review`, and `prepare-design-review` register an attempt,
+freeze its execution binding (exact checkout/base, intent/publication,
+criteria/contracts/route and packet), create a stable `spawn_request_id`, and
+increment `attempt_registrations`. Registration is not a native spawn and does
+not increment `spawn_calls`. The external adapter is responsible for using
+that ID once and reporting immutable receipts through `observe-runtime`:
+`start`, optional `heartbeat`, `return_observed`, `stop`, or `not_started`.
+Only the first valid `start` increments `spawn_calls`; a registration replay
+returns `existing_request_do_not_spawn_again`, while exact start receipt replay
+returns `already_observed; do_not_spawn_again`. Event-ID reuse with different
+bytes is rejected.
+
+Each receipt binds run/attempt/epoch/packet/spawn request/runtime instance and
+records event ID, observation time, observer/build, and coverage. `start`
+sets `running`; heartbeat does not refresh or expire a lease. `return_observed`
+binds the exact return hash but does not mean stop. `stop` requires the exact
+instance and `descendant_writers=included`. `not_started` is only valid for an
+unstarted request with no runtime instance or return. Timeout, missing
+heartbeat/handle, user attestation, and process scans never infer stop; legacy
+attempts without a runtime record remain readable as explicitly `unknown`.
+The checkout lease is a reservation, not a producer-liveness signal. Safe
+candidate/review qualification, release, and reuse require exact `stop` or
+valid `not_started` evidence; otherwise the reservation remains quarantined.
+
+The helper validates, hashes, and persists an external observation; it does
+not spawn, supervise, enumerate, or kill native processes/descendants. The
+receipt's observer and declared descendant coverage are therefore a trust
+boundary. Phase G ships deterministic protocol/state transitions, not native
+runtime qualification or conformance.
 
 ## Return ingress
 
@@ -78,9 +110,9 @@ Helper — единственный writer ledger; orchestrator вызывает
 
 | Command | Один model intent / completion |
 |---|---|
-| `dispatch` | Validate readiness + route, lease/attempt, packet, short brief; persist PREPARED before native spawn |
-| `candidate` | Ingest worker return и dispatch handle observation, stop/write audit, prepare candidate Git action; разрешённый commit с receipt, freeze SHA, prepare reviewer packet/attempt в одном intent |
-| `integrate` | Ingest review return(s), integrity barrier, issue adjudication refs, current PASS checks; publish INTEGRATED, release lease reservation, next_action |
+| `dispatch` | Validate readiness + route, reserve checkout, freeze execution binding, register attempt/packet, return stable spawn ID; external runtime spawn follows once |
+| `candidate` | Ingest worker return and exact runtime stop/not-started proof, run write-set audit, prepare candidate Git action; approved commit with receipt, freeze SHA, register reviewer request in one intent |
+| `integrate` | Ingest review return(s) plus exact reviewer stop/not-started receipt, integrity barrier, issue adjudication refs, current PASS checks; publish INTEGRATED and release reservation only under the runtime gate |
 | `gate` / `amend` / `recover` | Compound subject updates, evidence refs, invalidation и next action; details co-located in respective phase |
 | `brief` / `status` | Bounded read projection без full history; brief также возвращается mutation commands |
 
@@ -90,7 +122,7 @@ Helper не вызывает модели, не держит agent loop/daemon �
 
 ## Side effects and crash reconciliation
 
-Prepared/applied journal только для commits, init/branch/worktree changes, landing, scoped rollback/cleanup и других действий, опасных при повторе. Pure reads, projections, return ingest — ordinary atomic state. Dispatch — attempt PREPARED до spawn, handle/status observation при следующем intent; потерянный handle не повод повторить spawn. Background writing command должен быть в attempt resource inventory.
+Prepared/applied journal только для commits, init/branch/worktree changes, landing, scoped rollback/cleanup и других действий, опасных при повторе. Pure reads, projections, return/runtime observation ingest — ordinary atomic state. Dispatch durably registers PREPARED and its stable spawn request before external spawn; dispatch replay explicitly does not authorize another spawn. Exact event replay is idempotent. A lost handle, timeout, or absent heartbeat leaves runtime `unknown`; only a later exact typed stop/not-started receipt can release the reservation. Background writing command must be included in the attempt resource inventory/runtime stop coverage.
 
 | Crash window | Recovery |
 |---|---|
@@ -100,7 +132,7 @@ Prepared/applied journal только для commits, init/branch/worktree chang
 | Partial effect / foreign drift | uncertain, target quarantine, preserve evidence; exact repair/authority resolution |
 | Receipt exists, view stale | Regenerate view, effect не повторять |
 | Current JSON corrupt | Validate prev/selected snapshots newest-first; восстановить лишь verified committed publication, reconcile все actual effects после неё |
-| Spawn happened, handle/return missing | PREPARED/DISPATCHED с unknown liveness; inventory/inbox/stop reconciliation ниже; no duplicate spawn |
+| Spawn may have happened, handle/return missing | Keep PREPARED/DISPATCHED liveness `unknown`; reconcile with the external adapter and exact stable spawn ID; do not spawn again. No heartbeat/timeout is not stop proof; keep the reservation quarantined until typed stop/not-started receipt |
 
 V1 не обещает exactly-once execution и не создаёт distributed transaction framework. Git candidate commit предшествует review; `candidate` completion не означает INTEGRATED (06).
 
@@ -108,10 +140,10 @@ V1 не обещает exactly-once execution и не создаёт distributed
 
 Cooperative threat model: lock/epoch защищают helper writes от stale orchestrator, но не останавливают старые processes или прямые filesystem writes. Owner takeover и разрешение product writes — разные решения.
 
-1. Прочитать entry/recover, repository identity, current/prev snapshot; получить lock. Planned transfer использует old owner handoff-ready и resource inventory. Abrupt loss использует runtime-confirmed owner stop либо explicit user attestation, что прежняя сессия закрыта и takeover нужен. Attestation и scope сохраняются evidence; одного возраста ledger недостаточно. Затем epoch++/new token, control RECOVERING, old attempts fenced, leases quarantined.
-2. Сопоставить attempts/commands с доступными runtime handles/process/session observations. Подтверждённо живые задачи остановить штатным control и получить completion. Отсутствующий UI/handle не доказательство остановки. E02 квалифицирует fate of children/descendant tools при parent interruption по конкретному build; вывод не переносится между разными failure modes.
-3. **Reuse guard:** достаточно runtime-confirmed stop всей writing activity; либо user attestation о завершении старой сессии **и её background writers** плюс доступные corroborating observations без противоречий. Проверить scoped process inventory и два checkout fingerprints через короткое bounded observation window из E02. `ps`/`lsof`/тишина файлов — только corroboration; negative scan с unknown coverage не называется доказательством. При attestation только о закрытом окне запросить точное недостающее подтверждение остановки writers; до него писать product нельзя.
-4. Если известный writer остаётся или attestation отсутствует, reuse BLOCKED. Report называет attempt/checkout и действие: stop old runtime/background work, подтвердить остановку, повторить recovery. При невозможности установить это — сохранить старый target quarantined; отдельный successor в новой isolated repository copy возможен лишь как явное новое scope решение, не автоматический duplicate run/worktree в shared common-dir.
+1. Прочитать entry/recover, repository identity, current/prev snapshot; получить lock. Planned transfer использует old owner handoff-ready и resource inventory. Abrupt loss может требовать explicit user attestation, чтобы разрешить owner takeover; attestation/scope сохраняются как authority evidence, но не являются runtime stop evidence. Затем epoch++/new token, control RECOVERING, old attempts fenced, checkout reservations quarantined.
+2. Сопоставить attempts/commands с доступными runtime handles/process/session observations. Внешний runtime adapter, а не helper, сообщает exact attempt-bound `stop`/`not_started` через `observe-runtime`; `return_observed` фиксирует return hash, но не liveness stop. Missing UI/handle, timeout, отсутствие heartbeat, epoch change и user attestation не доказывают termination. Receipt must bind runtime instance and declare descendant writers included.
+3. **Reuse guard:** только exact typed stop receipt с coverage `descendant_writers=included` либо допустимый `not_started` receipt для попытки без instance/return, плюс свежий checkout audit. `ps`/`lsof`/тишина файлов и user attestations могут быть corroborating/ownership evidence, не machine guard. Если typed receipt отсутствует или coverage unknown/excluded, process liveness remains unknown, reservation stays quarantined, and candidate/review qualification or checkout reuse is blocked.
+4. Отчёт называет attempt/checkout и точное недостающее событие/action для runtime adapter. Не создавай duplicate execution при потере handle: exact registration replay returns no-spawn disposition. При невозможности получить stop receipt — сохранить старый target quarantined; отдельный successor scope требует fresh run namespace, accepted scope manifest and `init-successor`, не автоматический duplicate run/worktree в shared common-dir.
 5. После reuse guard audit actual tracked/untracked/ignored changes и foreign baseline, reconcile operations и ready inbox. Вернувшийся старый epoch payload — historical evidence; новый owner может принять факты только после нового audit/version checks, не старую authority. Partial product repair выполняет новый worker.
 6. Validate docs/evidence/capability fingerprints; invalidate stale gates. Publish recovery result и exact next action на earliest invalid gate, re-ground по 08, затем ACTIVE. Unknown schema → read-only migration diagnostic.
 
@@ -126,10 +158,11 @@ Default retention: последние 8 **unpinned** recovery snapshots плюс
 ## Structural happy path
 
 ```text
-1 dispatch(T02): route + A02 PREPARED + lease + packet, native spawn follows
-2 candidate(T02, inbox): ingest DONE + audit; OP9 prepared → Git C → receipt;
-  T02 CANDIDATE/REVIEW, RV02 PREPARED on C, native reviewer follows
-3 integrate(T02, review inbox): stopped reviewer + integrity + PASS on C;
+1 dispatch(T02): route + A02 PREPARED + reservation + packet/binding + stable spawn ID;
+  external runtime starts that ID once and publishes start receipt
+2 candidate(T02, inbox): ingest DONE + exact worker stop receipt + audit;
+  OP9 prepared → Git C → receipt; register RV02 on C; reviewer starts once
+3 integrate(T02, review inbox): exact reviewer stop receipt + integrity + PASS on C;
   T02 INTEGRATED, next_action ready work
 ```
 

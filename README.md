@@ -71,6 +71,29 @@ versions, epoch, and publication revision; G2/G3 cannot pass on provisional
 files. Same-byte retries recover safely after a crash, while conflicting or
 stale inputs leave canonical state unchanged.
 
+Repository ownership is exclusive across runs. A changed scope after a
+terminal run starts in a fresh namespace with `init-successor` and a
+schema-validated successor manifest binding the exact terminal predecessor,
+accepted evidence, resources, and explicit exclusions. It does not copy live
+attempts or reservations. Worker dispatch/review preparation registers an
+attempt and returns a stable `spawn_request_id`; it is not itself a native
+spawn. The runtime adapter uses that ID once and records `start`, optional
+`heartbeat`/`return_observed`, and exact `stop` (or `not_started`) receipts via
+`observe-runtime`. Only the first valid `start` increments `spawn_calls`;
+registration increments `attempt_registrations`. Exact replay reports an
+already-observed disposition and never authorizes another spawn.
+
+Checkout leases are reservations, separate from producer liveness. Missing
+runtime records and absent heartbeats/timeouts remain `unknown`; a return is
+not proof of stop. Candidate/review qualification and reservation release or
+reuse require an exact stop receipt covering descendant writers, or an exact
+`not_started` receipt where no process/return could exist. Legacy attempts
+remain readable but fail closed for those mutations. Phase G persists and
+validates external runtime observations; the helper does not itself spawn,
+supervise, enumerate, or kill native processes. Physical stop is only as
+trustworthy as the external runtime receipt and its declared coverage; native
+runtime qualification is not complete here.
+
 Legacy nonterminal runs that have intent prose but no structured
 `requirements[]`/`criteria[]` use `adopt-requirements` with an explicit
 schema-validated manifest. The command never infers records from prose. It
@@ -140,8 +163,9 @@ it derives the immediately preceding validated same-ticket candidate, requires
 the blocked attempt base and stored repair provenance to point to it, verifies
 the exact BLOCKED return declares `files=[]` and has no candidate, and audits
 the exact checkout against that Git candidate with no tracked, untracked,
-ignored, type, mode, rename, or symlink delta. It then releases only that active
-lease, preserves the attempt and return, appends a hash-addressed closure
+ignored, type, mode, rename, or symlink delta. Because the attempt has a
+return, it also requires an exact typed stop receipt before releasing only that reservation, preserves the
+attempt and return, appends a hash-addressed closure
 receipt/decision/evidence record, and restores `ticket.current_attempt` so a
 fresh `authorize-repair` cycle can proceed. Dirty, stale, ambiguous,
 non-BLOCKED, already-candidate, quarantined, or otherwise open states remain
@@ -149,13 +173,15 @@ unchanged.
 
 Use `finalize-attempt` for returned `BLOCKED`/`HANDOFF`/`FAILED` workers and
 terminated `LOST`/`INTERRUPTED` workers. Its disposition matrix combines
-writer-stop evidence, the actual Git write-set, and the explicit prior
-candidate: a clean baseline releases the lease and retains a
+exact typed runtime stop evidence for returned producers (`not_started` only
+when no process or return exists), the actual Git write-set, and
+the explicit prior candidate: a clean baseline releases the reservation and retains a
 `DONE`/`CONTINUATION` candidate or makes an initial ticket dispatchable from
 its verified base; useful writes are never silently promoted, and uncertain
 or foreign writes remain quarantined. If stop/cleanup proof arrives later,
-`reconcile-finalized-attempt` requires a PASS stopped-writer receipt and a new
-exact-baseline audit. Failed proof is zero-effect and exact replay remains
+`reconcile-finalized-attempt` requires an exact runtime stop receipt covering
+descendant writers (or `not_started` only where no process/return exists) and a new exact-baseline audit. Failed
+proof is zero-effect and exact replay remains
 valid after later progress.
 
 ## Presets

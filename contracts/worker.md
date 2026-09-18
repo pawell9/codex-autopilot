@@ -22,4 +22,13 @@ Return one JSON object matching `schemas/contracts.schema.json` with `status` `D
 
 Write to the exact `return_target` inbox through a sibling temp file, flush/close, and atomic-rename to `return.json`; then stop writing and send the short attempt/status/path message. If only message transport is qualified, return the exact structured object without prose substitution. Never create ledger records or treat a path/hash as trusted until the helper ingests it.
 
+The worker does not create runtime observations or decide its own liveness.
+Return publication and process stop are separate events: a completed return,
+missing handle, timeout, or absent heartbeat is not proof that the worker or
+descendant writers stopped. The orchestrator/runtime adapter records exact
+attempt-bound `return_observed` and `stop` receipts; the stop observation must
+declare descendant writers `included` before the reserved checkout may be
+reused. A `not_started` receipt is only for an attempt that never produced a
+process or return.
+
 **Completion:** the return is schema-valid, bounded, matching the attempt, explicit about not-run/unverifiable work, and sufficient for cause-first triage without granting integration authority.
