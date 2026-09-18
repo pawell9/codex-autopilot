@@ -8,6 +8,7 @@ same base/tree/write-set proof required from an ordinary production candidate.
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -36,8 +37,17 @@ def cli(*args: str, expect: int = 0) -> dict[str, object]:
     return json.loads(output) if output else {}
 
 
-def observe_runtime(control: Path, paths: dict[str, Path], run_id: str, attempt_id: str, event: str, event_id: str, *, instance: str) -> None:
-    state, _ = ledger.load_state(paths)
+def observe_runtime(control: Path, paths: dict[str, Path], run_id: str, attempt_id: str, event: str, event_id: str, *, instance: str, state: dict[str, object], revision: int | None = None) -> dict[str, object]:
+    """Publish one typed runtime observation through the production handler.
+
+    The surrounding qualification already owns a validated state snapshot, so
+    reuse it to bind the immutable receipt and expected revision.  Calling the
+    command handler directly avoids starting a fresh Python interpreter for
+    each start/stop event; the handler still performs its normal lock, CAS,
+    validation, content-addressed persistence, and durable ledger publication.
+    Each observation remains its own publication, with the stop event fenced
+    by the revision returned from its paired start event.
+    """
     attempt = ledger.attempt_by_id(state, attempt_id)
     receipt = {
         "kind": "runtime_observation", "event_id": event_id, "event": event,
@@ -49,9 +59,12 @@ def observe_runtime(control: Path, paths: dict[str, Path], run_id: str, attempt_
     }
     event_path = paths["run"] / f"{event_id}.json"
     write_json(event_path, receipt)
-    cli("observe-runtime", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner",
-        "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--event", event,
-        "--event-id", event_id, "--event-file", str(event_path))
+    return ledger.cmd_observe_runtime(argparse.Namespace(
+        control_root=str(control), run_id=run_id, owner_token="owner",
+        revision=state["revision"] if revision is None else revision,
+        attempt_id=attempt_id, event=event, event_id=event_id,
+        event_file=str(event_path),
+    ))
 
 
 def ticket_id(index: int) -> str:
@@ -186,9 +199,13 @@ def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, obj
     state, _ = ledger.load_state(paths)
     attempt = next(item for item in state["attempts"] if item["id"] == attempt_id)
     runtime_instance = f"runtime-{attempt_id}"
-    observe_runtime(control, paths, run_id, attempt_id, "start", f"OBS-{attempt_id}-START", instance=runtime_instance)
-    observe_runtime(control, paths, run_id, attempt_id, "stop", f"OBS-{attempt_id}-STOP", instance=runtime_instance)
-    state, _ = ledger.load_state(paths)
+    runtime_started = observe_runtime(control, paths, run_id, attempt_id, "start", f"OBS-{attempt_id}-START", instance=runtime_instance, state=state)
+    runtime_stopped = observe_runtime(control, paths, run_id, attempt_id, "stop", f"OBS-{attempt_id}-STOP", instance=runtime_instance, state=state, revision=int(runtime_started["revision"]))
+    # The observation handler has already validated and durably published both
+    # events. Carry its exact resulting CAS revision forward; packet identity
+    # is immutable across the pair, so a second full-ledger validation here is
+    # redundant.
+    state["revision"] = runtime_stopped["revision"]
     attempt = next(item for item in state["attempts"] if item["id"] == attempt_id)
     inbox = paths["scratch"] / attempt_id / "return.json"
     relative_path = f"fixture/{ticket['id']}.txt"
@@ -225,9 +242,14 @@ def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, obj
     state, raw = ledger.load_state(paths)
     review_attempt = next(item for item in state["attempts"] if item["id"] == review_attempt_id)
     review_runtime_instance = f"runtime-{review_attempt_id}"
-    observe_runtime(control, paths, run_id, review_attempt_id, "start", f"OBS-{review_attempt_id}-START", instance=review_runtime_instance)
-    observe_runtime(control, paths, run_id, review_attempt_id, "stop", f"OBS-{review_attempt_id}-STOP", instance=review_runtime_instance)
-    state, raw = ledger.load_state(paths)
+    runtime_started = observe_runtime(control, paths, run_id, review_attempt_id, "start", f"OBS-{review_attempt_id}-START", instance=review_runtime_instance, state=state)
+    runtime_stopped = observe_runtime(control, paths, run_id, review_attempt_id, "stop", f"OBS-{review_attempt_id}-STOP", instance=review_runtime_instance, state=state, revision=int(runtime_started["revision"]))
+    state["revision"] = runtime_stopped["revision"]
+    # Integration binds its receipt to the exact current ledger bytes. Read
+    # those bytes directly here instead of reparsing and revalidating the full
+    # ledger only to compute its digest; integrate still enforces the CAS and
+    # the byte-exact digest against authoritative state.
+    raw = paths["ledger"].read_bytes()
     review_attempt = next(item for item in state["attempts"] if item["id"] == review_attempt_id)
     review_return = paths["scratch"] / review_attempt_id / "return.json"
     should_block_for_repair = not repair and index == 0
@@ -397,8 +419,13 @@ def run_qualification() -> dict[str, object]:
             raise AssertionError("not all tickets integrated")
         if len(projection["tickets"]) != 40 or projection["ticket_counts"].get("INTEGRATED") != 40:
             raise AssertionError("dashboard projection truncated tickets")
+        counters = final.get("usage", {}).get("counters", {})
+        runtime_observation_refs = sum(
+            len(attempt.get("runtime", {}).get("observation_refs", []))
+            for attempt in final.get("attempts", [])
+        )
         elapsed = time.monotonic() - started
-        return {"qualified": True, "verdict": "40-TICKET QUALIFICATION PASS", "ticket_count": len(final["tickets"]), "dependency_edges": dependency_edges, "dag_depth": 40, "processed_integration_order": processed, "premature_readiness_rejected": premature.get("ok") is False, "repair_path": repair_seen, "pause_seen": paused_seen, "recovery_seen": recovery_seen, "terminal_control": final["lifecycle"]["control"], "settings": final["run_settings"], "schema_round_trip": ledger.canonical_bytes(round_trip) == raw, "dashboard_ticket_count": len(projection["tickets"]), "ledger_bytes": len(raw), "elapsed_seconds": round(elapsed, 3)}
+        return {"qualified": True, "verdict": "40-TICKET QUALIFICATION PASS", "ticket_count": len(final["tickets"]), "dependency_edges": dependency_edges, "dag_depth": 40, "processed_integration_order": processed, "premature_readiness_rejected": premature.get("ok") is False, "repair_path": repair_seen, "pause_seen": paused_seen, "recovery_seen": recovery_seen, "terminal_control": final["lifecycle"]["control"], "settings": final["run_settings"], "schema_round_trip": ledger.canonical_bytes(round_trip) == raw, "dashboard_ticket_count": len(projection["tickets"]), "attempt_registrations": counters.get("attempt_registrations", 0), "spawn_calls": counters.get("spawn_calls", 0), "runtime_observation_refs": runtime_observation_refs, "ledger_bytes": len(raw), "elapsed_seconds": round(elapsed, 3)}
 
 
 def main() -> None:

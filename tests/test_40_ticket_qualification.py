@@ -15,10 +15,14 @@ class FortyTicketQualificationTests(unittest.TestCase):
         self.assertTrue(result["recovery_seen"])
         self.assertTrue(result["schema_round_trip"])
         self.assertEqual("ACCEPTED", result["terminal_control"])
-        # Phase D gives every ordinary candidate a real Git commit, full
-        # base-to-tree audit, and immutable proof-object verification.  Keep a
-        # bounded wall-clock guard for the stronger 40-candidate workload.
-        self.assertLess(result["elapsed_seconds"], 180)
+        self.assertEqual(82, result["attempt_registrations"])
+        self.assertEqual(82, result["spawn_calls"])
+        self.assertEqual(164, result["runtime_observation_refs"])
+        # Keep Phase D's real-Git candidate proofs. Phase G adds 164 separate,
+        # CAS-fenced, content-addressed runtime observations (start/stop for
+        # 40 workers + 1 repair worker + 41 reviewers). Allow a principled
+        # Phase G ceiling below 270 seconds without permitting omitted receipts.
+        self.assertLess(result["elapsed_seconds"], 270)
         self.assertLess(result["ledger_bytes"], 8 * 1024 * 1024)
 
 
