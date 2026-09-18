@@ -1174,3 +1174,16 @@ CODEX AUTOPILOT
 - Финальный suite: `186 tests in 414.030s, OK, skipped=1`. Skip — прежний документированный opt-in production-checkpoint audit. `py_compile`, contracts/lifecycle JSON parse, CLI parser smoke check и `git diff --check` — PASS.
 - Live Idea Scout не открывался и не изменялся; production R58 recovery не выполнялся. Все mutating rehearsal/regression paths работали только на complete disposable copies.
 - Следующая сессия начинает только Phase G из master hardening plan. Phase G в этой сессии не начата. Push не выполнялся.
+
+# 35. Durable status: v1.1.0 hardening through Phase G
+
+Актуальное состояние после завершения Phase G. Подробная трассировка и накопленная верификация находятся в [`reports/v1.1.0-hardening-progress.md`](../../reports/v1.1.0-hardening-progress.md).
+
+- Ветка: `codex/v1.1.0-hardening`.
+- Phases A–G завершены; **Phase H не начата**. Не переходить к Phase H в рамках этого handoff без отдельного запроса/плана.
+- Phase G закрыла master items 31–34: successor/predecessor manifest и repo ownership; разделение liveness и reservation; точная execution identity/scope с общим binding validation; immutable runtime observation receipts (`start`, `heartbeat`, `return_observed`, `stop`, `not_started`) и потребление exact terminal evidence кандидатными/lease переходами.
+- Phase G local commits: `7423091`, `d239b5a`, `def0177`, `dc67cd5`, `c517ab4`, `c6e8b12`, `c305095`, `a4fc073`, `70e7dab`.
+- Relevant six-module batch: `76 tests in 105.805s, OK`. Standalone 40-ticket qualification: `1 test, OK`; internal duration `222.746s` / `222.924s` wall, under `<270s`, with 82 registrations, 82 spawns, and 164 observation refs. Final full suite: `207 tests in 617.035s, OK, skipped=1`; skip is the documented opt-in production-checkpoint audit.
+- Receipt verification is a bookkeeping boundary: the system checks exact identity, immutable bytes, references and reported coverage, but still trusts the external observer's truthfulness/completeness. Native runtime conformance is Phase H, not claimed complete here.
+- Live Idea Scout не открывался и не изменялся; production R58 recovery не выполнялся. Финальные post-documentation-commit `py_compile`, schema parse, CLI smoke check остаются pending до отдельного подтверждения; `git diff --check` выполняется для этого doc change до коммита.
+- Phase H не начинать; push не выполнять. На момент этого handoff локальные commits не отправлялись.
