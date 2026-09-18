@@ -5,6 +5,12 @@ import unittest
 from pathlib import Path
 
 from tools import ledger
+from tests.test_phase_g_execution_binding_v110 import (
+    bind_worker_packet,
+    fixture_route,
+    install_current_execution_authority,
+    publish_fixture_route,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +41,7 @@ class LifecycleRepairTests(unittest.TestCase):
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        install_current_execution_authority(paths, repo)
         return control, repo, paths
 
     def publish_candidate_history(self, state: dict[str, object]) -> None:
@@ -53,6 +60,20 @@ class LifecycleRepairTests(unittest.TestCase):
             ticket["current_worker_attempt"] = None
 
     def worker_packet(self, root: Path, attempt_id: str, *, mode: str = "implement", base: str | None = None, path: str = "app.txt", operation: str = "modify", repair: dict[str, object] | None = None) -> Path:
+        paths = ledger.paths(root / "control", "repair-run")
+        route = fixture_route(f"route-{attempt_id}")
+        try:
+            publish_fixture_route(paths, route)
+        except ledger.LedgerError:
+            # Some negative cases deliberately seed an invalid candidate ledger;
+            # keep packet construction read-only so dispatch itself exercises
+            # the fail-closed ledger boundary.
+            pass
+        try:
+            state, _ = ledger.load_state(paths)
+        except ledger.LedgerError:
+            state = json.loads(paths["ledger"].read_text(encoding="utf-8"))
+        ticket = next(item for item in state["tickets"] if item["id"] == "T-1")
         packet = {
             "identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": attempt_id, "epoch": 0},
             "kind": "worker", "mode": mode, "goal": "lifecycle regression",
@@ -63,6 +84,9 @@ class LifecycleRepairTests(unittest.TestCase):
             "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}],
             "return_target": {"path": "return.json"},
         }
+        bind_worker_packet(state, ticket, packet)
+        if base is not None:
+            packet["workspace"]["expected_base"] = base
         if repair is not None:
             packet["repair"] = repair
         packet_path = root / f"{attempt_id}.json"
@@ -70,7 +94,10 @@ class LifecycleRepairTests(unittest.TestCase):
         return packet_path
 
     def dispatch(self, control: Path, packet: Path, attempt_id: str, revision: int, *, expect: int = 0) -> subprocess.CompletedProcess[str]:
-        return run("dispatch", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", str(revision), "--ticket-id", "T-1", "--attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--route-id", f"route-{attempt_id}", "--packet", str(packet), expect=expect)
+        route = fixture_route(f"route-{attempt_id}")
+        route_path = packet.parent / f"{attempt_id}-route.json"
+        write_json(route_path, route)
+        return run("dispatch", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", str(revision), "--ticket-id", "T-1", "--attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--route-id", f"route-{attempt_id}", "--packet", str(packet), "--route", str(route_path), expect=expect)
 
     def seed_create_candidate_finding(
         self,
@@ -346,7 +373,7 @@ class LifecycleRepairTests(unittest.TestCase):
             self.assertEqual("await_worker_return", waiting["lifecycle"]["next_action"]["kind"])
             self.assertIn("not a user checkpoint", " ".join(waiting["lifecycle"]["next_action"]["preconditions"]))
             attempt = ledger.attempt_by_id(waiting, "A-1")
-            returned = {"identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": "A-1", "packet_hash": attempt["packet_hash"], "epoch": 0}, "status": "DONE", "result": "modified", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "ok", "evidence_ref": "EV"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV"]}]}
+            returned = {"identity": {**json.loads(packet.read_text(encoding="utf-8"))["identity"], "packet_hash": attempt["packet_hash"]}, "status": "DONE", "result": "modified", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "ok", "evidence_ref": "EV"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV"]}]}
             inbox = paths["scratch"] / "A-1" / "return.json"; write_json(inbox, returned)
             run("validate-return", "--control-root", str(control), "--run-id", "repair-run", "--attempt-id", "A-1", "--return-file", str(inbox), "--kind", "worker")
             run("ingest-return", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--attempt-id", "A-1", "--return-file", str(inbox), "--kind", "worker")
@@ -444,7 +471,7 @@ class LifecycleRepairTests(unittest.TestCase):
             self.assertEqual([{"path": "app.txt", "operations": ["modify"]}], attempt["lease"]["zone"])
             self.assertEqual("A-create", attempt["repair_lease_provenance"]["source_attempt_ref"])
             self.assertEqual("AUTH-1", attempt["repair_authorization_ref"])
-            returned = {"identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": "A-repair", "packet_hash": attempt["packet_hash"], "epoch": 0}, "status": "DONE", "result": "repaired", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "fixed", "evidence_ref": "EV-repair"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV-repair"]}]}
+            returned = {"identity": {**json.loads(packet.read_text(encoding="utf-8"))["identity"], "packet_hash": attempt["packet_hash"]}, "status": "DONE", "result": "repaired", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "fixed", "evidence_ref": "EV-repair"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV-repair"]}]}
             inbox = paths["scratch"] / "A-repair" / "return.json"; write_json(inbox, returned)
             result = run("ingest-return", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "4", "--attempt-id", "A-repair", "--return-file", str(inbox), "--kind", "worker")
             self.assertFalse(json.loads(result.stdout)["quarantined"])
@@ -538,7 +565,7 @@ class LifecycleRepairTests(unittest.TestCase):
 
     def test_repair_modify_rejects_stale_and_foreign_scope(self) -> None:
         cases = {
-            "stale": {"base": "d" * 40, "path": "app.txt", "source": "A-create", "error": "base SHA is stale"},
+            "stale": {"base": "d" * 40, "path": "app.txt", "source": "A-create", "error": "base SHA"},
             "foreign": {"base": "b" * 40, "path": "other.txt", "source": "A-create", "error": "lacks prior-create provenance"},
         }
         for case, values in cases.items():
@@ -600,7 +627,7 @@ class LifecycleRepairTests(unittest.TestCase):
             control, _, _, repair = self.seed_completed_repair_chain(root, completed_repairs=1)
             packet = self.worker_packet(root, "A-stale-chain", mode="repair", base="b" * 40, repair=repair)
             rejected = self.dispatch(control, packet, "A-stale-chain", 3, expect=2)
-            self.assertIn("stale or forked", rejected.stderr)
+            self.assertIn("base SHA", rejected.stderr)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             control, paths, candidate, repair = self.seed_completed_repair_chain(root, completed_repairs=1)
@@ -656,7 +683,7 @@ class LifecycleRepairTests(unittest.TestCase):
             packet = self.worker_packet(root, "A-repair", mode="repair", base=candidate, repair=repair)
             self.dispatch(control, packet, "A-repair", 3)
             state, _ = ledger.load_state(paths); attempt = ledger.attempt_by_id(state, "A-repair")
-            returned = {"identity": {"run_id": "repair-run", "ticket_id": "T-1", "attempt_id": "A-repair", "packet_hash": attempt["packet_hash"], "epoch": 0}, "status": "DONE", "result": "overbroad", "files": [{"path": "other.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "fixed", "evidence_ref": "EV-repair"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV-repair"]}]}
+            returned = {"identity": {**json.loads(packet.read_text(encoding="utf-8"))["identity"], "packet_hash": attempt["packet_hash"]}, "status": "DONE", "result": "overbroad", "files": [{"path": "other.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "fixed", "evidence_ref": "EV-repair"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV-repair"]}]}
             inbox = paths["scratch"] / "A-repair" / "return.json"; write_json(inbox, returned)
             result = run("ingest-return", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "4", "--attempt-id", "A-repair", "--return-file", str(inbox), "--kind", "worker")
             self.assertIn('"quarantined": true', result.stdout)

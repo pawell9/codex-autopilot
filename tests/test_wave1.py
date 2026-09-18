@@ -146,29 +146,41 @@ class Wave1Tests(unittest.TestCase):
             paths = ledger.paths(control, "run-1")
             state, previous = ledger.load_state(paths)
             intent = paths["docs"] / "intent" / "v1.md"
+            design = paths["docs"] / "design" / "v1.md"
             ledger.atomic_write(intent, b"# intent\n")
+            ledger.atomic_write(design, b"# fixture design\n")
+            route_record = {"id": "route-1", "capability": "worker", "reasoning": "bounded", "adequacy": "CONFIRMED", "context_grade": "PACKET_SCOPED"}
+            publication_bytes = ledger.canonical_bytes({"fixture": "wave1 current-writer design", "route_refs": ["route-1"]})
+            publication_hash = ledger.object_store(paths, publication_bytes)
             state.update({
                 "revision": 1,
                 "previous_publication_hash": ledger.sha256_bytes(previous),
                 "repository": {**state["repository"], "branch": "main", "initial_head": base_sha, "checkout": str(repo)},
-                "documents": [{"id": "doc-1", "version": "v1", "path": str(intent), "hash": ledger.sha256_file(intent), "kind": "intent", "section_anchors": []}],
-                "intent": {"current_revision": "intent-v1", "document_ref": "doc-1", "approved_amendments": []},
+                "documents": [
+                    {"id": "doc-1", "version": "v1", "path": str(intent), "hash": ledger.sha256_file(intent), "kind": "intent", "section_anchors": []},
+                    {"id": "design-1", "version": "v1", "path": str(design), "hash": ledger.sha256_file(design), "kind": "design", "section_anchors": []},
+                ],
+                "intent": {"current_revision": "intent-v1", "document_ref": "doc-1", "document_hash": ledger.sha256_file(intent), "approved_amendments": []},
                 "requirements": [{"id": "R-1", "version": "v1", "status": "active", "provenance_refs": ["doc-1"], "criterion_refs": ["C-1"]}],
                 "criteria": [{"id": "C-1", "version": "v1", "requirement_refs": ["R-1"], "oracle": "app", "status": "active"}],
-                "contracts": [{"id": "contract-1", "version": "v1", "status": "active", "provenance_refs": ["doc-1"], "implementation_availability": "available", "implementation_availability_evidence_refs": ["fixture:contract-1-available"]}],
-                "tickets": [{"id": "T-1", "goal_ref": "G-1", "criterion_refs": ["C-1"], "contract_refs": ["contract-1"], "dependency_refs": [], "state": "READY", "complexity": "bounded", "risk": "routine", "zone": [{"path": "app.txt", "operations": ["modify"]}], "current_attempt": None, "replacement_refs": []}],
+                "contracts": [{"id": "contract-1", "version": "v1", "status": "active", "provenance_refs": ["doc-1"], "producer_refs": [], "consumer_refs": ["T-1"], "implementation_availability": "available", "implementation_availability_evidence_refs": ["fixture:contract-1-available"]}],
+                "tickets": [{"id": "T-1", "goal_ref": "G-1", "criterion_refs": ["C-1"], "contract_refs": ["contract-1"], "dependency_refs": [], "state": "READY", "complexity": "bounded", "risk": "routine", "zone": [{"path": "app.txt", "operations": ["modify"]}], "current_attempt": None, "current_worker_attempt": None, "last_worker_attempt": None, "current_candidate": None, "replacement_refs": []}],
+                "routes": [route_record],
                 "lifecycle": {"phase": "EXECUTE", "control": "ACTIVE", "next_action": {"kind": "dispatch", "subject_refs": [], "preconditions": [], "read_refs": []}},
             })
+            state["design_publication"] = {"id": "B-wave1", "version": "v1", "status": "PUBLISHED", "owner_epoch": 0, "intent_revision": "intent-v1", "intent_document_ref": "doc-1", "intent_document_hash": ledger.sha256_file(intent), "publication_hash": publication_hash, "bundle_ref": f"objects/{publication_hash}", "published_revision": 1, "document_refs": ["design-1"], "requirement_refs": ["R-1"], "criterion_refs": ["C-1"], "requirements_publication_ref": None, "contract_refs": ["contract-1"], "ticket_refs": ["T-1"], "route_refs": ["route-1"], "invalidated_by": []}
+            state["design_publication_history"] = [dict(state["design_publication"])]
             ledger.validate_ledger(state)
             ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
             packet = Path(directory) / "worker.json"
-            write_json(packet, {"identity": {"run_id": "run-1", "ticket_id": "T-1", "attempt_id": "A-1", "epoch": 0}, "kind": "worker", "mode": "implement", "goal": "update app", "acceptance": [{"criterion_id": "C-1"}], "workspace": {"root": str(repo), "expected_base": base_sha}, "write": {"allow": [{"path": "app.txt", "operations": ["modify"]}]}, "verification": [{"check_id": "oracle", "required": True}], "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}], "return_target": {"transport": "file", "path": "return.json"}})
+            packet_identity = {"run_id": "run-1", "ticket_id": "T-1", "attempt_id": "A-1", "epoch": 0, "intent_revision": "intent-v1", "intent_document_ref": "doc-1", "intent_document_hash": ledger.sha256_file(intent), "design_publication_ref": "B-wave1", "design_publication_hash": publication_hash, "design_publication_revision": 1, "contract_refs": ["contract-1"]}
+            write_json(packet, {"identity": packet_identity, "intent_revision": "intent-v1", "intent_document_ref": "doc-1", "intent_document_hash": ledger.sha256_file(intent), "kind": "worker", "mode": "implement", "goal": "update app", "acceptance": [{"criterion_id": "C-1"}], "workspace": {"root": str(repo), "expected_base": base_sha}, "write": {"allow": [{"path": "app.txt", "operations": ["modify"]}]}, "verification": [{"check_id": "oracle", "required": True}], "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}], "return_target": {"transport": "file", "path": "return.json"}})
             route = Path(directory) / "route.json"
             write_json(route, {"id": "route-1", "capability": "worker", "reasoning": "bounded", "adequacy": "CONFIRMED", "context_grade": "PACKET_SCOPED"})
             run("dispatch", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", "1", "--ticket-id", "T-1", "--attempt-id", "A-1", "--lease-id", "L-1", "--route-id", "route-1", "--packet", str(packet), "--route", str(route))
             state, _ = ledger.load_state(paths)
             worker_return = paths["scratch"] / "A-1" / "return.json"
-            write_json(worker_return, {"identity": {"run_id": "run-1", "ticket_id": "T-1", "attempt_id": "A-1", "packet_hash": state["attempts"][0]["packet_hash"], "epoch": 0}, "status": "DONE", "result": "updated", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "VALUE=42", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]})
+            write_json(worker_return, {"identity": {**packet_identity, "packet_hash": state["attempts"][0]["packet_hash"]}, "status": "DONE", "result": "updated", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "VALUE=42", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]})
             run("ingest-return", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", "2", "--attempt-id", "A-1", "--return-file", str(worker_return), "--kind", "worker")
             run("prepare-effect", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", "3", "--operation-id", "OP-1", "--kind", "candidate_commit", "--target", str(repo), "--expected-before", base_sha, "--authority-ref", "test")
             (repo / "app.txt").write_text("VALUE=42\n", encoding="utf-8")

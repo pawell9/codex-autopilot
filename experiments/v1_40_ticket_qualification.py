@@ -82,15 +82,33 @@ def assert_artifacts_match(run_root: Path, tickets: list[dict[str, object]]) -> 
             raise AssertionError(f"canonical ticket artifact drift: {ticket['id']}")
 
 
-def worker_packet(run_id: str, ticket: dict[str, object], attempt_id: str, mode: str = "implement", repair: dict[str, str] | None = None) -> dict[str, object]:
+def worker_identity(state: dict[str, object], ticket: dict[str, object], attempt_id: str) -> dict[str, object]:
+    intent = ledger.current_intent_binding(state)
+    publication = state["design_publication"]
+    return {
+        "run_id": state["run_id"], "ticket_id": ticket["id"], "attempt_id": attempt_id,
+        "epoch": state["owner"]["epoch"], "intent_revision": intent["revision"],
+        "intent_document_ref": intent["document_ref"], "intent_document_hash": intent["document_hash"],
+        "design_publication_ref": publication["id"],
+        "design_publication_hash": publication["publication_hash"],
+        "design_publication_revision": publication["published_revision"],
+        "contract_refs": sorted(ticket.get("contract_refs", [])),
+    }
+
+
+def worker_packet(run_id: str, ticket: dict[str, object], attempt_id: str, mode: str = "implement", repair: dict[str, str] | None = None, *, state: dict[str, object]) -> dict[str, object]:
+    identity = worker_identity(state, ticket, attempt_id)
     packet: dict[str, object] = {
-        "identity": {"run_id": run_id, "ticket_id": ticket["id"], "attempt_id": attempt_id, "epoch": 0},
+        "identity": identity,
+        "intent_revision": identity["intent_revision"],
+        "intent_document_ref": identity["intent_document_ref"],
+        "intent_document_hash": identity["intent_document_hash"],
         "kind": "worker", "mode": mode, "goal": "synthetic qualification worker",
         "acceptance": [{"criterion_id": "C-qualification"}],
         "workspace": {"root": "", "expected_base": None},
         "write": {"allow": [{"path": f"fixture/{ticket['id']}.txt", "operations": ["modify"]}]},
         "verification": [{"check_id": "synthetic-oracle", "required": True}],
-        "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}],
+        "risk": {"level": ticket["risk"]}, "context": [{"ref": "contracts/worker.md"}],
         "return_target": {"path": "return.json"},
     }
     if repair is not None:
@@ -133,7 +151,8 @@ def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, obj
     ).stdout.strip()
     packet_path = root / f"{attempt_id}.packet.json"
     route_path = root / f"{attempt_id}.route.json"
-    packet = worker_packet(run_id, ticket, attempt_id, "repair" if repair else "implement", repair_contract)
+    packet = worker_packet(run_id, ticket, attempt_id, "repair" if repair else "implement", repair_contract, state=state)
+    packet_identity = packet["identity"]
     # The BLOCKED repair candidate commit must bind to the worker's actual
     # checkout and base, not a fixture-only authority string.
     packet["workspace"] = {"root": str(repo), "expected_base": base_sha}
@@ -147,7 +166,7 @@ def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, obj
     (repo / relative_path).write_text(
         f"candidate from {attempt_id}\n", encoding="utf-8",
     )
-    payload = {"identity": {"run_id": run_id, "ticket_id": ticket["id"], "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0}, "status": "DONE", "result": "synthetic completed worker", "files": [{"path": relative_path, "operation": "modify"}], "checks": [{"check_id": "synthetic-oracle", "outcome": "pass", "actual": "fixture", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-qualification", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]}
+    payload = {"identity": {**packet_identity, "packet_hash": attempt["packet_hash"]}, "status": "DONE", "result": "synthetic completed worker", "files": [{"path": relative_path, "operation": "modify"}], "checks": [{"check_id": "synthetic-oracle", "outcome": "pass", "actual": "fixture", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-qualification", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]}
     write_json(inbox, payload)
     cli("ingest-return", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "worker")
     state, _ = ledger.load_state(paths)
@@ -238,17 +257,26 @@ def run_qualification() -> dict[str, object]:
         paths = ledger.paths(control, run_id)
         state, previous = ledger.load_state(paths)
         intent = paths["docs"] / "intent" / "v1.md"
+        design = paths["docs"] / "design" / "v1.md"
         intent_bytes = b"# Synthetic 40-ticket qualification\n"
         ledger.atomic_write(intent, intent_bytes)
+        design_bytes = b"# Synthetic 40-ticket design\n"
+        ledger.atomic_write(design, design_bytes)
         for ticket in tickets:
             write_ticket_artifact(paths["run"], ticket)
-        publication_hash = ledger.object_store(paths, b'{"fixture":"40-ticket-design-publication"}\n')
-        publication = {"id": "B-qualification", "version": "v1", "status": "PUBLISHED", "owner_epoch": 0, "intent_revision": "v1", "intent_document_ref": "D-qualification", "intent_document_hash": ledger.sha256_bytes(intent_bytes), "publication_hash": publication_hash, "bundle_ref": f"objects/{publication_hash}", "published_revision": 1, "document_refs": ["D-qualification"], "requirement_refs": ["R-qualification"], "criterion_refs": ["C-qualification"], "contract_refs": ["K-qualification"], "ticket_refs": [ticket["id"] for ticket in tickets], "route_refs": []}
+        route_ids = ["route-premature"]
+        route_ids.extend(f"route-attempt-{index:02d}" for index in range(len(tickets)))
+        route_ids.extend(f"route-attempt-{index:02d}-repair" for index in range(len(tickets)))
+        routes = [{"id": route_id, "capability": "fixture-worker", "reasoning": "synthetic", "requested_binding": "fixture-model", "observed_binding": "fixture-model", "adequacy": "CONFIRMED", "context_grade": "PACKET_SCOPED"} for route_id in route_ids]
+        route_refs = [item["id"] for item in routes]
+        bundle_raw = ledger.canonical_bytes({"fixture": "40-ticket-design-publication", "design_document_hash": ledger.sha256_bytes(design_bytes), "ticket_refs": [ticket["id"] for ticket in tickets], "criterion_refs": ["C-qualification"], "contract_refs": ["K-qualification"], "routes": routes})
+        publication_hash = ledger.object_store(paths, bundle_raw)
+        publication = {"id": "B-qualification", "version": "v1", "status": "PUBLISHED", "owner_epoch": 0, "intent_revision": "v1", "intent_document_ref": "D-qualification", "intent_document_hash": ledger.sha256_bytes(intent_bytes), "publication_hash": publication_hash, "bundle_ref": f"objects/{publication_hash}", "published_revision": 1, "document_refs": ["D-design-qualification"], "requirement_refs": ["R-qualification"], "criterion_refs": ["C-qualification"], "contract_refs": ["K-qualification"], "ticket_refs": [ticket["id"] for ticket in tickets], "route_refs": route_refs}
         design_reviews = [
             {"id": "REV-G2-qualification", "mandate": "synthetic coverage qualification", "subject_fingerprint": publication_hash, "verdict": "PASS", "return_ref": "objects/coverage-qualification", "context_refs": ["synthetic"], "finding_refs": [], "intent_revision": "v1", "review_kind": "coverage", "target_revision": 1},
             {"id": "REV-G3-qualification", "mandate": "synthetic plan qualification", "subject_fingerprint": publication_hash, "verdict": "PASS", "return_ref": "objects/plan-qualification", "context_refs": ["synthetic"], "finding_refs": [], "intent_revision": "v1", "review_kind": "plan", "target_revision": 1},
         ]
-        state.update({"repository": {**state["repository"], "branch": "fixture", "checkout": str(repo)}, "documents": [{"id": "D-qualification", "version": "v1", "path": str(intent), "hash": ledger.sha256_bytes(intent_bytes), "kind": "intent", "section_anchors": []}], "intent": {"current_revision": "v1", "document_ref": "D-qualification", "document_hash": ledger.sha256_bytes(intent_bytes), "approved_amendments": []}, "requirements": [{"id": "R-qualification", "version": "v1", "status": "active", "provenance_refs": ["D-qualification"], "criterion_refs": ["C-qualification"]}], "criteria": [{"id": "C-qualification", "version": "v1", "requirement_refs": ["R-qualification"], "oracle": "synthetic lifecycle oracle", "status": "active", "source_ref": "D-qualification"}], "contracts": [{"id": "K-qualification", "version": "v1", "status": "active", "provenance_refs": ["D-qualification"], "implementation_availability": "available", "implementation_availability_evidence_refs": ["fixture:qualification-contract-available"]}], "tickets": tickets, "design_publication": publication, "design_publication_history": [publication], "reviews": design_reviews, "lifecycle": {"phase": "EXECUTE", "control": "ACTIVE", "reason": "40_ticket_qualification", "issue_refs": [], "stop_target": None, "next_action": {"kind": "qualification", "subject_refs": [ticket["id"] for ticket in tickets], "preconditions": [], "read_refs": ["phases/execute.md"]}}})
+        state.update({"repository": {**state["repository"], "branch": "fixture", "initial_head": subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True, capture_output=True).stdout.strip(), "checkout": str(repo)}, "documents": [{"id": "D-qualification", "version": "v1", "path": str(intent), "hash": ledger.sha256_bytes(intent_bytes), "kind": "intent", "section_anchors": []}, {"id": "D-design-qualification", "version": "v1", "path": str(design), "hash": ledger.sha256_bytes(design_bytes), "kind": "design", "section_anchors": []}], "intent": {"current_revision": "v1", "document_ref": "D-qualification", "document_hash": ledger.sha256_bytes(intent_bytes), "approved_amendments": []}, "requirements": [{"id": "R-qualification", "version": "v1", "status": "active", "provenance_refs": ["D-qualification"], "criterion_refs": ["C-qualification"]}], "criteria": [{"id": "C-qualification", "version": "v1", "requirement_refs": ["R-qualification"], "oracle": "synthetic lifecycle oracle", "status": "active", "source_ref": "D-qualification"}], "contracts": [{"id": "K-qualification", "version": "v1", "status": "active", "provenance_refs": ["D-qualification"], "producer_refs": [], "consumer_refs": [ticket["id"] for ticket in tickets], "implementation_availability": "available", "implementation_availability_evidence_refs": ["fixture:qualification-contract-available"]}], "tickets": tickets, "routes": routes, "design_publication": publication, "design_publication_history": [publication], "reviews": design_reviews, "lifecycle": {"phase": "EXECUTE", "control": "ACTIVE", "reason": "40_ticket_qualification", "issue_refs": [], "stop_target": None, "next_action": {"kind": "qualification", "subject_refs": [ticket["id"] for ticket in tickets], "preconditions": [], "read_refs": ["phases/execute.md"]}}})
         state["revision"] = 1
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
         ledger.validate_ledger(state)
@@ -259,8 +287,9 @@ def run_qualification() -> dict[str, object]:
         premature_ticket = tickets[1]
         premature_packet = root / "premature.packet.json"
         premature_route = root / "premature.route.json"
-        write_json(premature_packet, worker_packet(run_id, premature_ticket, "premature-attempt"))
-        write_json(premature_route, {"id": "route-premature", "capability": "fixture-worker", "reasoning": "synthetic", "adequacy": "CONFIRMED", "context_grade": "PACKET_SCOPED"})
+        write_json(premature_packet, worker_packet(run_id, premature_ticket, "premature-attempt", state=state))
+        premature_route_record = next(item for item in routes if item["id"] == "route-premature")
+        write_json(premature_route, premature_route_record)
         premature = cli("dispatch", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", "1", "--ticket-id", str(premature_ticket["id"]), "--attempt-id", "premature-attempt", "--lease-id", "premature-lease", "--route-id", "route-premature", "--packet", str(premature_packet), "--route", str(premature_route), expect=2)
 
         processed: list[str] = []

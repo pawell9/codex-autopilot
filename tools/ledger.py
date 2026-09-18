@@ -1478,6 +1478,79 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
     for attempt in state.get("attempts", []):
         if attempt["epoch"] > state["owner"]["epoch"] + 1:
             fail(f"attempt epoch is ahead of owner epoch: {attempt['id']}")
+        execution_binding = attempt.get("execution_binding")
+        execution_binding_hash = attempt.get("execution_binding_hash")
+        if execution_binding is not None or execution_binding_hash is not None:
+            if not isinstance(execution_binding, dict) or not isinstance(execution_binding_hash, str):
+                fail(f"attempt execution binding and hash must be persisted together: {attempt['id']}")
+            validate(execution_binding, root["$defs"]["execution_binding"], root, f"$.attempts[{attempt['id']}].execution_binding")
+            expected_binding_hash = sha256_bytes(canonical_bytes(execution_binding))
+            if execution_binding_hash != expected_binding_hash:
+                fail(f"attempt execution binding hash is not canonical: {attempt['id']}")
+            binding_alignment = {
+                "run_id": state.get("run_id"),
+                "ticket_id": attempt.get("subject_ref"),
+                "attempt_id": attempt.get("id"),
+                "kind": attempt.get("kind"),
+                "mode": attempt.get("mode"),
+                "epoch": attempt.get("epoch"),
+                "packet_hash": attempt.get("packet_hash"),
+                "base_sha": attempt.get("base_sha"),
+                "route_id": attempt.get("route_ref"),
+            }
+            if any(execution_binding.get(field) != expected for field, expected in binding_alignment.items()):
+                fail(f"attempt execution binding does not align with its registered record: {attempt['id']}")
+            if attempt.get("packet_ref") != f"objects/{attempt.get('packet_hash')}":
+                fail(f"attempt execution binding packet reference is inconsistent: {attempt['id']}")
+
+            ticket_ref = execution_binding.get("ticket_id")
+            if ticket_ref not in ticket_ids:
+                fail(f"attempt execution binding references an unknown ticket: {attempt['id']}")
+            document = next((item for item in state.get("documents", []) if item.get("id") == execution_binding.get("intent_document_ref")), None)
+            if document is None or document.get("hash") != execution_binding.get("intent_document_hash"):
+                fail(f"attempt execution binding intent document reference/hash is unknown: {attempt['id']}")
+
+            publication_records = history or ([publication] if publication else [])
+            matched_publications = [
+                item for item in publication_records
+                if item.get("id") == execution_binding.get("design_publication_ref")
+                and item.get("publication_hash") == execution_binding.get("design_publication_hash")
+                and item.get("published_revision") == execution_binding.get("design_publication_revision")
+            ]
+            if len(matched_publications) != 1:
+                fail(f"attempt execution binding does not reference one exact published design record: {attempt['id']}")
+            bound_publication = matched_publications[0]
+            if (
+                bound_publication.get("intent_revision") != execution_binding.get("intent_revision")
+                or bound_publication.get("intent_document_ref") != execution_binding.get("intent_document_ref")
+                or bound_publication.get("intent_document_hash") != execution_binding.get("intent_document_hash")
+                or not set(execution_binding.get("criterion_refs", [])).issubset(set(bound_publication.get("criterion_refs", [])))
+                or not {item.get("ref") for item in execution_binding.get("contract_bindings", [])}.issubset(set(bound_publication.get("contract_refs", [])))
+                or (execution_binding.get("route_hash") is not None and execution_binding.get("route_id") not in set(bound_publication.get("route_refs", [])))
+            ):
+                fail(f"attempt execution binding is outside its exact published design mandate: {attempt['id']}")
+
+            base_sha = execution_binding.get("base_sha")
+            initial_head_match = base_sha == state.get("repository", {}).get("initial_head")
+            candidate_match = any(
+                item.get("ticket_ref") == ticket_ref and item.get("sha") == base_sha
+                for item in state.get("candidates", [])
+            )
+            legacy_candidate_match = any(
+                item.get("kind") == "worker" and item.get("subject_ref") == ticket_ref
+                and item.get("candidate_sha") == base_sha
+                for item in state.get("attempts", [])
+            )
+            if not (initial_head_match or candidate_match or legacy_candidate_match):
+                fail(f"attempt execution binding base is not a recorded initial head or candidate: {attempt['id']}")
+            contract_ids = {item.get("id") for item in state.get("contracts", [])}
+            contract_refs = [item.get("ref") for item in execution_binding.get("contract_bindings", [])]
+            if len(contract_refs) != len(set(contract_refs)) or not set(contract_refs).issubset(contract_ids):
+                fail(f"attempt execution binding contains unknown or duplicate contract refs: {attempt['id']}")
+            if execution_binding.get("route_hash") is not None:
+                route_record = next((item for item in state.get("routes", []) if item.get("id") == execution_binding.get("route_id")), None)
+                if route_record is None or sha256_bytes(canonical_bytes(route_record)) != execution_binding.get("route_hash"):
+                    fail(f"attempt execution binding route identity is not present in the ledger: {attempt['id']}")
         runtime = attempt.get("runtime")
         if isinstance(runtime, dict):
             expected_spawn_id = stable_spawn_request_id(

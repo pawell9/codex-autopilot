@@ -5,6 +5,12 @@ import unittest
 from pathlib import Path
 
 from tools import ledger
+from tests.test_phase_g_execution_binding_v110 import (
+    bind_worker_packet,
+    fixture_route,
+    install_current_execution_authority,
+    publish_fixture_route,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +29,7 @@ def write_json(path: Path, value: object) -> None:
 
 
 class Wave2Tests(unittest.TestCase):
-    def init_run(self, root: Path, run_id: str = "run-2") -> tuple[Path, Path]:
+    def init_run(self, root: Path, run_id: str = "run-2", *, current_authority: bool = True) -> tuple[Path, Path]:
         control = root / "control"
         repo = root / "repo"
         control.mkdir()
@@ -37,6 +43,8 @@ class Wave2Tests(unittest.TestCase):
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        if current_authority:
+            install_current_execution_authority(paths, repo)
         return control, repo
 
     def packet(self, run_id: str, attempt_id: str, mode: str = "implement", repair: dict[str, str] | None = None) -> dict[str, object]:
@@ -47,13 +55,23 @@ class Wave2Tests(unittest.TestCase):
 
     def dispatch(self, root: Path, packet: dict[str, object], route: dict[str, object] | None = None, attempt_id: str = "A-1", expect: int = 0, revision: int = 1) -> subprocess.CompletedProcess[str]:
         control = root / "control"
+        paths = ledger.paths(control, "run-2")
+        route_id = f"route-{attempt_id}"
+        route_value = route or fixture_route(route_id)
+        if route_value.get("id") not in (None, route_id):
+            raise AssertionError("fixture route ID must match the dispatch route-id")
+        route_value = {**route_value, "id": route_id}
+        if route_value.get("adequacy") == "CONFIRMED":
+            publish_fixture_route(paths, route_value)
+        state, _ = ledger.load_state(paths)
+        ticket = next(item for item in state["tickets"] if item["id"] == "T-1")
+        bind_worker_packet(state, ticket, packet)
         packet_path = root / f"{attempt_id}-packet.json"
         write_json(packet_path, packet)
-        args = ["dispatch", "--control-root", str(control), "--run-id", "run-2", "--owner-token", "owner-a", "--revision", str(revision), "--ticket-id", "T-1", "--attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--route-id", f"route-{attempt_id}", "--packet", str(packet_path)]
-        if route is not None:
-            route_path = root / f"{attempt_id}-route.json"
-            write_json(route_path, route)
-            args += ["--route", str(route_path)]
+        args = ["dispatch", "--control-root", str(control), "--run-id", "run-2", "--owner-token", "owner-a", "--revision", str(revision), "--ticket-id", "T-1", "--attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--route-id", route_id, "--packet", str(packet_path)]
+        route_path = root / f"{attempt_id}-route.json"
+        write_json(route_path, route_value)
+        args += ["--route", str(route_path)]
         return run(*args, expect=expect)
 
     def test_rejected_or_unknown_route_cannot_dispatch(self) -> None:
@@ -73,7 +91,8 @@ class Wave2Tests(unittest.TestCase):
             self.dispatch(root, self.packet("run-2", "A-1"))
             paths = ledger.paths(root / "control", "run-2")
             state, _ = ledger.load_state(paths)
-            payload = {"identity": {"run_id": "run-2", "ticket_id": "T-1", "attempt_id": "A-1", "packet_hash": state["attempts"][0]["packet_hash"], "epoch": 0}, "status": "BLOCKED", "result": "contract is incomplete", "files": [], "checks": [{"check_id": "oracle", "outcome": "not_run", "actual": "blocked", "evidence_ref": "ev-block"}], "criteria": [{"criterion_id": "C-1", "outcome": "unverifiable", "evidence_refs": ["ev-block"]}], "issues": [{"type": "contract_gap", "cause": "contract", "impact": "blocking", "affected_refs": ["T-1"], "disposition": "repair contract"}]}
+            packet_identity = json.loads((root / "A-1-packet.json").read_text(encoding="utf-8"))["identity"]
+            payload = {"identity": {**packet_identity, "packet_hash": state["attempts"][0]["packet_hash"]}, "status": "BLOCKED", "result": "contract is incomplete", "files": [], "checks": [{"check_id": "oracle", "outcome": "not_run", "actual": "blocked", "evidence_ref": "ev-block"}], "criteria": [{"criterion_id": "C-1", "outcome": "unverifiable", "evidence_refs": ["ev-block"]}], "issues": [{"type": "contract_gap", "cause": "contract", "impact": "blocking", "affected_refs": ["T-1"], "disposition": "repair contract"}]}
             inbox = paths["scratch"] / "A-1" / "return.json"
             write_json(inbox, payload)
             run("ingest-return", "--control-root", str(root / "control"), "--run-id", "run-2", "--owner-token", "owner-a", "--revision", "2", "--attempt-id", "A-1", "--return-file", str(inbox), "--kind", "worker")
@@ -94,7 +113,8 @@ class Wave2Tests(unittest.TestCase):
             self.dispatch(root, self.packet("run-2", "A-1"))
             paths = ledger.paths(root / "control", "run-2")
             state, _ = ledger.load_state(paths)
-            payload = {"identity": {"run_id": "run-2", "ticket_id": "T-1", "attempt_id": "A-1", "packet_hash": state["attempts"][0]["packet_hash"], "epoch": 0}, "status": "DONE", "result": "updated", "files": [{"path": "other.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "ok", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]}
+            packet_identity = json.loads((root / "A-1-packet.json").read_text(encoding="utf-8"))["identity"]
+            payload = {"identity": {**packet_identity, "packet_hash": state["attempts"][0]["packet_hash"]}, "status": "DONE", "result": "updated", "files": [{"path": "other.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "ok", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]}
             inbox = paths["scratch"] / "A-1" / "return.json"
             write_json(inbox, payload)
 
@@ -118,7 +138,7 @@ class Wave2Tests(unittest.TestCase):
     def test_amendment_records_full_consumer_closure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            control, _ = self.init_run(root)
+            control, _ = self.init_run(root, current_authority=False)
             paths = ledger.paths(control, "run-2")
             old_path = paths["docs"] / "intent" / "v1.md"
             ledger.atomic_write(old_path, b"old intent\n")
