@@ -15,6 +15,33 @@ from tests.test_phase_b_projections_v110 import OWNER, RUN_ID, TICKET_ID, run, w
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def record_runtime_event(
+    control: Path, run_id: str, owner_token: str, paths: dict[str, Path], attempt_id: str,
+    event: str, event_id: str, *, instance: str | None = "runtime-test",
+    descendant_writers: str = "not_applicable",
+) -> dict[str, Any]:
+    """Publish an exact runtime receipt through the same public CLI used by adapters."""
+    state, _ = ledger.load_state(paths)
+    attempt = ledger.attempt_by_id(state, attempt_id)
+    receipt = {
+        "kind": "runtime_observation", "event_id": event_id, "event": event,
+        "run_id": run_id, "attempt_id": attempt_id, "epoch": attempt["epoch"],
+        "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+        "runtime_instance_id": instance, "observed_at": "2026-09-18T12:00:00Z",
+        "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+        "coverage": {"scope": "test process tree", "descendant_writers": descendant_writers},
+    }
+    event_path = paths["run"] / f"{event_id}.json"
+    write_json(event_path, receipt)
+    run(
+        "observe-runtime", "--control-root", str(control), "--run-id", run_id,
+        "--owner-token", owner_token, "--revision", str(state["revision"]),
+        "--attempt-id", attempt_id, "--event", event, "--event-id", event_id,
+        "--event-file", str(event_path),
+    )
+    return receipt
+
+
 class PhaseGRuntimeObservationTests(unittest.TestCase):
     def setUp_dispatch(self, root: Path) -> tuple[phase_g_fixture.PhaseGExecutionBindingTests, Path, dict[str, Path], Path, dict[str, Any]]:
         fixture = phase_g_fixture.PhaseGExecutionBindingTests()
@@ -192,6 +219,160 @@ class PhaseGRuntimeObservationTests(unittest.TestCase):
             self.assertEqual("unknown", projected["liveness"])
             self.assertFalse(projected["protocol_recorded"])
             self.assertNotIn("observation_refs", attempt)
+
+    def test_legacy_unknown_blocks_candidate_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = phase_g_fixture.PhaseGExecutionBindingTests()
+            control, _, paths, packet_path, packet = fixture.setup_dispatch(root)
+            fixture.dispatch(control, packet_path, revision=1)
+            state, _ = ledger.load_state(paths)
+            attempt = ledger.attempt_by_id(state, "A-G")
+            attempt.pop("runtime")
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            self.assertFalse(ledger.runtime_stop_proven(paths, attempt))
+
+            returned = {
+                "identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]},
+                "status": "DONE", "result": "legacy return", "files": [],
+                "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "passed", "evidence_ref": "EV-G"}],
+                "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["EV-G"]}],
+            }
+            inbox = paths["scratch"] / "A-G" / "return.json"
+            write_json(inbox, returned)
+            run(
+                "ingest-return", "--control-root", str(control), "--run-id", RUN_ID,
+                "--owner-token", OWNER, "--revision", "2", "--attempt-id", "A-G",
+                "--return-file", str(inbox), "--kind", "worker",
+            )
+            before, _ = ledger.load_state(paths)
+            with self.assertRaisesRegex(ledger.LedgerError, "exact runtime stop/not_started"):
+                ledger.require_runtime_stopped(paths, ledger.attempt_by_id(before, "A-G"), "candidate qualification")
+            rejected = run(
+                "candidate", "--control-root", str(control), "--run-id", RUN_ID,
+                "--owner-token", OWNER, "--revision", str(before["revision"]),
+                "--attempt-id", "A-G", "--operation-id", "missing", expect=2,
+            )
+            self.assertIn("exact runtime stop/not_started", rejected.stderr)
+            after, _ = ledger.load_state(paths)
+            self.assertEqual(before["revision"], after["revision"])
+            self.assertEqual("unknown", ledger.runtime_liveness(ledger.attempt_by_id(after, "A-G")))
+
+    def test_legacy_unknown_cannot_release_reservation_from_termination_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = phase_g_fixture.PhaseGExecutionBindingTests()
+            control, _, paths, packet_path, _ = fixture.setup_dispatch(root)
+            fixture.dispatch(control, packet_path, revision=1)
+            state, _ = ledger.load_state(paths)
+            ledger.attempt_by_id(state, "A-G").pop("runtime")
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            evidence = root / "legacy-stop.json"
+            write_json(evidence, {"status": "PASS", "writer_stopped": True, "observation": "historical compatibility evidence"})
+            before = paths["ledger"].read_bytes()
+            rejected = run(
+                "terminate-attempt", "--control-root", str(control), "--run-id", RUN_ID,
+                "--owner-token", OWNER, "--revision", "2", "--attempt-id", "A-G",
+                "--state", "LOST", "--lease-state", "released", "--evidence", str(evidence), expect=2,
+            )
+            self.assertIn("exact runtime stop/not_started", rejected.stderr)
+            self.assertEqual(before, paths["ledger"].read_bytes())
+            final, _ = ledger.load_state(paths)
+            self.assertEqual("active", ledger.attempt_by_id(final, "A-G")["lease"]["state"])
+            self.assertEqual("unknown", ledger.runtime_liveness(ledger.attempt_by_id(final, "A-G")))
+
+    def test_runtime_observation_objects_are_verified_on_load_and_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, control, paths, _, _ = self.setUp_dispatch(root)
+            start_file = root / "OBS-START.json"
+            self.observe(root, control, paths, "A-G", "start", 2, event_id="OBS-START")
+            state, _ = ledger.load_state(paths)
+            attempt = ledger.attempt_by_id(state, "A-G")
+            start_ref = attempt["runtime"]["start_ref"]
+            start_object = paths["objects"] / start_ref.split("/")[1]
+
+            start_object.unlink()
+            with self.assertRaisesRegex(ledger.LedgerError, "immutable object is unavailable"):
+                ledger.load_state(paths)
+            replay = run(
+                "observe-runtime", "--control-root", str(control), "--run-id", RUN_ID,
+                "--owner-token", OWNER, "--revision", "2", "--attempt-id", "A-G",
+                "--event", "start", "--event-id", "OBS-START", "--event-file", str(start_file), expect=2,
+            )
+            self.assertIn("immutable object is unavailable", replay.stderr)
+
+    def test_runtime_observation_hash_schema_identity_and_pointer_are_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, control, paths, _, _ = self.setUp_dispatch(root)
+            self.observe(root, control, paths, "A-G", "start", 2, event_id="OBS-START")
+            heartbeat = record_runtime_event(
+                control, RUN_ID, OWNER, paths, "A-G", "heartbeat", "OBS-HEARTBEAT",
+                instance="runtime-1",
+            )
+            state, _ = ledger.load_state(paths)
+            attempt = ledger.attempt_by_id(state, "A-G")
+            heartbeat_ref = attempt["runtime"]["heartbeat_refs"][0]
+            heartbeat_object = paths["objects"] / heartbeat_ref.split("/")[1]
+
+            tampered_state = json.loads(json.dumps(state))
+            tampered_object = paths["objects"] / tampered_state["attempts"][0]["runtime"]["start_ref"].split("/")[1]
+            ledger.atomic_write(tampered_object, b"tampered")
+            with self.assertRaisesRegex(ledger.LedgerError, "hash does not match"):
+                ledger.validate_ledger(tampered_state)
+            # Restore the content-addressed object before the remaining isolated checks.
+            start_receipt = {
+                "kind": "runtime_observation", "event_id": "OBS-START", "event": "start",
+                "run_id": RUN_ID, "attempt_id": "A-G", "epoch": attempt["epoch"],
+                "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+                "runtime_instance_id": "runtime-1", "observed_at": "2026-09-18T12:00:00Z",
+                "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+                "coverage": {"scope": "test process tree", "descendant_writers": "not_applicable"},
+            }
+            start_raw = ledger.canonical_bytes(start_receipt)
+            ledger.atomic_write(tampered_object, start_raw)
+
+            wrong_schema = json.loads(json.dumps(state))
+            malformed = dict(heartbeat, unexpected="field")
+            malformed_ref = f"objects/{ledger.object_store(paths, ledger.canonical_bytes(malformed))}"
+            wrong_schema_attempt = ledger.attempt_by_id(wrong_schema, "A-G")
+            wrong_schema_attempt["runtime"]["observation_refs"][1] = malformed_ref
+            wrong_schema_attempt["runtime"]["heartbeat_refs"][0] = malformed_ref
+            with self.assertRaisesRegex(ledger.LedgerError, "unknown field"):
+                ledger.validate_ledger(wrong_schema)
+
+            wrong_identity = json.loads(json.dumps(state))
+            foreign = dict(heartbeat, run_id="different-run")
+            foreign_ref = f"objects/{ledger.object_store(paths, ledger.canonical_bytes(foreign))}"
+            wrong_identity_attempt = ledger.attempt_by_id(wrong_identity, "A-G")
+            wrong_identity_attempt["runtime"]["observation_refs"][1] = foreign_ref
+            wrong_identity_attempt["runtime"]["heartbeat_refs"][0] = foreign_ref
+            with self.assertRaisesRegex(ledger.LedgerError, "identity does not match"):
+                ledger.validate_ledger(wrong_identity)
+
+            wrong_pointer = json.loads(json.dumps(state))
+            ledger.attempt_by_id(wrong_pointer, "A-G")["runtime"]["start_ref"] = heartbeat_ref
+            with self.assertRaisesRegex(ledger.LedgerError, "pointer/event mismatch"):
+                ledger.validate_ledger(wrong_pointer)
+
+    def test_duplicate_runtime_event_ids_are_rejected_by_ledger_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, control, paths, _, _ = self.setUp_dispatch(root)
+            self.observe(root, control, paths, "A-G", "start", 2, event_id="OBS-START")
+            heartbeat = record_runtime_event(
+                control, RUN_ID, OWNER, paths, "A-G", "heartbeat", "OBS-HEARTBEAT",
+                instance="runtime-1",
+            )
+            state, _ = ledger.load_state(paths)
+            attempt = ledger.attempt_by_id(state, "A-G")
+            duplicate = dict(heartbeat, event_id="OBS-START")
+            duplicate_ref = f"objects/{ledger.object_store(paths, ledger.canonical_bytes(duplicate))}"
+            attempt["runtime"]["observation_refs"].append(duplicate_ref)
+            attempt["runtime"]["heartbeat_refs"].append(duplicate_ref)
+            with self.assertRaisesRegex(ledger.LedgerError, "duplicate runtime observation event_id"):
+                ledger.validate_ledger(state)
 
 
 if __name__ == "__main__":

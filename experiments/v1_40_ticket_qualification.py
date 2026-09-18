@@ -36,6 +36,24 @@ def cli(*args: str, expect: int = 0) -> dict[str, object]:
     return json.loads(output) if output else {}
 
 
+def observe_runtime(control: Path, paths: dict[str, Path], run_id: str, attempt_id: str, event: str, event_id: str, *, instance: str) -> None:
+    state, _ = ledger.load_state(paths)
+    attempt = ledger.attempt_by_id(state, attempt_id)
+    receipt = {
+        "kind": "runtime_observation", "event_id": event_id, "event": event,
+        "run_id": run_id, "attempt_id": attempt_id, "epoch": attempt["epoch"],
+        "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+        "runtime_instance_id": instance, "observed_at": "2026-09-18T12:00:00Z",
+        "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+        "coverage": {"scope": "test process tree", "descendant_writers": "included" if event == "stop" else "not_applicable"},
+    }
+    event_path = paths["run"] / f"{event_id}.json"
+    write_json(event_path, receipt)
+    cli("observe-runtime", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner",
+        "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--event", event,
+        "--event-id", event_id, "--event-file", str(event_path))
+
+
 def ticket_id(index: int) -> str:
     return f"ticket-{index:02d}"
 
@@ -146,9 +164,15 @@ def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, obj
     index = int(str(ticket["id"]).rsplit("-", 1)[1])
     attempt_id = f"attempt-{index:02d}" + ("-repair" if repair else "")
     repair_contract = ticket.get("repair") if repair else None
-    base_sha = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True, capture_output=True,
-    ).stdout.strip()
+    current_ticket = next(item for item in state["tickets"] if item["id"] == ticket["id"])
+    candidate = ledger.current_candidate_record(state, current_ticket)
+    base_sha = candidate.get("sha") if candidate is not None else state["repository"].get("initial_head")
+    if not base_sha:
+        raise AssertionError("qualification checkout has no exact current candidate/base")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "--create", f"qualification-{attempt_id}", str(base_sha)],
+        check=True, text=True, capture_output=True,
+    )
     packet_path = root / f"{attempt_id}.packet.json"
     route_path = root / f"{attempt_id}.route.json"
     packet = worker_packet(run_id, ticket, attempt_id, "repair" if repair else "implement", repair_contract, state=state)
@@ -159,6 +183,11 @@ def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, obj
     write_json(packet_path, packet)
     write_json(route_path, {"id": f"route-{attempt_id}", "capability": "fixture-worker", "reasoning": "synthetic", "requested_binding": "fixture-model", "observed_binding": "fixture-model", "adequacy": "CONFIRMED", "context_grade": "PACKET_SCOPED"})
     cli("dispatch", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--ticket-id", str(ticket["id"]), "--attempt-id", attempt_id, "--lease-id", f"lease-{attempt_id}", "--route-id", f"route-{attempt_id}", "--packet", str(packet_path), "--route", str(route_path))
+    state, _ = ledger.load_state(paths)
+    attempt = next(item for item in state["attempts"] if item["id"] == attempt_id)
+    runtime_instance = f"runtime-{attempt_id}"
+    observe_runtime(control, paths, run_id, attempt_id, "start", f"OBS-{attempt_id}-START", instance=runtime_instance)
+    observe_runtime(control, paths, run_id, attempt_id, "stop", f"OBS-{attempt_id}-STOP", instance=runtime_instance)
     state, _ = ledger.load_state(paths)
     attempt = next(item for item in state["attempts"] if item["id"] == attempt_id)
     inbox = paths["scratch"] / attempt_id / "return.json"
@@ -193,6 +222,11 @@ def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, obj
     review_file = root / f"{review_attempt_id}.packet.json"
     write_json(review_file, review_packet(run_id, ticket, review_attempt_id, candidate_sha))
     cli("prepare-review", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--ticket-id", str(ticket["id"]), "--review-attempt-id", review_attempt_id, "--lease-id", f"lease-{review_attempt_id}", "--packet", str(review_file))
+    state, raw = ledger.load_state(paths)
+    review_attempt = next(item for item in state["attempts"] if item["id"] == review_attempt_id)
+    review_runtime_instance = f"runtime-{review_attempt_id}"
+    observe_runtime(control, paths, run_id, review_attempt_id, "start", f"OBS-{review_attempt_id}-START", instance=review_runtime_instance)
+    observe_runtime(control, paths, run_id, review_attempt_id, "stop", f"OBS-{review_attempt_id}-STOP", instance=review_runtime_instance)
     state, raw = ledger.load_state(paths)
     review_attempt = next(item for item in state["attempts"] if item["id"] == review_attempt_id)
     review_return = paths["scratch"] / review_attempt_id / "return.json"

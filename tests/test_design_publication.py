@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from tools import ledger
+from tests.test_phase_g_runtime_observations_v110 import record_runtime_event
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,13 +63,14 @@ class DesignPublicationTests(unittest.TestCase):
 
     def review_packet(self, root: Path, control: Path, attempt_id: str, review_kind: str, *, source_revision: int) -> Path:
         state, _ = ledger.load_state(ledger.paths(control, "design-run"))
-        packet = {"identity": {"run_id": "design-run", "attempt_id": attempt_id, "epoch": 0, "source_revision": source_revision, "intent_revision": "intent-v2"}, "kind": "review", "mandate": f"design {review_kind}", "subject_fingerprint": state["design_publication"]["publication_hash"], "criteria": [{"criterion_id": "C-1"}], "axes": [review_kind], "return_target": {"path": "return.json"}}
+        packet = {"identity": {"run_id": "design-run", "attempt_id": attempt_id, "epoch": 0, "source_revision": state["revision"], "intent_revision": "intent-v2"}, "kind": "review", "mandate": f"design {review_kind}", "subject_fingerprint": state["design_publication"]["publication_hash"], "criteria": [{"criterion_id": "C-1"}], "axes": [review_kind], "return_target": {"path": "return.json"}}
         packet_path = root / f"{attempt_id}.json"
         write_json(packet_path, packet)
         return packet_path
 
     def prepare_review(self, control: Path, packet: Path, attempt_id: str, kind: str, revision: int) -> None:
-        run("prepare-design-review", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(revision), "--review-attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--packet", str(packet), "--review-kind", kind, "--reviewer-identity", "reviewer@example.invalid", "--reviewer-role", "independent-design-reviewer")
+        current, _ = ledger.load_state(ledger.paths(control, "design-run"))
+        run("prepare-design-review", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(current["revision"]), "--review-attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--packet", str(packet), "--review-kind", kind, "--reviewer-identity", "reviewer@example.invalid", "--reviewer-role", "independent-design-reviewer")
 
     def finish_review(self, root: Path, control: Path, attempt_id: str, revision: int, *, verdict: str = "PASS") -> None:
         paths = ledger.paths(control, "design-run")
@@ -77,7 +79,10 @@ class DesignPublicationTests(unittest.TestCase):
         returned = {"identity": {"run_id": "design-run", "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": attempt["packet_source_revision"], "registration_revision": attempt["packet_registration_revision"], "subject_revision": attempt["subject_revision"], "intent_revision": "intent-v2"}, "subject_fingerprint": state["design_publication"]["publication_hash"], "verdict": verdict, "coverage": [{"criterion_id": "C-1", "outcome": "fulfilled" if verdict == "PASS" else "unverifiable", "evidence_refs": ["EV-review"]}], "checks": [{"check_id": "design-check", "axis": attempt["mode"], "outcome": "fulfilled" if verdict == "PASS" else "not_run", "actual": "fixture", "evidence_ref": "EV-review"}], "context_refs": ["clean-design-review"], "findings": []}
         inbox = paths["scratch"] / attempt_id / "return.json"
         write_json(inbox, returned)
-        run("ingest-return", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(revision), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "review")
+        record_runtime_event(control, "design-run", "owner-a", paths, attempt_id, "start", f"OBS-{attempt_id}-START", instance=f"runtime-{attempt_id}")
+        record_runtime_event(control, "design-run", "owner-a", paths, attempt_id, "stop", f"OBS-{attempt_id}-STOP", instance=f"runtime-{attempt_id}", descendant_writers="included")
+        current, _ = ledger.load_state(paths)
+        run("ingest-return", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(current["revision"]), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "review")
 
     def test_happy_path_publication_reviews_and_gates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -197,9 +202,10 @@ class DesignPublicationTests(unittest.TestCase):
             revised_source.write_text("# D-design-v3\n\nrevised design\n", encoding="utf-8")
             value["documents"][0] = {**value["documents"][0], "id": "D-design-v3", "version": "v3", "source": str(revised_source), "hash": ledger.sha256_file(revised_source)}
             bundle_v3 = root / "B-design-v3.json"; write_json(bundle_v3, value)
-            published = json.loads(self.publish(control, bundle_v3, revision=5).stdout)
+            state, _ = ledger.load_state(ledger.paths(control, "design-run"))
+            published = json.loads(self.publish(control, bundle_v3, revision=state["revision"]).stdout)
             self.assertFalse(published["idempotent"])
-            self.assertEqual(6, published["revision"])
+            self.assertEqual(state["revision"] + 1, published["revision"])
 
             state, _ = ledger.load_state(paths)
             history = state["design_publication_history"]
@@ -211,7 +217,7 @@ class DesignPublicationTests(unittest.TestCase):
             self.assertEqual("ACTIVE", state["lifecycle"]["control"])
             self.assertEqual("BLOCK", state["reviews"][0]["verdict"])
             self.assertFalse([issue for issue in state.get("issues", []) if issue.get("impact") == "blocking"])
-            retry = json.loads(self.publish(control, bundle_v3, revision=5).stdout)
+            retry = json.loads(self.publish(control, bundle_v3, revision=published["revision"] - 1).stdout)
             self.assertTrue(retry["idempotent"])
             self.assertEqual(2, len(ledger.load_state(paths)[0]["design_publication_history"]))
 
@@ -353,7 +359,10 @@ class DesignPublicationTests(unittest.TestCase):
             self.assertIn("axes do not exactly match", preflight.stderr); self.assertEqual(original, paths["ledger"].read_bytes())
             returned["checks"][0]["axis"] = "plan"; write_json(inbox, returned)
             run("validate-return", "--control-root", str(control), "--run-id", "design-run", "--attempt-id", "A-plan-mixed", "--return-file", str(inbox), "--kind", "review")
-            run("ingest-return", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", "6", "--attempt-id", "A-plan-mixed", "--return-file", str(inbox), "--kind", "review")
+            record_runtime_event(control, "design-run", "owner-a", paths, "A-plan-mixed", "start", "OBS-A-plan-mixed-START", instance="runtime-A-plan-mixed")
+            record_runtime_event(control, "design-run", "owner-a", paths, "A-plan-mixed", "stop", "OBS-A-plan-mixed-STOP", instance="runtime-A-plan-mixed", descendant_writers="included")
+            current, _ = ledger.load_state(paths)
+            run("ingest-return", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(current["revision"]), "--attempt-id", "A-plan-mixed", "--return-file", str(inbox), "--kind", "review")
             state, _ = ledger.load_state(paths)
             self.assertFalse([item for item in state.get("issues", []) if item.get("type") == "reviewer_disagreement"])
             self.assertEqual("review_not_pass", state["lifecycle"]["reason"])
@@ -367,10 +376,14 @@ class DesignPublicationTests(unittest.TestCase):
             state, _ = ledger.load_state(paths); attempt = ledger.attempt_by_id(state, "A-finding")
             returned = {"identity": {"run_id": "design-run", "attempt_id": "A-finding", "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": attempt["packet_source_revision"], "intent_revision": "intent-v2"}, "subject_fingerprint": state["design_publication"]["publication_hash"], "verdict": "BLOCK", "coverage": [{"criterion_id": "C-1", "outcome": "missing", "evidence_refs": ["EV"]}], "checks": [{"check_id": "coverage", "axis": "coverage", "outcome": "failed", "actual": "missing", "evidence_ref": "EV"}], "context_refs": ["clean"], "findings": [{"axis": "coverage", "impact": "blocking", "claim": "missing ownership", "expected": "owned", "actual": "missing", "evidence": "EV", "affected_refs": ["coverage"]}]}
             inbox = paths["scratch"] / "A-finding" / "return.json"; write_json(inbox, returned)
-            run("ingest-return", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", "4", "--attempt-id", "A-finding", "--return-file", str(inbox), "--kind", "review")
+            record_runtime_event(control, "design-run", "owner-a", paths, "A-finding", "start", "OBS-A-finding-START", instance="runtime-A-finding")
+            record_runtime_event(control, "design-run", "owner-a", paths, "A-finding", "stop", "OBS-A-finding-STOP", instance="runtime-A-finding", descendant_writers="included")
+            current, _ = ledger.load_state(paths)
+            run("ingest-return", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(current["revision"]), "--attempt-id", "A-finding", "--return-file", str(inbox), "--kind", "review")
             state, _ = ledger.load_state(paths); state["lifecycle"]["issue_refs"] = [ref for ref in state["lifecycle"]["issue_refs"] if not ref.startswith("issue-")]; ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
             value = json.loads(bundle.read_text(encoding="utf-8")); value["bundle_id"] = "B-design-v2"; value["version"] = "v2"; source = root / "D-design-v2.md"; source.write_text("# revised\n", encoding="utf-8"); value["documents"][0] = {**value["documents"][0], "id": "D-design-v2", "version": "v2", "source": str(source), "hash": ledger.sha256_file(source)}; revised = root / "revised.json"; write_json(revised, value)
-            self.publish(control, revised, revision=5)
+            current, _ = ledger.load_state(paths)
+            self.publish(control, revised, revision=current["revision"])
             final, _ = ledger.load_state(paths)
             old_finding = final["findings"][0]
             self.assertIn("B-design-v2", old_finding["invalidated_by"])

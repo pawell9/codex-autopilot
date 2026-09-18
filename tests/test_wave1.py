@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from tools import ledger
+from tests.test_phase_g_runtime_observations_v110 import record_runtime_event
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,10 +180,14 @@ class Wave1Tests(unittest.TestCase):
             write_json(route, {"id": "route-1", "capability": "worker", "reasoning": "bounded", "adequacy": "CONFIRMED", "context_grade": "PACKET_SCOPED"})
             run("dispatch", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", "1", "--ticket-id", "T-1", "--attempt-id", "A-1", "--lease-id", "L-1", "--route-id", "route-1", "--packet", str(packet), "--route", str(route))
             state, _ = ledger.load_state(paths)
+            record_runtime_event(control, "run-1", "owner-a", paths, "A-1", "start", "OBS-A-1-START", instance="runtime-A-1")
+            record_runtime_event(control, "run-1", "owner-a", paths, "A-1", "stop", "OBS-A-1-STOP", instance="runtime-A-1", descendant_writers="included")
+            state, _ = ledger.load_state(paths)
             worker_return = paths["scratch"] / "A-1" / "return.json"
             write_json(worker_return, {"identity": {**packet_identity, "packet_hash": state["attempts"][0]["packet_hash"]}, "status": "DONE", "result": "updated", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "VALUE=42", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]})
-            run("ingest-return", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", "2", "--attempt-id", "A-1", "--return-file", str(worker_return), "--kind", "worker")
-            run("prepare-effect", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", "3", "--operation-id", "OP-1", "--kind", "candidate_commit", "--target", str(repo), "--expected-before", base_sha, "--authority-ref", "test")
+            run("ingest-return", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--attempt-id", "A-1", "--return-file", str(worker_return), "--kind", "worker")
+            state, _ = ledger.load_state(paths)
+            run("prepare-effect", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--operation-id", "OP-1", "--kind", "candidate_commit", "--target", str(repo), "--expected-before", base_sha, "--authority-ref", "test")
             (repo / "app.txt").write_text("VALUE=42\n", encoding="utf-8")
             subprocess.run(["git", "add", "app.txt"], cwd=repo, check=True)
             subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "candidate"], cwd=repo, check=True)
@@ -190,19 +195,23 @@ class Wave1Tests(unittest.TestCase):
             tree_sha = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
             receipt = Path(directory) / "commit.json"
             write_json(receipt, {"status": "PASS", "run_id": "run-1", "ticket_id": "T-1", "attempt_id": "A-1", "operation_id": "OP-1", "kind": "candidate_commit", "target": str(repo), "checkout": str(repo), "expected_before": base_sha, "base_sha": base_sha, "intended_after": candidate_sha, "commit_sha": candidate_sha, "tree_sha": tree_sha, "authority_ref": "test", "receipt_ref": "receipt"})
-            run("candidate", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", "4", "--attempt-id", "A-1", "--commit-receipt", str(receipt), "--operation-id", "OP-1")
+            state, _ = ledger.load_state(paths)
+            run("candidate", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--attempt-id", "A-1", "--commit-receipt", str(receipt), "--operation-id", "OP-1")
             state, _ = ledger.load_state(paths)
             self.assertEqual("CANDIDATE", state["tickets"][0]["state"])
             review_packet = Path(directory) / "review.json"
             write_json(review_packet, {"identity": {"run_id": "run-1", "attempt_id": "A-review-1", "epoch": 0}, "kind": "review", "mandate": "routine change review", "subject_fingerprint": candidate_sha, "criteria": [{"criterion_id": "C-1"}], "axes": ["correctness"], "return_target": {"transport": "file", "path": "review.json"}})
-            run("prepare-review", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", "5", "--ticket-id", "T-1", "--review-attempt-id", "A-review-1", "--lease-id", "RL-1", "--packet", str(review_packet))
+            run("prepare-review", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--ticket-id", "T-1", "--review-attempt-id", "A-review-1", "--lease-id", "RL-1", "--packet", str(review_packet))
             state, raw = ledger.load_state(paths)
             review_attempt = next(item for item in state["attempts"] if item["id"] == "A-review-1")
+            record_runtime_event(control, "run-1", "owner-a", paths, "A-review-1", "start", "OBS-A-review-1-START", instance="runtime-A-review-1")
+            record_runtime_event(control, "run-1", "owner-a", paths, "A-review-1", "stop", "OBS-A-review-1-STOP", instance="runtime-A-review-1", descendant_writers="included")
+            state, raw = ledger.load_state(paths)
             review_return = paths["scratch"] / "A-review-1" / "review-return.json"
             write_json(review_return, {"identity": {"run_id": "run-1", "attempt_id": "A-review-1", "packet_hash": review_attempt["packet_hash"], "epoch": 0}, "subject_fingerprint": candidate_sha, "verdict": "PASS", "coverage": [{"criterion_id": "C-1", "outcome": "fulfilled", "evidence_refs": ["ev-review"]}], "checks": [{"check_id": "correctness", "axis": "correctness", "outcome": "fulfilled", "actual": "VALUE=42", "evidence_ref": "ev-review"}], "context_refs": ["clean-review-context"], "findings": []})
             integrity = Path(directory) / "integrity.json"
             write_json(integrity, {"status": "PASS", "candidate_fingerprint": candidate_sha, "ledger_hash": ledger.sha256_bytes(raw)})
-            run("integrate", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", "6", "--attempt-id", "A-review-1", "--review-file", str(review_return), "--integrity-receipt", str(integrity), "--review-id", "REV-1")
+            run("integrate", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--attempt-id", "A-review-1", "--review-file", str(review_return), "--integrity-receipt", str(integrity), "--review-id", "REV-1")
             final, _ = ledger.load_state(paths)
             self.assertEqual("INTEGRATED", final["tickets"][0]["state"])
             self.assertEqual("review", next(item for item in final["attempts"] if item["id"] == "A-review-1")["kind"])

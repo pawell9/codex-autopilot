@@ -127,6 +127,7 @@ class PhaseCAttemptFinalizationTests(unittest.TestCase):
     def _observe_runtime(
         self, case: dict[str, Any], attempt_id: str, event: str, *,
         descendants: str = "not_applicable", instance: str = "runtime-phase-c",
+        return_hash: str | None = None,
     ) -> Path:
         state, _ = ledger.load_state(case["paths"])
         attempt = ledger.attempt_by_id(state, attempt_id)
@@ -136,7 +137,7 @@ class PhaseCAttemptFinalizationTests(unittest.TestCase):
             "run_id": RUN_ID, "attempt_id": attempt_id, "epoch": attempt["epoch"],
             "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
             "runtime_instance_id": instance, "observed_at": "2026-09-18T12:00:00Z",
-            "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+            "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": return_hash,
             "coverage": {"scope": "test process tree", "descendant_writers": descendants},
         }
         receipt_path = case["root"] / f"{event_id}.json"
@@ -253,10 +254,11 @@ class PhaseCAttemptFinalizationTests(unittest.TestCase):
         attempt: dict[str, Any] = {
             "id": attempt_id, "kind": "worker", "mode": mode, "subject_ref": TICKET_ID,
             "packet_ref": packet_ref, "packet_hash": packet_hash, "epoch": 0,
-            "state": "RETURNED", "lease": {"id": f"L-{attempt_id}", "state": "active", "zone": [{"path": "app.txt", "operations": ["modify"]}]},
+            "state": "PREPARED", "lease": {"id": f"L-{attempt_id}", "state": "active", "zone": [{"path": "app.txt", "operations": ["modify"]}]},
             "route_ref": f"route-{attempt_id}", "checkout": str(repo), "base_sha": base_sha,
-            "candidate_sha": None, "candidate_tree_sha": None, "return_ref": return_ref, "finding_refs": [],
+            "candidate_sha": None, "candidate_tree_sha": None, "return_ref": None, "finding_refs": [],
         }
+        ledger.initialize_attempt_runtime(RUN_ID, attempt)
         if repair:
             auth_ref = "AUTH-REPAIR"
             contract_ref = f"objects/{ledger.object_store(paths, ledger.canonical_bytes(repair))}"
@@ -275,6 +277,19 @@ class PhaseCAttemptFinalizationTests(unittest.TestCase):
             "control": "BLOCKED", "reason": f"worker_{status.lower()}", "issue_refs": sorted(set(state["lifecycle"].get("issue_refs", []) + ["ISS-REPAIR"])),
             "next_action": {"kind": "finalize_attempt", "subject_refs": [attempt_id], "preconditions": ["verify stopped writer and exact checkout state"], "read_refs": ["phases/recover.md"]},
         })
+        state["revision"] += 1
+        state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+        ledger.refresh_control_projection(state)
+        ledger.validate_ledger(state)
+        ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        self._observe_runtime(case, attempt_id, "start")
+        self._observe_runtime(
+            case, attempt_id, "return_observed", return_hash=return_ref.removeprefix("objects/"),
+        )
+        self._observe_runtime(case, attempt_id, "stop", descendants="included")
+        state, previous = ledger.load_state(paths)
+        terminal_attempt = ledger.attempt_by_id(state, attempt_id)
+        terminal_attempt.update({"state": "RETURNED", "return_ref": return_ref})
         state["revision"] += 1
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
         ledger.refresh_control_projection(state)

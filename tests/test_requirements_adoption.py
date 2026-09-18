@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from tools import ledger
+from tests.test_phase_g_runtime_observations_v110 import record_runtime_event
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -168,9 +169,13 @@ class RequirementsAdoptionTests(unittest.TestCase):
             }
             packet_path = root / "review.json"; write_json(packet_path, packet)
             run("prepare-design-review", "--control-root", str(control), "--run-id", "adopt-run", "--owner-token", "owner-a", "--revision", "4", "--review-attempt-id", "A-review-lost", "--lease-id", "L-review-lost", "--packet", str(packet_path), "--review-kind", "coverage", "--reviewer-identity", "fixture-reviewer", "--reviewer-role", "coverage-reviewer")
-            evidence = root / "stop.json"; write_json(evidence, {"status": "PASS", "writer_stopped": True, "observation": "synthetic reviewer crash"})
-            result = json.loads(run("terminate-attempt", "--control-root", str(control), "--run-id", "adopt-run", "--owner-token", "owner-a", "--revision", "5", "--attempt-id", "A-review-lost", "--state", "LOST", "--lease-state", "released", "--evidence", str(evidence)).stdout)
-            self.assertEqual(6, result["revision"])
+            paths = ledger.paths(control, "adopt-run")
+            record_runtime_event(control, "adopt-run", "owner-a", paths, "A-review-lost", "start", "OBS-A-review-lost-START", instance="runtime-review-lost")
+            evidence = paths["run"] / "OBS-A-review-lost-STOP.json"
+            record_runtime_event(control, "adopt-run", "owner-a", paths, "A-review-lost", "stop", "OBS-A-review-lost-STOP", instance="runtime-review-lost", descendant_writers="included")
+            state, _ = ledger.load_state(paths)
+            result = json.loads(run("terminate-attempt", "--control-root", str(control), "--run-id", "adopt-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--attempt-id", "A-review-lost", "--state", "LOST", "--lease-state", "released", "--evidence", str(evidence)).stdout)
+            self.assertEqual(state["revision"] + 1, result["revision"])
             state, _ = ledger.load_state(ledger.paths(control, "adopt-run"))
             attempt = ledger.attempt_by_id(state, "A-review-lost")
             self.assertEqual("LOST", attempt["state"])
@@ -186,7 +191,10 @@ class RequirementsAdoptionTests(unittest.TestCase):
             packet = {"identity": {"run_id": "adopt-run", "attempt_id": "A-review-takeover", "epoch": 0, "source_revision": 4, "registration_revision": 4, "subject_revision": 4, "intent_revision": "v1"}, "kind": "review", "mandate": "coverage", "subject_fingerprint": published["publication_hash"], "criteria": [{"criterion_id": "C-1"}], "axes": ["coverage"], "return_target": {"path": "return.json"}}
             packet_path = root / "takeover-review.json"; write_json(packet_path, packet)
             run("prepare-design-review", "--control-root", str(control), "--run-id", "adopt-run", "--owner-token", "owner-a", "--revision", "4", "--review-attempt-id", "A-review-takeover", "--lease-id", "L-review-takeover", "--packet", str(packet_path), "--review-kind", "coverage", "--reviewer-identity", "fixture-reviewer", "--reviewer-role", "coverage-reviewer")
-            recovered = json.loads(run("recover", "--control-root", str(control), "--run-id", "adopt-run", "--owner-token", "owner-a", "--revision", "5", "--reason", "owner_transfer", "--takeover", "--new-owner-token", "owner-b", "--attestation-ref", "EV-old-owner-stopped").stdout)
+            paths = ledger.paths(control, "adopt-run")
+            record_runtime_event(control, "adopt-run", "owner-a", paths, "A-review-takeover", "start", "OBS-A-review-takeover-START", instance="runtime-review-takeover")
+            state, _ = ledger.load_state(paths)
+            recovered = json.loads(run("recover", "--control-root", str(control), "--run-id", "adopt-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--reason", "owner_transfer", "--takeover", "--new-owner-token", "owner-b", "--attestation-ref", "EV-old-owner-stopped").stdout)
             self.assertEqual(1, recovered["epoch"])
             state, _ = ledger.load_state(ledger.paths(control, "adopt-run"))
             self.assertEqual("owner-b", state["owner"]["token"])

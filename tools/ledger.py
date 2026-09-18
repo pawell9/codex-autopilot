@@ -1475,6 +1475,8 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
         visited.add(node)
     for node in graph:
         visit(node)
+    runtime_event_ids: dict[str, tuple[str, str]] = {}
+    runtime_observation_schema = root["$defs"]["runtime_observation"]
     for attempt in state.get("attempts", []):
         if attempt["epoch"] > state["owner"]["epoch"] + 1:
             fail(f"attempt epoch is ahead of owner epoch: {attempt['id']}")
@@ -1556,7 +1558,10 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
             expected_spawn_id = stable_spawn_request_id(
                 state.get("run_id", ""), attempt["id"], attempt["epoch"], attempt.get("packet_hash", ""),
             )
-            refs = set(runtime.get("observation_refs", []))
+            observation_refs = runtime.get("observation_refs", [])
+            refs = set(observation_refs)
+            if len(refs) != len(observation_refs):
+                fail(f"duplicate runtime observation reference for attempt {attempt['id']}")
             if runtime.get("spawn_request_id") != expected_spawn_id:
                 fail(f"runtime spawn request ID is not stable for attempt {attempt['id']}")
             if any(ref and ref not in refs for ref in (
@@ -1571,12 +1576,97 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
                 fail(f"stopped runtime attempt lacks its exact stop/instance binding: {attempt['id']}")
             if liveness == "not_started" and (not runtime.get("not_started_ref") or runtime.get("runtime_instance_id") is not None):
                 fail(f"not_started runtime attempt has an invalid instance binding: {attempt['id']}")
+            if verify_files:
+                runtime_paths = paths(state["repository"]["control_root"], state["run_id"])
+                observations: list[dict[str, Any]] = []
+                refs_by_event: dict[str, list[str]] = {name: [] for name in ("start", "heartbeat", "return_observed", "stop", "not_started")}
+                for ref in observation_refs:
+                    observation = stored_payload(runtime_paths, ref, "runtime observation")
+                    validate(observation, runtime_observation_schema, root, "$.runtime_observation")
+                    if (
+                        observation.get("kind") != "runtime_observation"
+                        or observation.get("run_id") != state.get("run_id")
+                        or observation.get("attempt_id") != attempt.get("id")
+                        or observation.get("epoch") != attempt.get("epoch")
+                        or observation.get("packet_hash") != attempt.get("packet_hash")
+                        or observation.get("spawn_request_id") != runtime.get("spawn_request_id")
+                    ):
+                        fail(f"runtime observation identity does not match its exact attempt: {attempt['id']}")
+                    event_id = observation["event_id"]
+                    prior_identity = runtime_event_ids.get(event_id)
+                    if prior_identity is not None:
+                        fail(f"conflicting or duplicate runtime observation event_id: {event_id}")
+                    runtime_event_ids[event_id] = (attempt["id"], ref)
+                    event = observation["event"]
+                    refs_by_event[event].append(ref)
+                    observations.append(observation)
+
+                expected_pointers = {
+                    "start_ref": refs_by_event["start"],
+                    "stop_ref": refs_by_event["stop"],
+                    "not_started_ref": refs_by_event["not_started"],
+                    "return_observation_ref": refs_by_event["return_observed"],
+                }
+                for field, event_refs in expected_pointers.items():
+                    expected_ref = event_refs[0] if len(event_refs) == 1 else None
+                    if len(event_refs) > 1 or runtime.get(field) != expected_ref:
+                        fail(f"runtime observation pointer/event mismatch for {field}: {attempt['id']}")
+                if runtime.get("heartbeat_refs", []) != refs_by_event["heartbeat"]:
+                    fail(f"runtime heartbeat pointers do not match immutable observations: {attempt['id']}")
+
+                observed_liveness = "unknown"
+                observed_instance = None
+                saw_return = False
+                for observation in observations:
+                    event = observation["event"]
+                    instance = observation.get("runtime_instance_id")
+                    if event == "start":
+                        if observed_liveness != "unknown" or observed_instance is not None or saw_return or not instance:
+                            fail(f"invalid runtime start transition for attempt {attempt['id']}")
+                        observed_instance = instance
+                        observed_liveness = "running"
+                    elif event == "heartbeat":
+                        if observed_liveness != "running" or instance != observed_instance:
+                            fail(f"runtime heartbeat is not bound to a running instance: {attempt['id']}")
+                    elif event == "return_observed":
+                        if saw_return or observed_liveness == "not_started" or not instance:
+                            fail(f"invalid runtime return observation transition: {attempt['id']}")
+                        if observed_instance is not None and instance != observed_instance:
+                            fail(f"runtime return observation changed instance identity: {attempt['id']}")
+                        if observed_instance is None:
+                            observed_instance = instance
+                        if attempt.get("return_ref") and attempt.get("return_ref") != f"objects/{observation.get('return_hash')}":
+                            fail(f"runtime return observation hash conflicts with ingested return: {attempt['id']}")
+                        saw_return = True
+                    elif event == "stop":
+                        if observed_liveness == "running":
+                            if instance != observed_instance:
+                                fail(f"runtime stop changed instance identity: {attempt['id']}")
+                        elif observed_liveness == "unknown":
+                            if not instance or (observed_instance is not None and instance != observed_instance):
+                                fail(f"late runtime stop is not bound to the observed instance: {attempt['id']}")
+                            observed_instance = instance
+                        else:
+                            fail(f"invalid runtime stop transition for attempt {attempt['id']}")
+                        if observation.get("coverage", {}).get("descendant_writers") != "included":
+                            fail(f"runtime stop does not cover descendant writers: {attempt['id']}")
+                        observed_liveness = "stopped"
+                    elif event == "not_started":
+                        if observed_liveness != "unknown" or observed_instance is not None or saw_return or instance is not None:
+                            fail(f"invalid runtime not_started transition for attempt {attempt['id']}")
+                        observed_liveness = "not_started"
+                if observed_liveness != liveness or observed_instance != runtime.get("runtime_instance_id"):
+                    fail(f"runtime state does not match its immutable observation sequence: {attempt['id']}")
+                if runtime.get("start_ref"):
+                    start = observations[observation_refs.index(runtime["start_ref"])]
+                    if start.get("runtime_instance_id") != runtime.get("runtime_instance_id"):
+                        fail(f"runtime start pointer instance does not match attempt state: {attempt['id']}")
         if (
-            state.get("runtime_provenance") and attempt.get("kind") == "review"
+            attempt.get("kind") == "review"
             and attempt.get("state") == "RETURNED" and attempt.get("lease", {}).get("state") == "active"
-            and (not isinstance(attempt.get("runtime"), dict) or runtime_liveness(attempt) in ("stopped", "not_started"))
+            and isinstance(runtime, dict) and runtime_liveness(attempt) in ("stopped", "not_started")
         ):
-            fail(f"returned legacy reviewer attempt or stopped runtime reviewer retains an active lease: {attempt['id']}")
+            fail(f"returned reviewer with a terminal runtime observation retains an active lease: {attempt['id']}")
     attempts_by_id = {item["id"]: item for item in state.get("attempts", [])}
     candidates_by_id = {item["id"]: item for item in state.get("candidates", [])}
     operations_by_id = {item["id"]: item for item in state.get("operations", [])}
@@ -2340,10 +2430,10 @@ def runtime_liveness(attempt: dict[str, Any]) -> str:
 
 
 def runtime_stop_proven(p: dict[str, Path], attempt: dict[str, Any]) -> bool:
-    """Validate an exact typed stop/not-started receipt; legacy attempts stay unknown."""
+    """Validate an exact typed stop/not-started receipt; unknown legacy state fails closed."""
     runtime = attempt.get("runtime")
     if not isinstance(runtime, dict):
-        return True
+        return False
     if runtime.get("liveness") == "not_started":
         ref = runtime.get("not_started_ref")
         expected_event = "not_started"
@@ -2373,7 +2463,7 @@ def runtime_stop_proven(p: dict[str, Path], attempt: dict[str, Any]) -> bool:
 
 
 def require_runtime_stopped(p: dict[str, Path], attempt: dict[str, Any], action: str) -> None:
-    if isinstance(attempt.get("runtime"), dict) and not runtime_stop_proven(p, attempt):
+    if not runtime_stop_proven(p, attempt):
         fail(f"{action} requires an exact runtime stop/not_started observation; liveness={runtime_liveness(attempt)}")
 
 
@@ -6303,9 +6393,7 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
             target["review_result"] = payload.get("verdict")
             # A return is not a stop observation. Runtime-protocol reservations
             # remain checked out until exact stop/reconciliation is recorded.
-            if target.get("lease", {}).get("state") == "active" and (
-                not isinstance(target.get("runtime"), dict) or runtime_stop_proven(p, target)
-            ):
+            if target.get("lease", {}).get("state") == "active" and runtime_stop_proven(p, target):
                 target["lease"]["state"] = "released"
         target["finding_refs"] = append_review_findings(next_state, payload, args.attempt_id, digest, packet=packet if args.kind == "review" else None, subject_ref=target.get("subject_ref"))
         if args.kind == "worker":
@@ -6836,7 +6924,7 @@ def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
             fail("only an in-flight attempt may be terminated")
         if attempt.get("epoch") != state["owner"]["epoch"] and args.lease_state == "released":
             fail("stale-epoch attempt may only be quarantined until takeover reconciliation")
-        if args.lease_state == "released" and isinstance(attempt.get("runtime"), dict):
+        if args.lease_state == "released":
             require_runtime_stopped(p, attempt, "runtime reservation release")
             runtime = attempt["runtime"]
             exact_stop_ref = runtime.get("stop_ref") if runtime_liveness(attempt) == "stopped" else runtime.get("not_started_ref")
@@ -8801,10 +8889,6 @@ def cmd_finalize_attempt(args: argparse.Namespace) -> dict[str, Any]:
             evidence_known = bool(
                 attempt.get("lease", {}).get("state") == "released"
                 and runtime_stop_proven(p, attempt)
-                and (
-                    runtime_stop_proven(p, attempt) if isinstance(attempt.get("runtime"), dict)
-                    else termination and termination.get("status") == "PASS" and termination.get("writer_stopped") is True
-                )
             )
         else:
             fail("attempt finalization requires a RETURNED, LOST, or INTERRUPTED worker attempt")
@@ -9922,6 +10006,18 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
             attempt["review_purpose"] = purpose
         attempt["packet_ref"] = f"objects/{packet_hash}"
         attempt["packet_hash"] = packet_hash
+        # A handoff publishes a new immutable producer packet. Bind a fresh
+        # spawn request to that packet before any reviewer runtime can start.
+        # A previously observed runtime cannot be retargeted to a different
+        # packet; the fresh-PREPARED guard above normally makes this a legacy
+        # registration without runtime observations.
+        prior_runtime = attempt.get("runtime")
+        if isinstance(prior_runtime, dict) and (
+            prior_runtime.get("observation_refs")
+            or prior_runtime.get("liveness", "unknown") != "unknown"
+        ):
+            fail("handoff cannot replace a packet after runtime activity was observed")
+        initialize_attempt_runtime(args.run_id, attempt)
         attempt["handoff"] = {"bundle_root": str(bundle), "manifest_ref": f"sha256:{manifest_hash}", "candidate_fingerprint": projection.get("candidate_fingerprint"), "intent_revision": projection.get("intent_revision"), "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"], "purpose": purpose, "packet_kind": packet.get("kind"), "projection_hash": sha256_bytes(canonical_bytes(projection)), "transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN"}
         add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"manual_handoffs": 1, "manual_setup": 1, "user_interventions": 1})
         state["lifecycle"]["control"] = "BLOCKED"
@@ -9961,6 +10057,8 @@ def cmd_import_manual_legacy(args: argparse.Namespace) -> dict[str, Any]:
                     return {"imported": True, "idempotent": True, "terminal": True, "verdict": prior_acceptance.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False, "revision": state["revision"]}
             admit_event(state, "acceptance.import")
         attempt = next((item for item in state.get("attempts", []) if item.get("id") == args.attempt_id), None)
+        if attempt is not None:
+            require_runtime_stopped(p, attempt, "manual acceptance/review import")
         proposed_path = inbox_file(p, args.attempt_id, return_path)
         proposed_ref = f"objects/{sha256_file(proposed_path)}"
         prior_acceptance = next((item for item in state.get("acceptance", []) if item.get("return_ref") == proposed_ref), None)
@@ -9980,6 +10078,7 @@ def cmd_import_manual_legacy(args: argparse.Namespace) -> dict[str, Any]:
         admit_event(state, "acceptance.import")
         if attempt is None:
             attempt = attempt_by_id(state, args.attempt_id)
+        require_runtime_stopped(p, attempt, "manual acceptance/review import")
         if state["revision"] != args.revision:
             fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
         if attempt.get("mode") != "user_assisted":
@@ -10096,6 +10195,7 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
         state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
         admit_event(state, "acceptance.import")
         attempt = attempt_by_id(state, args.attempt_id)
+        require_runtime_stopped(p, attempt, "manual acceptance/review import")
         if attempt.get("state") != "PREPARED" or attempt.get("return_ref"):
             fail("manual review import requires a fresh PREPARED attempt; interrupted/lost/returned attempts are immutable")
         if attempt.get("epoch") != state.get("owner", {}).get("epoch"):

@@ -221,6 +221,48 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
         return {"packet": packet_path, "projection": projection_path,
                 "export": export, "bundle": bundle, "result": result}
 
+    def observe_runtime(
+        self, case: dict[str, Any], attempt_id: str, event: str, *,
+        return_hash: str | None = None, instance: str = "manual-reviewer-session",
+    ) -> Path:
+        state, _ = ledger.load_state(case["paths"])
+        attempt = ledger.attempt_by_id(state, attempt_id)
+        receipt = {
+            "kind": "runtime_observation", "event_id": f"OBS-{attempt_id}-MANUAL-{event.upper()}",
+            "event": event, "run_id": case["run_id"], "attempt_id": attempt_id,
+            "epoch": attempt["epoch"], "packet_hash": attempt["packet_hash"],
+            "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+            "runtime_instance_id": instance, "observed_at": "2026-09-18T12:00:00Z",
+            "observer": "manual-runtime-adapter-test", "runtime_build": "fixture-1",
+            "return_hash": return_hash,
+            "coverage": {"scope": "manual reviewer session", "descendant_writers": "included" if event == "stop" else "not_applicable"},
+        }
+        event_path = case["root"] / f"{receipt['event_id']}.json"
+        write_json(event_path, receipt)
+        run(
+            "observe-runtime", "--control-root", str(case["control"]),
+            "--run-id", case["run_id"], "--owner-token", OWNER,
+            "--revision", str(state["revision"]), "--attempt-id", attempt_id,
+            "--event", event, "--event-id", receipt["event_id"], "--event-file", str(event_path),
+        )
+        return event_path
+
+    def stop_manual_runtime(self, case: dict[str, Any], attempt_id: str, *, return_hash: str | None = None) -> Path:
+        state, _ = ledger.load_state(case["paths"])
+        attempt = ledger.attempt_by_id(state, attempt_id)
+        if ledger.runtime_stop_proven(case["paths"], attempt):
+            runtime = attempt["runtime"]
+            ref = runtime["stop_ref"] if runtime.get("stop_ref") else runtime["not_started_ref"]
+            observation = ledger.stored_payload(case["paths"], ref, "manual stop observation")
+            event_path = case["root"] / "replayed-stop-receipt.json"
+            write_json(event_path, observation)
+            return event_path
+        if ledger.runtime_liveness(attempt) == "unknown":
+            self.observe_runtime(case, attempt_id, "start")
+        if return_hash is not None:
+            self.observe_runtime(case, attempt_id, "return_observed", return_hash=return_hash)
+        return self.observe_runtime(case, attempt_id, "stop")
+
     def review_return(
         self, case: dict[str, Any], *, verdict: str = "PASS",
         attempt_id: str = REVIEW_ATTEMPT_ID, packet_hash: str,
@@ -283,6 +325,11 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
         return_payload: dict[str, Any], attempt_id: str = REVIEW_ATTEMPT_ID,
         reviewer_stopped: bool = True,
     ) -> dict[str, Path]:
+        attempt_before, _ = ledger.load_state(case["paths"])
+        attempt_record = ledger.attempt_by_id(attempt_before, attempt_id)
+        if attempt_record.get("state") == "PREPARED":
+            return_hash = ledger.sha256_bytes(ledger.canonical_bytes(return_payload))
+            self.stop_manual_runtime(case, attempt_id, return_hash=return_hash)
         state, raw = ledger.load_state(case["paths"])
         attempt = next(item for item in state["attempts"] if item["id"] == attempt_id)
         bundle = prepared["bundle"]
@@ -337,6 +384,7 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
                     else self.review_return(case, purpose=purpose, packet_hash=attempt["packet_hash"])
                 )
                 evidence = self.write_manual_evidence(case, prepared, return_payload=payload)
+                state, _ = ledger.load_state(case["paths"])
                 imported = invoke(
                     "import-manual", "--control-root", str(case["control"]),
                     "--run-id", case["run_id"], "--owner-token", OWNER,
@@ -388,6 +436,7 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
             attempt = next(item for item in state["attempts"] if item["id"] == REVIEW_ATTEMPT_ID)
             payload = self.acceptance_return(case, packet_hash=attempt["packet_hash"])
             evidence = self.write_manual_evidence(case, prepared, return_payload=payload)
+            state, _ = ledger.load_state(case["paths"])
             raw_before = case["paths"]["ledger"].read_bytes()
             result = invoke(
                 "import-manual", "--control-root", str(case["control"]),
@@ -414,6 +463,7 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
                 case, verdict="PASS", check_outcome="failed", packet_hash=attempt["packet_hash"],
             )
             evidence = self.write_manual_evidence(case, prepared, return_payload=payload)
+            state, _ = ledger.load_state(case["paths"])
             raw_before = case["paths"]["ledger"].read_bytes()
             result = invoke(
                 "import-manual", "--control-root", str(case["control"]),
@@ -434,10 +484,11 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             case = self.init_case(Path(directory))
             prepared = self.prepare(case, "final_g5")
+            # The interrupted session really did start and was explicitly
+            # stopped; a later forged return must not be treated as a new run.
+            termination = self.stop_manual_runtime(case, REVIEW_ATTEMPT_ID)
             state, _ = ledger.load_state(case["paths"])
             attempt = next(item for item in state["attempts"] if item["id"] == REVIEW_ATTEMPT_ID)
-            termination = case["root"] / "termination.json"
-            write_json(termination, {"status": "PASS", "writer_stopped": True})
             run(
                 "terminate-attempt", "--control-root", str(case["control"]),
                 "--run-id", case["run_id"], "--owner-token", OWNER,
@@ -479,6 +530,7 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
             attempt = next(item for item in state["attempts"] if item["id"] == REVIEW_ATTEMPT_ID)
             payload = self.review_return(case, packet_hash=attempt["packet_hash"])
             evidence = self.write_manual_evidence(case, prepared, return_payload=payload)
+            state, _ = ledger.load_state(case["paths"])
             result = invoke(
                 "import-manual", "--control-root", str(case["control"]),
                 "--run-id", case["run_id"], "--owner-token", OWNER,
@@ -512,6 +564,7 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
                 case, verdict="BLOCK", finding=True, packet_hash=attempt["packet_hash"],
             )
             evidence = self.write_manual_evidence(case, prepared, return_payload=payload)
+            state, _ = ledger.load_state(case["paths"])
             result = invoke(
                 "import-manual", "--control-root", str(case["control"]),
                 "--run-id", case["run_id"], "--owner-token", OWNER,

@@ -82,12 +82,44 @@ class Qualification:
         self.events.append({"label": label, "before": self.expected_revision, "after": self.expected_revision, "idempotent": True, "ledger_hash": ledger.sha256_bytes(before)})
         return result
 
+    def observe_runtime(
+        self, attempt_id: str, event: str, event_id: str, *, instance: str,
+        return_hash: str | None = None,
+    ) -> None:
+        state, _ = self.state()
+        attempt = ledger.attempt_by_id(state, attempt_id)
+        receipt = {
+            "kind": "runtime_observation", "event_id": event_id, "event": event,
+            "run_id": self.run_id, "attempt_id": attempt_id, "epoch": attempt["epoch"],
+            "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+            "runtime_instance_id": instance, "observed_at": "2026-09-18T12:00:00Z",
+            "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": return_hash,
+            "coverage": {"scope": "test process tree", "descendant_writers": "included" if event == "stop" else "not_applicable"},
+        }
+        event_path = self.paths["run"] / f"{event_id}.json"
+        write_json(event_path, receipt)
+        self.mutate(
+            f"runtime-{attempt_id}-{event}", "observe-runtime", "--control-root", str(self.control),
+            "--run-id", self.run_id, "--owner-token", self.token,
+            "--revision", str(state["revision"]), "--attempt-id", attempt_id,
+            "--event", event, "--event-id", event_id, "--event-file", str(event_path),
+        )
+
     def bootstrap(self) -> None:
         result = self.call("init", "--control-root", str(self.control), "--repo-root", str(self.repo), "--run-id", self.run_id, "--owner-token", self.token)
         if result["revision"] != 0:
             raise AssertionError("init did not create revision 0")
         self.events.append({"label": "init", "before": None, "after": 0, "ledger_hash": ledger.sha256_file(self.paths["ledger"])})
-        self.mutate("interrupted-bootstrap-recovery", "recover", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", "0", "--reason", "interrupted_bootstrap")
+        before, _ = self.state()
+        def bind_checkout(state: dict[str, object]) -> None:
+            state["repository"].update({
+                "checkout": str(self.repo), "branch": self.call_git("branch", "--show-current"),
+                "initial_head": self.call_git("rev-parse", "HEAD"),
+            })
+        bound = ledger.transaction(self.paths, self.token, before["revision"], bind_checkout)
+        self.expected_revision = int(bound["revision"])
+        self.events.append({"label": "bind-checkout", "before": before["revision"], "after": self.expected_revision, "ledger_hash": ledger.sha256_file(self.paths["ledger"])})
+        self.mutate("interrupted-bootstrap-recovery", "recover", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--reason", "interrupted_bootstrap")
         intent_v1 = self.root / "intent-v1.md"; ledger.atomic_write(intent_v1, b"# Intent v1\n\nR-1 and R-2.\n")
         self.mutate("publish-intent", "publish-intent", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--intent-file", str(intent_v1), "--doc-id", "D-intent-v1", "--doc-version", "v1", "--intent-revision", "1")
         self.mutate("finish-bootstrap-recovery", "gate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--phase", "INTENT", "--control", "ACTIVE", "--reason", "reconciled", "--next-action", "g1_build")
@@ -153,6 +185,9 @@ class Qualification:
         payload = {"identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]}, "subject_fingerprint": publication["publication_hash"], "verdict": verdict, "coverage": [{"criterion_id": "C-1", "outcome": outcome, "evidence_refs": [f"EV-{attempt_id}"]}, {"criterion_id": "C-2", "outcome": outcome, "evidence_refs": [f"EV-{attempt_id}"]}], "checks": [{"check_id": f"check-{review_kind}", "axis": review_kind, "outcome": check_outcome, "actual": verdict, "evidence_ref": f"EV-{attempt_id}"}], "context_refs": ["offline-clean-fixture"], "findings": []}
         inbox = self.paths["scratch"] / attempt_id / "return.json"; write_json(inbox, payload)
         self.call("validate-return", "--control-root", str(self.control), "--run-id", self.run_id, "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "review")
+        runtime_instance = f"runtime-{attempt_id}"
+        self.observe_runtime(attempt_id, "start", f"OBS-{attempt_id}-START", instance=runtime_instance)
+        self.observe_runtime(attempt_id, "stop", f"OBS-{attempt_id}-STOP", instance=runtime_instance)
         self.mutate(f"ingest-{attempt_id}-{verdict.lower()}", "ingest-return", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "review")
         self.idempotent(f"ingest-{attempt_id}-lost-response", "ingest-return", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision - 1), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "review")
         if ledger.attempt_by_id(self.state()[0], attempt_id)["lease"]["state"] != "released":
@@ -187,19 +222,38 @@ class Qualification:
     def worker_candidate(self, ticket_id: str, criterion_id: str, attempt_id: str, filename: str, content: str, *, repair: dict[str, str] | None = None, ready: bool = True) -> str:
         if ready:
             self.mutate(f"ready-{ticket_id}", "ready-ticket", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--ticket-id", ticket_id)
-        base = self.call_git("rev-parse", "HEAD")
+        state, _ = self.state()
+        ticket = next(item for item in state["tickets"] if item["id"] == ticket_id)
+        intent = ledger.current_intent_binding(state)
+        publication = state["design_publication"]
+        candidate = ledger.current_candidate_record(state, ticket)
+        base = candidate.get("sha") if candidate is not None else state["repository"].get("initial_head")
+        if not base:
+            raise AssertionError("fixture checkout has no exact current candidate/base")
+        self.call_git("switch", "--create", f"qualification-{attempt_id}", str(base))
         baseline = self.baseline(attempt_id)
         operation = "modify" if (self.repo / filename).exists() else "create"
-        packet = {"identity": {"run_id": self.run_id, "ticket_id": ticket_id, "attempt_id": attempt_id, "epoch": 0, "source_revision": self.expected_revision, "intent_revision": "2"}, "kind": "worker", "mode": "repair" if repair else "implement", "goal": f"implement {ticket_id}", "acceptance": [{"criterion_id": criterion_id}], "workspace": {"root": str(self.repo), "expected_base": base}, "write": {"allow": [{"path": filename, "operations": ["create", "modify"]}]}, "verification": [{"check_id": f"oracle-{criterion_id}", "criterion_refs": [criterion_id], "required": True}], "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}], "return_target": {"path": "return.json"}}
+        identity = {
+            "run_id": self.run_id, "ticket_id": ticket_id, "attempt_id": attempt_id, "epoch": 0,
+            "source_revision": self.expected_revision, "intent_revision": intent["revision"],
+            "intent_document_ref": intent["document_ref"], "intent_document_hash": intent["document_hash"],
+            "design_publication_ref": publication["id"], "design_publication_hash": publication["publication_hash"],
+            "design_publication_revision": publication["published_revision"],
+            "contract_refs": sorted(ticket.get("contract_refs", [])),
+        }
+        packet = {"identity": identity, "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"], "intent_document_hash": intent["document_hash"], "kind": "worker", "mode": "repair" if repair else "implement", "goal": f"implement {ticket_id}", "acceptance": [{"criterion_id": criterion_id}], "workspace": {"root": str(self.repo), "expected_base": base}, "write": {"allow": [{"path": filename, "operations": ["create", "modify"]}]}, "verification": [{"check_id": f"oracle-{criterion_id}", "criterion_refs": [criterion_id], "required": True}], "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}], "return_target": {"path": "return.json"}}
         if repair:
             packet["repair"] = repair
         packet_path = self.root / f"{attempt_id}-packet.json"; write_json(packet_path, packet)
         self.mutate(f"dispatch-{attempt_id}", "dispatch", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--ticket-id", ticket_id, "--attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--route-id", "ROUTE-v3", "--packet", str(packet_path))
         self.idempotent(f"dispatch-{attempt_id}-lost-response", "dispatch", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision - 1), "--ticket-id", ticket_id, "--attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--route-id", "ROUTE-v3", "--packet", str(packet_path))
+        runtime_instance = f"runtime-{attempt_id}"
+        self.observe_runtime(attempt_id, "start", f"OBS-{attempt_id}-START", instance=runtime_instance)
         ledger.atomic_write(self.repo / filename, content.encode())
         (self.repo / filename).chmod(0o644)
+        self.observe_runtime(attempt_id, "stop", f"OBS-{attempt_id}-STOP", instance=runtime_instance)
         attempt = ledger.attempt_by_id(self.state()[0], attempt_id)
-        payload = {"identity": {"run_id": self.run_id, "ticket_id": ticket_id, "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": packet["identity"]["source_revision"], "intent_revision": "2"}, "status": "DONE", "result": "implemented", "files": [{"path": filename, "operation": operation}], "checks": [{"check_id": f"oracle-{criterion_id}", "outcome": "pass", "actual": content.strip(), "evidence_ref": f"EV-{attempt_id}"}], "criteria": [{"criterion_id": criterion_id, "outcome": "satisfied", "evidence_refs": [f"EV-{attempt_id}"]}]}
+        payload = {"identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]}, "status": "DONE", "result": "implemented", "files": [{"path": filename, "operation": operation}], "checks": [{"check_id": f"oracle-{criterion_id}", "outcome": "pass", "actual": content.strip(), "evidence_ref": f"EV-{attempt_id}"}], "criteria": [{"criterion_id": criterion_id, "outcome": "satisfied", "evidence_refs": [f"EV-{attempt_id}"]}]}
         inbox = self.paths["scratch"] / attempt_id / "return.json"; write_json(inbox, payload)
         self.call("validate-return", "--control-root", str(self.control), "--run-id", self.run_id, "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "worker")
         self.mutate(f"ingest-{attempt_id}", "ingest-return", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "worker")
@@ -238,6 +292,11 @@ class Qualification:
         packet_path = self.root / f"{review_attempt_id}-packet.json"; write_json(packet_path, packet)
         self.mutate(f"prepare-{review_attempt_id}", "prepare-review", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--ticket-id", ticket_id, "--review-attempt-id", review_attempt_id, "--lease-id", f"L-{review_attempt_id}", "--packet", str(packet_path))
         attempt = ledger.attempt_by_id(self.state()[0], review_attempt_id)
+        runtime_instance = f"runtime-{review_attempt_id}"
+        self.observe_runtime(review_attempt_id, "start", f"OBS-{review_attempt_id}-START", instance=runtime_instance)
+        self.observe_runtime(review_attempt_id, "stop", f"OBS-{review_attempt_id}-STOP", instance=runtime_instance)
+        state = self.state()[0]
+        worker = ledger.attempt_by_id(state, worker_attempt_id)
         outcome = "fulfilled" if verdict == "PASS" else "missing"
         payload = {"identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]}, "subject_fingerprint": worker["candidate_sha"], "verdict": verdict, "coverage": [{"criterion_id": criterion_id, "outcome": outcome, "evidence_refs": [f"EV-{review_attempt_id}"]}], "checks": [{"check_id": "correctness", "axis": "correctness", "outcome": "fulfilled" if verdict == "PASS" else "failed", "actual": verdict, "evidence_ref": f"EV-{review_attempt_id}"}], "context_refs": ["offline-independent"], "findings": [] if verdict == "PASS" else [{"axis": "correctness", "impact": "blocking", "claim": "candidate needs repair", "expected": "correct", "actual": "defect", "evidence": f"EV-{review_attempt_id}", "affected_refs": [ticket_id]}]}
         finding_ref = self.pending_finding_by_ticket.get(ticket_id)
@@ -285,8 +344,68 @@ class Qualification:
         return candidate1, candidate2
 
     def accept(self, candidate: str) -> None:
-        state, _ = self.state(); attempt_id = "A-T2-review-1"; review_attempt = ledger.attempt_by_id(state, attempt_id)
-        export = self.root / "candidate-export"; export.mkdir(); shutil.copy2(self.repo / "app-one.txt", export / "app-one.txt"); shutil.copy2(self.repo / "app-two.txt", export / "app-two.txt")
+        state, _ = self.state()
+        attempt_id = "A-T2-g5"
+        ticket = next(item for item in state["tickets"] if item["id"] == "T-2-v3")
+        candidate_record = ledger.current_candidate_record(state, ticket)
+        if candidate_record is None:
+            raise AssertionError("G5 requires the exact current T-2 candidate")
+        initial_packet = {
+            "identity": {
+                "run_id": self.run_id, "ticket_id": ticket["id"], "attempt_id": attempt_id,
+                "epoch": 0, "source_revision": self.expected_revision,
+                "registration_revision": self.expected_revision, "subject_revision": self.expected_revision,
+                "intent_revision": "2",
+            },
+            "kind": "review", "mandate": "independent product acceptance",
+            "subject_fingerprint": candidate_record["sha"], "criteria": [{"criterion_id": "C-2"}],
+            "axes": ["product-acceptance"], "return_target": {"path": "acceptance.json"},
+        }
+        initial_packet_path = self.root / f"{attempt_id}-registration.json"
+        write_json(initial_packet_path, initial_packet)
+        packet_raw = initial_packet_path.read_bytes()
+        packet_hash = ledger.sha256_bytes(packet_raw)
+        packet_ref = f"objects/{ledger.object_store(self.paths, packet_raw)}"
+        before_revision = self.expected_revision
+        def register_g5_review(state: dict[str, object]) -> None:
+            worker = ledger.current_candidate_producer(state, ticket)
+            if worker is None or worker.get("candidate_sha") != candidate_record["sha"]:
+                raise AssertionError("G5 reviewer registration lost its exact candidate producer")
+            attempt = {
+                "id": attempt_id, "kind": "review", "mode": "change", "subject_ref": ticket["id"],
+                "packet_ref": packet_ref, "packet_hash": packet_hash, "epoch": state["owner"]["epoch"],
+                "state": "PREPARED", "lease": {"id": f"L-{attempt_id}", "state": "active", "zone": []},
+                "route_ref": None, "checkout": None, "base_sha": worker["candidate_sha"],
+                "candidate_sha": worker["candidate_sha"], "candidate_tree_sha": worker["candidate_tree_sha"],
+                "return_ref": None, "finding_refs": [], "subject_fingerprint": worker["candidate_sha"],
+                "packet_registration_revision": state["revision"], "packet_source_revision": state["revision"],
+                "subject_revision": state["revision"], "attempt_created_revision": state["revision"] + 1,
+                "return_source_revision": None,
+            }
+            ledger.initialize_attempt_runtime(self.run_id, attempt)
+            binding = ledger.current_intent_binding(state)
+            attempt.update({
+                "intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"],
+                "intent_document_hash": binding["document_hash"],
+            })
+            state["attempts"].append(attempt)
+            ledger.add_usage(state.setdefault("usage", ledger.default_usage()).setdefault("counters", ledger.zero_usage()), {"packet_bytes": len(packet_raw), "attempt_registrations": 1})
+            state["lifecycle"]["next_action"] = {"kind": "prepare_g5_handoff", "subject_refs": [attempt_id], "preconditions": ["exact integrated candidate remains current"], "read_refs": ["phases/accept.md"]}
+        registered = ledger.transaction(self.paths, self.token, before_revision, register_g5_review)
+        self.expected_revision = int(registered["revision"])
+        self.events.append({"label": "prepare-g5-reviewer", "before": before_revision, "after": self.expected_revision, "ledger_hash": ledger.sha256_file(self.paths["ledger"])})
+        state, _ = self.state(); review_attempt = ledger.attempt_by_id(state, attempt_id)
+        export = self.root / "candidate-export"; export.mkdir()
+        for ticket_id, filename in (("T-1-v3", "app-one.txt"), ("T-2-v3", "app-two.txt")):
+            ticket = next(item for item in state["tickets"] if item["id"] == ticket_id)
+            current_candidate = ledger.current_candidate_record(state, ticket)
+            if current_candidate is None:
+                raise AssertionError(f"missing exact candidate for manual acceptance export: {ticket_id}")
+            content = subprocess.run(
+                ["git", "-C", str(self.repo), "show", f"{current_candidate['sha']}:{filename}"],
+                check=True, capture_output=True,
+            ).stdout
+            ledger.atomic_write(export / filename, content)
         bundle_root = self.root / "g5-bundle"
         packet = {"identity": {"run_id": self.run_id, "attempt_id": attempt_id, "epoch": 0, "source_revision": self.expected_revision, "intent_revision": "2", "intent_document_ref": "D-intent-v2", "intent_document_hash": state["intent"]["document_hash"]}, "kind": "acceptance", "mandate": "independent product acceptance", "subject_fingerprint": candidate, "criteria": [{"id": "C-1", "requirement_id": "R-1", "oracle": "app-one FIXED"}, {"id": "C-2", "requirement_id": "R-2", "oracle": "app-two DONE"}], "axes": ["product-acceptance"], "constraints": ["offline"], "subject": {"candidate_sha": candidate, "candidate_tree_sha": review_attempt["candidate_tree_sha"], "export_label": "synthetic", "pristine_check_required": True}, "return_target": {"path": "acceptance.json"}}
         projection = {"kind": "acceptance_projection", "intent_revision": "2", "intent_document_ref": "D-intent-v2", "intent_document_hash": state["intent"]["document_hash"], "candidate_fingerprint": candidate, "goal": "synthetic lifecycle", "criteria": [{"id": "C-1", "requirement_id": "R-1", "oracle": "app-one FIXED"}, {"id": "C-2", "requirement_id": "R-2", "oracle": "app-two DONE"}], "exclusions": [], "return_schema": "acceptance_return"}
@@ -298,6 +417,12 @@ class Qualification:
         context = {"receipt_id": "CTX-G5", "status": "PASS", "grade": "MANUAL_ATTESTED_CLEAN", "packet_hash": attempt["packet_hash"], "export_hash": handoff["manifest_sha256"], "clean_input": True, "contamination_absent": True, "session_provenance": {"fixture": "offline"}}
         env_path = self.root / "environment.json"; context_path = self.root / "context.json"; write_json(env_path, env); write_json(context_path, context)
         base_return = {"identity": {"run_id": self.run_id, "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": packet["identity"]["source_revision"], "intent_revision": "2", "intent_document_ref": "D-intent-v2", "intent_document_hash": state["intent"]["document_hash"]}, "candidate_fingerprint": candidate, "verdict": "PASS", "outcomes": [{"criterion_id": "C-1", "outcome": "fulfilled", "evidence_refs": ["EV-G5-1"]}, {"criterion_id": "C-2", "outcome": "fulfilled", "evidence_refs": ["EV-G5-2"]}], "checks": [{"check_id": "product-acceptance", "outcome": "fulfilled", "actual": "fixture passed", "evidence_ref": "EV-G5"}], "findings": []}
+        return_hash = ledger.sha256_bytes(ledger.canonical_bytes(base_return))
+        runtime_instance = "runtime-A-T2-review-1"
+        self.observe_runtime(attempt_id, "start", "OBS-A-T2-G5-START", instance=runtime_instance)
+        self.observe_runtime(attempt_id, "return_observed", "OBS-A-T2-G5-RETURN", instance=runtime_instance, return_hash=return_hash)
+        self.observe_runtime(attempt_id, "stop", "OBS-A-T2-G5-STOP", instance=runtime_instance)
+        state, _ = self.state()
         inbox_root = self.paths["scratch"] / attempt_id
         stale = dict(base_return); stale["candidate_fingerprint"] = "0" * 40; stale_path = inbox_root / "stale-acceptance.json"; write_json(stale_path, stale)
         _, raw = self.state(); integrity = self.root / "g5-integrity.json"; write_json(integrity, {"status": "PASS", "candidate_fingerprint": candidate, "ledger_hash": ledger.sha256_bytes(raw)})

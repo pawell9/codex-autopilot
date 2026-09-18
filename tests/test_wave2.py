@@ -11,6 +11,7 @@ from tests.test_phase_g_execution_binding_v110 import (
     install_current_execution_authority,
     publish_fixture_route,
 )
+from tests.test_phase_g_runtime_observations_v110 import record_runtime_event
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,7 +96,10 @@ class Wave2Tests(unittest.TestCase):
             payload = {"identity": {**packet_identity, "packet_hash": state["attempts"][0]["packet_hash"]}, "status": "BLOCKED", "result": "contract is incomplete", "files": [], "checks": [{"check_id": "oracle", "outcome": "not_run", "actual": "blocked", "evidence_ref": "ev-block"}], "criteria": [{"criterion_id": "C-1", "outcome": "unverifiable", "evidence_refs": ["ev-block"]}], "issues": [{"type": "contract_gap", "cause": "contract", "impact": "blocking", "affected_refs": ["T-1"], "disposition": "repair contract"}]}
             inbox = paths["scratch"] / "A-1" / "return.json"
             write_json(inbox, payload)
-            run("ingest-return", "--control-root", str(root / "control"), "--run-id", "run-2", "--owner-token", "owner-a", "--revision", "2", "--attempt-id", "A-1", "--return-file", str(inbox), "--kind", "worker")
+            record_runtime_event(root / "control", "run-2", "owner-a", paths, "A-1", "start", "OBS-A-1-START", instance="runtime-A-1")
+            record_runtime_event(root / "control", "run-2", "owner-a", paths, "A-1", "stop", "OBS-A-1-STOP", instance="runtime-A-1", descendant_writers="included")
+            state, _ = ledger.load_state(paths)
+            run("ingest-return", "--control-root", str(root / "control"), "--run-id", "run-2", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--attempt-id", "A-1", "--return-file", str(inbox), "--kind", "worker")
             state, _ = ledger.load_state(paths)
             self.assertEqual("BLOCKED", state["lifecycle"]["control"])
             self.assertEqual("BLOCKED", state["tickets"][0]["state"])
@@ -117,8 +121,11 @@ class Wave2Tests(unittest.TestCase):
             payload = {"identity": {**packet_identity, "packet_hash": state["attempts"][0]["packet_hash"]}, "status": "DONE", "result": "updated", "files": [{"path": "other.txt", "operation": "modify"}], "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "ok", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-1", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]}
             inbox = paths["scratch"] / "A-1" / "return.json"
             write_json(inbox, payload)
+            record_runtime_event(root / "control", "run-2", "owner-a", paths, "A-1", "start", "OBS-A-1-START", instance="runtime-A-1")
+            record_runtime_event(root / "control", "run-2", "owner-a", paths, "A-1", "stop", "OBS-A-1-STOP", instance="runtime-A-1", descendant_writers="included")
+            state, _ = ledger.load_state(paths)
 
-            result = run("ingest-return", "--control-root", str(root / "control"), "--run-id", "run-2", "--owner-token", "owner-a", "--revision", "2", "--attempt-id", "A-1", "--return-file", str(inbox), "--kind", "worker")
+            result = run("ingest-return", "--control-root", str(root / "control"), "--run-id", "run-2", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--attempt-id", "A-1", "--return-file", str(inbox), "--kind", "worker")
 
             self.assertIn('"status": "BLOCKED"', result.stdout)
             state, _ = ledger.load_state(paths)
