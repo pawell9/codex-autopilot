@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Synthetic 40-ticket lifecycle qualification for the V1 ledger.
 
-This exercises bookkeeping and lifecycle helpers only.  No coding worker is
-started and no real product change is made.
+This exercises bookkeeping and lifecycle helpers without starting agents.  It
+uses a disposable real Git repository so every synthetic candidate carries the
+same base/tree/write-set proof required from an ordinary production candidate.
 """
 
 from __future__ import annotations
@@ -59,7 +60,7 @@ def build_tickets(count: int) -> list[dict[str, object]]:
             "verification_ref": "synthetic-oracle",
             "complexity": "coupled" if index % 7 == 0 else "bounded",
             "risk": "elevated" if index % 11 == 0 else "routine",
-            "zone": [{"path": f"fixture/{ticket_id(index)}.txt", "operations": ["create"]}],
+            "zone": [{"path": f"fixture/{ticket_id(index)}.txt", "operations": ["modify"]}],
             "current_attempt": None,
             "replacement_refs": [],
         })
@@ -87,7 +88,7 @@ def worker_packet(run_id: str, ticket: dict[str, object], attempt_id: str, mode:
         "kind": "worker", "mode": mode, "goal": "synthetic qualification worker",
         "acceptance": [{"criterion_id": "C-qualification"}],
         "workspace": {"root": "", "expected_base": None},
-        "write": {"allow": [{"path": f"fixture/{ticket['id']}.txt", "operations": ["create"]}]},
+        "write": {"allow": [{"path": f"fixture/{ticket['id']}.txt", "operations": ["modify"]}]},
         "verification": [{"check_id": "synthetic-oracle", "required": True}],
         "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}],
         "return_target": {"path": "return.json"},
@@ -127,29 +128,45 @@ def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, obj
     index = int(str(ticket["id"]).rsplit("-", 1)[1])
     attempt_id = f"attempt-{index:02d}" + ("-repair" if repair else "")
     repair_contract = ticket.get("repair") if repair else None
+    base_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True, capture_output=True,
+    ).stdout.strip()
     packet_path = root / f"{attempt_id}.packet.json"
     route_path = root / f"{attempt_id}.route.json"
     packet = worker_packet(run_id, ticket, attempt_id, "repair" if repair else "implement", repair_contract)
     # The BLOCKED repair candidate commit must bind to the worker's actual
     # checkout and base, not a fixture-only authority string.
-    packet["workspace"] = {"root": str(repo), "expected_base": None}
+    packet["workspace"] = {"root": str(repo), "expected_base": base_sha}
     write_json(packet_path, packet)
     write_json(route_path, {"id": f"route-{attempt_id}", "capability": "fixture-worker", "reasoning": "synthetic", "requested_binding": "fixture-model", "observed_binding": "fixture-model", "adequacy": "CONFIRMED", "context_grade": "PACKET_SCOPED"})
     cli("dispatch", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--ticket-id", str(ticket["id"]), "--attempt-id", attempt_id, "--lease-id", f"lease-{attempt_id}", "--route-id", f"route-{attempt_id}", "--packet", str(packet_path), "--route", str(route_path))
     state, _ = ledger.load_state(paths)
     attempt = next(item for item in state["attempts"] if item["id"] == attempt_id)
     inbox = paths["scratch"] / attempt_id / "return.json"
-    payload = {"identity": {"run_id": run_id, "ticket_id": ticket["id"], "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0}, "status": "DONE", "result": "synthetic completed worker", "files": [], "checks": [{"check_id": "synthetic-oracle", "outcome": "pass", "actual": "fixture", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-qualification", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]}
+    relative_path = f"fixture/{ticket['id']}.txt"
+    (repo / relative_path).write_text(
+        f"candidate from {attempt_id}\n", encoding="utf-8",
+    )
+    payload = {"identity": {"run_id": run_id, "ticket_id": ticket["id"], "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0}, "status": "DONE", "result": "synthetic completed worker", "files": [{"path": relative_path, "operation": "modify"}], "checks": [{"check_id": "synthetic-oracle", "outcome": "pass", "actual": "fixture", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-qualification", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]}
     write_json(inbox, payload)
     cli("ingest-return", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "worker")
     state, _ = ledger.load_state(paths)
     operation_id = f"operation-{index:02d}" + ("-repair" if repair else "")
     authority_ref = repair_authority_ref if repair and repair_authority_ref else "qualification"
-    cli("prepare-effect", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(repo), "--authority-ref", authority_ref)
-    candidate_sha = f"{index + 1:040x}"
-    tree_sha = f"{index + 1001:040x}"
+    cli("prepare-effect", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(repo), "--expected-before", base_sha, "--authority-ref", authority_ref)
+    subprocess.run(["git", "-C", str(repo), "add", "--", relative_path], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid", "commit", "-qm", f"candidate {attempt_id}"],
+        check=True,
+    )
+    candidate_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True, capture_output=True,
+    ).stdout.strip()
+    tree_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], check=True, text=True, capture_output=True,
+    ).stdout.strip()
     receipt = root / f"{operation_id}.receipt.json"
-    write_json(receipt, {"status": "PASS", "checkout": str(repo), "base_sha": None, "commit_sha": candidate_sha, "tree_sha": tree_sha, "authority_ref": authority_ref, "receipt_ref": operation_id})
+    write_json(receipt, {"status": "PASS", "run_id": run_id, "ticket_id": ticket["id"], "attempt_id": attempt_id, "operation_id": operation_id, "kind": "candidate_commit", "target": str(repo), "checkout": str(repo), "expected_before": base_sha, "base_sha": base_sha, "intended_after": candidate_sha, "commit_sha": candidate_sha, "tree_sha": tree_sha, "authority_ref": authority_ref, "receipt_ref": operation_id})
     state, _ = ledger.load_state(paths)
     cli("candidate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--commit-receipt", str(receipt), "--operation-id", operation_id)
     state, _ = ledger.load_state(paths)
@@ -206,6 +223,16 @@ def run_qualification() -> dict[str, object]:
         root = Path(directory)
         control, repo = root / "control", root / "repo"
         control.mkdir(); repo.mkdir()
+        tickets = build_tickets(40)
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        (repo / "fixture").mkdir()
+        for ticket in tickets:
+            (repo / "fixture" / f"{ticket['id']}.txt").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "fixture"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid", "commit", "-qm", "qualification baseline"],
+            check=True,
+        )
         run_id = "qualification-40"
         init = cli("init", "--control-root", str(control), "--repo-root", str(repo), "--run-id", run_id, "--owner-token", "owner", "--request", "codex-autopilot полный автомат, глубокая — сделай qualification")
         paths = ledger.paths(control, run_id)
@@ -213,7 +240,6 @@ def run_qualification() -> dict[str, object]:
         intent = paths["docs"] / "intent" / "v1.md"
         intent_bytes = b"# Synthetic 40-ticket qualification\n"
         ledger.atomic_write(intent, intent_bytes)
-        tickets = build_tickets(40)
         for ticket in tickets:
             write_ticket_artifact(paths["run"], ticket)
         publication_hash = ledger.object_store(paths, b'{"fixture":"40-ticket-design-publication"}\n')

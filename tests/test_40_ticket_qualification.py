@@ -15,7 +15,10 @@ class FortyTicketQualificationTests(unittest.TestCase):
         self.assertTrue(result["recovery_seen"])
         self.assertTrue(result["schema_round_trip"])
         self.assertEqual("ACCEPTED", result["terminal_control"])
-        self.assertLess(result["elapsed_seconds"], 90)
+        # Phase D gives every ordinary candidate a real Git commit, full
+        # base-to-tree audit, and immutable proof-object verification.  Keep a
+        # bounded wall-clock guard for the stronger 40-candidate workload.
+        self.assertLess(result["elapsed_seconds"], 180)
         self.assertLess(result["ledger_bytes"], 8 * 1024 * 1024)
 
 

@@ -128,7 +128,10 @@ class BlockedContinuationCandidateTests(unittest.TestCase):
         candidate_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True, capture_output=True).stdout.strip()
         tree_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], check=True, text=True, capture_output=True).stdout.strip()
         commit_receipt = root / "commit.json"
-        write_json(commit_receipt, {"status": "PASS", "checkout": str(repo), "base_sha": base_sha,
+        write_json(commit_receipt, {"status": "PASS", "run_id": RUN_ID, "ticket_id": TICKET_ID,
+                                    "attempt_id": ATTEMPT_ID, "operation_id": "OP-CONT-1", "kind": "candidate_commit",
+                                    "target": str(repo), "checkout": str(repo), "expected_before": base_sha,
+                                    "base_sha": base_sha, "intended_after": candidate_sha,
                                     "commit_sha": candidate_sha, "tree_sha": tree_sha, "authority_ref": auth_id})
         auth = {
             "id": auth_id, "type": "continuation_candidate_authorization", "status": "authorized",
@@ -408,7 +411,10 @@ class BlockedContinuationCandidateTests(unittest.TestCase):
             ledger.validate_ledger(state)
             ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
             commit_receipt = root / "commit.json"
-            write_json(commit_receipt, {"status": "PASS", "checkout": str(repo), "base_sha": source_candidate,
+            write_json(commit_receipt, {"status": "PASS", "run_id": RUN_ID, "ticket_id": TICKET_ID,
+                                        "attempt_id": "A-repair", "operation_id": "OP-CONT", "kind": "candidate_commit",
+                                        "target": str(repo), "checkout": str(repo), "expected_before": source_candidate,
+                                        "base_sha": source_candidate, "intended_after": candidate_sha,
                                         "commit_sha": candidate_sha, "tree_sha": candidate_tree, "authority_ref": "AUTH-CONT"})
             authorization = {"id": "AUTH-CONT", "type": "continuation_candidate_authorization", "status": "authorized",
                              "decision": "PRESERVE_CONTINUATION", "reason": "The full-suite failure is an external resource blocker.",

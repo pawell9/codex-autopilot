@@ -37,6 +37,7 @@ class Qualification:
         self.pending_finding_by_ticket: dict[str, str] = {}
         self.call_git("init", "-q")
         ledger.atomic_write(self.repo / "README.md", b"# synthetic\n")
+        (self.repo / "README.md").chmod(0o644)
         self.call_git("add", "README.md")
         self.call_git("-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid", "commit", "-qm", "baseline")
 
@@ -196,6 +197,7 @@ class Qualification:
         self.mutate(f"dispatch-{attempt_id}", "dispatch", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--ticket-id", ticket_id, "--attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--route-id", "ROUTE-v3", "--packet", str(packet_path))
         self.idempotent(f"dispatch-{attempt_id}-lost-response", "dispatch", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision - 1), "--ticket-id", ticket_id, "--attempt-id", attempt_id, "--lease-id", f"L-{attempt_id}", "--route-id", "ROUTE-v3", "--packet", str(packet_path))
         ledger.atomic_write(self.repo / filename, content.encode())
+        (self.repo / filename).chmod(0o644)
         attempt = ledger.attempt_by_id(self.state()[0], attempt_id)
         payload = {"identity": {"run_id": self.run_id, "ticket_id": ticket_id, "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0, "source_revision": packet["identity"]["source_revision"], "intent_revision": "2"}, "status": "DONE", "result": "implemented", "files": [{"path": filename, "operation": operation}], "checks": [{"check_id": f"oracle-{criterion_id}", "outcome": "pass", "actual": content.strip(), "evidence_ref": f"EV-{attempt_id}"}], "criteria": [{"criterion_id": criterion_id, "outcome": "satisfied", "evidence_refs": [f"EV-{attempt_id}"]}]}
         inbox = self.paths["scratch"] / attempt_id / "return.json"; write_json(inbox, payload)
@@ -225,7 +227,7 @@ class Qualification:
         self.idempotent(f"prepare-effect-{attempt_id}-lost-response", "prepare-effect", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision - 1), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(self.repo), "--expected-before", base, "--authority-ref", authority_ref)
         self.call_git("add", filename); self.call_git("-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid", "commit", "-qm", f"candidate {attempt_id}")
         commit = self.call_git("rev-parse", "HEAD"); tree = self.call_git("rev-parse", "HEAD^{tree}")
-        receipt = self.root / f"{attempt_id}-receipt.json"; write_json(receipt, {"status": "PASS", "checkout": str(self.repo), "base_sha": base, "commit_sha": commit, "tree_sha": tree, "authority_ref": authority_ref, "receipt_ref": f"git:{commit}"})
+        receipt = self.root / f"{attempt_id}-receipt.json"; write_json(receipt, {"status": "PASS", "run_id": self.run_id, "ticket_id": ticket_id, "attempt_id": attempt_id, "operation_id": operation_id, "kind": "candidate_commit", "target": str(self.repo), "checkout": str(self.repo), "expected_before": base, "base_sha": base, "intended_after": commit, "commit_sha": commit, "tree_sha": tree, "authority_ref": authority_ref, "receipt_ref": f"git:{commit}"})
         self.mutate(f"candidate-{attempt_id}", "candidate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--attempt-id", attempt_id, "--commit-receipt", str(receipt), "--operation-id", operation_id)
         self.idempotent(f"candidate-{attempt_id}-lost-response", "candidate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision - 1), "--attempt-id", attempt_id, "--commit-receipt", str(receipt), "--operation-id", operation_id)
         return commit

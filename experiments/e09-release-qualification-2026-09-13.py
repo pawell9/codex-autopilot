@@ -55,7 +55,7 @@ def process_ticket(root: Path, control: Path, repo: Path, run_id: str, owner: st
     commit_sha = shell("git", "rev-parse", "HEAD", cwd=repo)["stdout"]
     tree_sha = shell("git", "rev-parse", "HEAD^{tree}", cwd=repo)["stdout"]
     receipt = root / f"{attempt_id}-commit.json"
-    write_json(receipt, {"status": "PASS", "checkout": str(repo), "base_sha": base, "commit_sha": commit_sha, "tree_sha": tree_sha, "authority_ref": "E09", "receipt_ref": f"E09-{ticket_id}"})
+    write_json(receipt, {"status": "PASS", "run_id": run_id, "ticket_id": ticket_id, "attempt_id": attempt_id, "operation_id": f"OP-{ticket_id}", "kind": "candidate_commit", "target": str(repo), "checkout": str(repo), "expected_before": base, "base_sha": base, "intended_after": commit_sha, "commit_sha": commit_sha, "tree_sha": tree_sha, "authority_ref": "E09", "receipt_ref": f"E09-{ticket_id}"})
     state = state_of(control, run_id)
     candidate = run("candidate", "--control-root", str(control), "--run-id", run_id, "--owner-token", owner, "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--commit-receipt", str(receipt), "--operation-id", f"OP-{ticket_id}")
     assert candidate["matched_expected"], candidate

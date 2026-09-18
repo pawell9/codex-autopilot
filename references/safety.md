@@ -14,7 +14,7 @@ G0 inventories the exact folder. A greenfield repository uses a recorded pre-boo
 
 V1 uses a clean exclusive checkout and unique `autopilot/<run-id>` branch from the agreed committed HEAD. It never writes over user dirtiness. A dirty/busy checkout may use a qualified permanent sibling worktree outside the source tree in an already authorized root with common-dir permissions; otherwise wait for a clean checkout. Nested `.autopilot/wt` copies and managed ephemeral worktrees are not fallback. Product writers are serial; shared-checkout parallel writes are not allowed.
 
-The worker never commits. The orchestrator audits and commits one nonempty logical candidate before review, with prepared operation containing base HEAD, intended tree, path list, operation ID, and evidence. Commit receipt includes resulting SHA/tree; history is never rewritten. `INTEGRATED` means current reviewed outcome on the run branch, not push/deploy/default-branch merge. Landing is separate explicitly authorized work.
+The worker never commits. The orchestrator audits and commits one nonempty logical candidate before review, with a prepared operation containing the exact base, checkout target, operation ID, authority, and expected result. The receipt binds the run, ticket, attempt, operation, target, base, resulting SHA/tree, and authority. Ordinary and continuation candidates pass the same full tracked/untracked/ignored/rename/type/mode/symlink audit and retain one hash-addressed `VerifiedCandidateProof`; history is never rewritten. `INTEGRATED` means current reviewed outcome on the run branch, not push/deploy/default-branch merge. Landing is separate explicitly authorized work.
 
 ## Ordinary review barrier
 
@@ -34,7 +34,7 @@ During wait, the authoritative run may publish ordinary owner status/recovery tr
 
 ## Effects, rollback, cleanup
 
-Before a dangerous effect record exact target/effect, authority, current fingerprint, recoverable checkpoint or acknowledged irreversibility, effective permission, and post-effect proof. Journal commits, init/branch/worktree, landing, scoped rollback, and cleanup as prepared/applied/uncertain operations. Unknown result is quarantined; never repeat by timeout.
+Before a dangerous effect record exact target/effect, authority, current fingerprint, recoverable checkpoint or acknowledged irreversibility, effective permission, and post-effect proof. Journal commits, init/branch/worktree, landing, scoped rollback, and cleanup as prepared/applied/uncertain/abandoned operations. An applied candidate commit remains pinned until its receipt and candidate proof are atomically linked as finalized. Unknown result is quarantined; never repeat by timeout.
 
 Partial uncommitted work may be restored only on proven owned paths with a prepared operation; foreign changes remain. A committed candidate is repaired/reverted with a new commit. No force-push, history rewrite, production migration, deployment, message, credentials rotation, recursive foreign cleanup, or remote backup is part of V1. Cleanup is optional after ownership disposition, stopped processes, and checkpoint.
 

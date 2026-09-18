@@ -177,7 +177,7 @@ class Wave1Tests(unittest.TestCase):
             candidate_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
             tree_sha = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
             receipt = Path(directory) / "commit.json"
-            write_json(receipt, {"status": "PASS", "checkout": str(repo), "base_sha": base_sha, "commit_sha": candidate_sha, "tree_sha": tree_sha, "authority_ref": "test", "receipt_ref": "receipt"})
+            write_json(receipt, {"status": "PASS", "run_id": "run-1", "ticket_id": "T-1", "attempt_id": "A-1", "operation_id": "OP-1", "kind": "candidate_commit", "target": str(repo), "checkout": str(repo), "expected_before": base_sha, "base_sha": base_sha, "intended_after": candidate_sha, "commit_sha": candidate_sha, "tree_sha": tree_sha, "authority_ref": "test", "receipt_ref": "receipt"})
             run("candidate", "--control-root", str(control), "--run-id", "run-1", "--owner-token", "owner-a", "--revision", "4", "--attempt-id", "A-1", "--commit-receipt", str(receipt), "--operation-id", "OP-1")
             state, _ = ledger.load_state(paths)
             self.assertEqual("CANDIDATE", state["tickets"][0]["state"])

@@ -106,6 +106,13 @@ CONTROL_TRANSITION_TABLE = {
 }
 TERMINAL_ATTEMPT_STATES = frozenset({"RETURNED", "LOST", "INTERRUPTED"})
 TERMINAL_CONTROLS = frozenset({"ACCEPTED", "FAILED", "CANCELLED"})
+EFFECT_TRANSITIONS = {
+    "prepared": frozenset({"applied", "uncertain", "abandoned"}),
+    "uncertain": frozenset({"applied", "abandoned"}),
+    "applied": frozenset({"finalized"}),
+    "abandoned": frozenset(),
+    "finalized": frozenset(),
+}
 RUN_SETTING_LABELS = {
     "interaction_mode": {"semi": "полуавтомат", "full": "полный автомат"},
     "depth": {"normal": "обычная", "deep": "глубокая"},
@@ -196,6 +203,19 @@ def fail(message: str) -> None:
     raise LedgerError(message)
 
 
+def transition_effect(operation: dict[str, Any], target: str) -> None:
+    """Apply the typed durable effect transition table."""
+    current = operation.get("state")
+    if target not in EFFECT_TRANSITIONS.get(current, frozenset()):
+        fail(f"illegal effect transition for {operation.get('id')}: {current} -> {target}")
+    operation["state"] = target
+
+
+def effect_is_unresolved(operation: dict[str, Any]) -> bool:
+    """Return whether an operation still needs execution, resolution, or adoption."""
+    return operation.get("state") in ("prepared", "uncertain", "applied")
+
+
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -259,7 +279,7 @@ def _action_event_id(kind: Any) -> str | None:
         return "run.recover"
     if kind in {"reconcile_actual_state", "reconcile_terminal_attempts"}:
         return "attempt.reconcile"
-    if kind in {"audit_worker_return_and_prepare_candidate", "preserve_blocked_candidate"}:
+    if kind in {"audit_worker_return_and_prepare_candidate", "preserve_blocked_candidate", "adopt_applied_effect"}:
         return "candidate.publish"
     if kind in {"authorize_repair", "resolve_blocker_or_authorize_candidate_bound_repair"}:
         return "repair.authorize"
@@ -323,9 +343,41 @@ def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
             if item.get("state") in ("LOST", "INTERRUPTED")
             and item.get("lease", {}).get("state") in ("active", "quarantined")
         ]
+        pending_operations = [item for item in state.get("operations", []) if effect_is_unresolved(item)]
+        if pending_operations:
+            operation = pending_operations[0]
+            operation_id = operation.get("id")
+            if operation.get("state") == "prepared":
+                action = {
+                    "kind": "apply_prepared_effect", "subject_refs": [operation_id],
+                    "preconditions": ["apply this exact prepared effect once", "record an exact immutable receipt or reconcile its observed state"],
+                    "read_refs": ["references/ledger.md", "references/safety.md"],
+                }
+            elif operation.get("state") == "uncertain":
+                action = {
+                    "kind": "reconcile_uncertain_effect", "subject_refs": [operation_id],
+                    "preconditions": ["inspect the exact target", "record fresh owner resolution evidence", "do not repeat the effect"],
+                    "read_refs": ["phases/recover.md", "references/safety.md"],
+                }
+            elif operation.get("state") == "applied":
+                producer = next((item for item in attempts if item.get("id") and item.get("id") == operation.get("attempt_ref")), None)
+                if producer is None:
+                    producer = next((item for item in attempts if item.get("kind") == "worker" and item.get("candidate_sha") in (None, operation.get("intended_after")) and item.get("checkout") and Path(item["checkout"]).expanduser().resolve() == Path(operation.get("target", "")).expanduser().resolve()), None)
+                if operation.get("kind") == "candidate_commit":
+                    action = {
+                        "kind": "adopt_applied_effect", "subject_refs": [operation_id, *([producer["id"]] if producer else [])],
+                        "preconditions": ["verify the immutable effect receipt and exact Git target", "finalize candidate linkage without repeating Git"],
+                        "read_refs": ["phases/recover.md", "references/ledger.md"],
+                    }
+                else:
+                    action = {
+                        "kind": "resume_after_effect_reconciliation", "subject_refs": [operation_id],
+                        "preconditions": ["re-read current ledger", "verify the resulting subject before further work"],
+                        "read_refs": ["phases/recover.md", "references/ledger.md"],
+                    }
         # Only an actual in-flight attempt creates a wait. A cached await or terminal
         # attempt is not executable orchestration authority.
-        if active:
+        elif active:
             if control in ("QUIESCING", "PAUSED", "RECOVERING"):
                 safe_active = [item for item in active if item.get("state") in ("PREPARED", "DISPATCHED")]
                 if safe_active:
@@ -655,7 +707,7 @@ def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
                             and not latest.get("invalidated_by")
                             and not any(item.get("impact") == "blocking" and not item.get("invalidated_by") for item in state.get("issues", []))
                             and not active_publication_leases(state)
-                            and not any(item.get("state") in ("prepared", "uncertain") for item in state.get("operations", []))
+                            and not any(effect_is_unresolved(item) for item in state.get("operations", []))
                         ):
                             action = {
                                 "kind": "finalize_acceptance", "subject_refs": [latest["return_ref"]] if latest.get("return_ref") else [],
@@ -1286,7 +1338,9 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
             fail(f"attempt epoch is ahead of owner epoch: {attempt['id']}")
         if state.get("runtime_provenance") and attempt.get("kind") == "review" and attempt.get("state") == "RETURNED" and attempt.get("lease", {}).get("state") == "active":
             fail(f"returned reviewer attempt retains an active lease: {attempt['id']}")
+    attempts_by_id = {item["id"]: item for item in state.get("attempts", [])}
     candidates_by_id = {item["id"]: item for item in state.get("candidates", [])}
+    operations_by_id = {item["id"]: item for item in state.get("operations", [])}
     for candidate in state.get("candidates", []):
         ticket = next((item for item in state.get("tickets", []) if item.get("id") == candidate.get("ticket_ref")), None)
         producer = next((item for item in state.get("attempts", []) if item.get("id") == candidate.get("producer_attempt_ref")), None)
@@ -1303,6 +1357,16 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
             successor = candidates_by_id.get(candidate["superseded_by"])
             if successor is None or successor.get("parent_candidate_ref") != candidate["id"]:
                 fail(f"candidate supersession edge is not reciprocal: {candidate['id']}")
+        proof_ref = candidate.get("proof_ref")
+        if proof_ref is not None:
+            if producer.get("candidate_proof_ref") != proof_ref:
+                fail(f"candidate and producer do not share one verified proof: {candidate['id']}")
+            proof_operations = [
+                operation for operation in operations_by_id.values()
+                if operation.get("proof_ref") == proof_ref and operation.get("candidate_ref") == candidate["id"]
+            ]
+            if len(proof_operations) != 1 or proof_operations[0].get("state") != "finalized":
+                fail(f"candidate proof is not linked to exactly one finalized effect: {candidate['id']}")
     for ticket in state.get("tickets", []):
         candidate_ref = ticket.get("current_candidate")
         if candidate_ref is not None:
@@ -1327,6 +1391,25 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
     for operation in state.get("operations", []):
         if operation.get("state") == "applied" and not operation.get("receipt_ref"):
             fail(f"applied operation lacks receipt: {operation['id']}")
+        linkage = (
+            operation.get("proof_ref"), operation.get("candidate_ref"),
+            operation.get("finalized_revision"),
+        )
+        if operation.get("state") == "finalized":
+            if not operation.get("receipt_ref") or any(value is None for value in linkage):
+                fail(f"finalized operation lacks receipt/candidate/proof linkage: {operation['id']}")
+            if not re.fullmatch(r"objects/[0-9a-f]{64}", operation.get("receipt_ref", "")):
+                fail(f"finalized operation receipt is not immutable: {operation['id']}")
+            candidate = candidates_by_id.get(operation.get("candidate_ref"))
+            if candidate is None or candidate.get("proof_ref") != operation.get("proof_ref"):
+                fail(f"finalized operation does not identify its verified candidate: {operation['id']}")
+            producer = attempts_by_id.get(candidate.get("producer_attempt_ref"))
+            if producer is None or producer.get("candidate_proof_ref") != operation.get("proof_ref"):
+                fail(f"finalized operation candidate producer has different proof: {operation['id']}")
+            if operation.get("finalized_revision") > state.get("revision", -1):
+                fail(f"finalized operation revision is ahead of the ledger: {operation['id']}")
+        elif any(value is not None for value in linkage):
+            fail(f"non-finalized operation contains finalized candidate linkage: {operation['id']}")
     all_ids = ids
     for finding in state.get("findings", []):
         if any(ref not in all_ids for ref in finding.get("affected_refs", [])):
@@ -1425,7 +1508,7 @@ def recovery_candidates(p: dict[str, Path], run_id: str) -> list[tuple[dict[str,
 
 def snapshot_is_pinned(state: dict[str, Any]) -> bool:
     return (
-        any(op.get("state") in ("prepared", "uncertain") for op in state.get("operations", []))
+        any(effect_is_unresolved(op) for op in state.get("operations", []))
         or state.get("lifecycle", {}).get("control") in ("RECOVERING", "ACCEPTED", "FAILED", "CANCELLED")
     )
 
@@ -2417,7 +2500,7 @@ def _ticket_blocking_refs(state: dict[str, Any], ticket_id: str) -> list[str]:
 
 def publish_candidate_projection(
     state: dict[str, Any], ticket: dict[str, Any], attempt: dict[str, Any], *,
-    quality: str, blocker_refs: list[str] | tuple[str, ...] = (),
+    quality: str, blocker_refs: list[str] | tuple[str, ...] = (), proof_ref: str | None = None,
 ) -> dict[str, Any]:
     """Publish the explicit candidate identity and advance its independent ticket pointer."""
     if quality not in ("DONE", "CONTINUATION"):
@@ -2446,6 +2529,8 @@ def publish_candidate_projection(
         "superseded_by": None,
         "invalidated_by": [],
     }
+    if proof_ref is not None:
+        record["proof_ref"] = proof_ref
     if existing is not None:
         comparable = {key: existing.get(key) for key in record}
         if comparable != record:
@@ -2464,6 +2549,186 @@ def publish_candidate_projection(
     ticket["last_worker_attempt"] = attempt["id"]
     ticket["current_attempt"] = attempt["id"]
     return record
+
+
+def build_verified_candidate_proof(
+    p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], attempt: dict[str, Any],
+    operation: dict[str, Any], operation_id: str, commit_receipt: dict[str, Any], commit_receipt_raw: bytes,
+    *, quality: str, parent_candidate_ref: str | None,
+) -> tuple[dict[str, Any], str]:
+    """Build one identity-, Git-, and write-set-bound proof for every candidate quality."""
+    if quality not in ("DONE", "CONTINUATION"):
+        fail(f"invalid verified candidate quality: {quality}")
+    if (
+        operation.get("id") != operation_id or operation.get("kind") != "candidate_commit"
+        or operation.get("state") not in ("prepared", "applied")
+        or operation.get("authority_ref") is None
+    ):
+        fail("verified candidate requires the exact prepared/applied candidate_commit operation")
+    if attempt.get("kind") != "worker" or attempt.get("subject_ref") != ticket.get("id"):
+        fail("verified candidate producer must be a same-ticket worker attempt")
+    if attempt.get("state") != "RETURNED" or attempt.get("lease", {}).get("state") != "active":
+        fail("verified candidate requires a returned attempt with an active, non-quarantined lease")
+    if attempt.get("epoch") != state.get("owner", {}).get("epoch"):
+        fail("verified candidate producer belongs to a stale owner epoch")
+    packet_ref = attempt.get("packet_ref")
+    returned_ref = attempt.get("return_ref")
+    if not packet_ref or not returned_ref or not attempt.get("packet_hash"):
+        fail("verified candidate requires immutable packet and return references")
+    packet = stored_payload(p, packet_ref, "candidate worker packet")
+    worker_return = stored_payload(p, returned_ref, "candidate worker return")
+    root = schema()
+    validate(worker_return, root["$defs"]["worker_return"], root, "$.candidate_worker_return")
+    validate_worker_return_semantics(worker_return, packet)
+    identity = packet_identity(worker_return)
+    packet_identity_value = packet_identity(packet)
+    if (
+        identity.get("run_id") != state.get("run_id")
+        or identity.get("ticket_id") != ticket.get("id")
+        or identity.get("attempt_id") != attempt.get("id")
+        or identity.get("packet_hash") != attempt.get("packet_hash")
+        or identity.get("epoch") != attempt.get("epoch")
+        or packet_identity_value.get("attempt_id") != attempt.get("id")
+        or packet_identity_value.get("ticket_id") not in (None, ticket.get("id"))
+    ):
+        fail("verified candidate packet/return identity is not bound to the current attempt")
+    expected_status = "DONE" if quality == "DONE" else worker_return.get("status")
+    if worker_return.get("status") != expected_status or (
+        quality == "CONTINUATION" and worker_return.get("status") not in ("BLOCKED", "HANDOFF")
+    ):
+        fail("candidate quality does not match the exact worker return status")
+
+    base_sha = attempt.get("base_sha")
+    if not GIT_SHA_RE.fullmatch(base_sha or ""):
+        fail("verified candidate requires an exact committed Git base SHA")
+    checkout_value = attempt.get("checkout")
+    if not isinstance(checkout_value, str) or not checkout_value:
+        fail("verified candidate attempt has no exact Git checkout")
+    checkout = Path(checkout_value).expanduser().resolve()
+    regular_directory(checkout, "verified candidate checkout")
+    target_value = operation.get("target")
+    if not isinstance(target_value, str) or not target_value:
+        fail("candidate effect operation has no exact target")
+    target = Path(target_value).expanduser().resolve()
+    if target != checkout:
+        fail("candidate effect target does not match the worker's exact checkout")
+    if operation.get("expected_before") != base_sha:
+        fail("candidate effect expected-before does not match the worker's exact base")
+    if operation.get("intended_after") not in (None, commit_receipt.get("commit_sha")):
+        fail("candidate receipt does not match the operation's intended-after SHA")
+    if commit_receipt.get("status") != "PASS":
+        fail("candidate commit receipt must have status PASS")
+    candidate_sha = commit_receipt.get("commit_sha")
+    tree_sha = commit_receipt.get("tree_sha")
+    if not GIT_SHA_RE.fullmatch(candidate_sha or "") or not GIT_SHA_RE.fullmatch(tree_sha or ""):
+        fail("candidate receipt must bind valid commit and tree SHAs")
+    if not commit_receipt.get("checkout"):
+        fail("candidate commit receipt must bind the exact checkout")
+    if Path(commit_receipt["checkout"]).expanduser().resolve() != checkout:
+        fail("candidate commit receipt checkout does not match the exact worker checkout")
+    if commit_receipt.get("base_sha") != base_sha:
+        fail("candidate commit receipt does not bind the exact worker base")
+    if commit_receipt.get("authority_ref") != operation.get("authority_ref"):
+        fail("candidate commit receipt does not bind the operation authority")
+    receipt_identity = {
+        "run_id": state.get("run_id"),
+        "ticket_id": ticket.get("id"),
+        "attempt_id": attempt.get("id"),
+        "operation_id": operation_id,
+        "kind": "candidate_commit",
+        "expected_before": base_sha,
+        "intended_after": candidate_sha,
+    }
+    if any(commit_receipt.get(key) != value for key, value in receipt_identity.items()):
+        fail("candidate commit receipt does not bind the exact run, ticket, attempt, operation, target, base, and intended commit")
+    if not commit_receipt.get("target") or Path(commit_receipt["target"]).expanduser().resolve() != target:
+        fail("candidate commit receipt does not bind the exact operation target")
+    if not worker_return.get("files"):
+        fail("candidate proof requires a non-empty declared worker write set")
+
+    try:
+        actual_head = git_output(checkout, "rev-parse", "HEAD").decode().strip()
+        actual_tree = git_output(checkout, "rev-parse", "HEAD^{tree}").decode().strip()
+        parents = git_output(checkout, "rev-list", "--parents", "-n", "1", actual_head).decode().split()
+    except (OSError, UnicodeError) as exc:
+        fail(f"cannot inspect verified candidate Git object: {exc}")
+    if actual_head != candidate_sha or actual_tree != tree_sha:
+        fail("candidate receipt does not match the exact checkout HEAD and tree")
+    if len(parents) != 2 or parents[1] != base_sha:
+        fail("candidate commit must be one direct commit on the exact worker base")
+    if git_output(checkout, "status", "--porcelain=v1", "-z", "--untracked-files=all"):
+        fail("candidate checkout must be clean after its exact candidate commit")
+
+    baseline = git_tree_baseline(checkout, base_sha)
+    audit = audit_write_set(checkout, baseline, worker_return.get("files", []), attempt.get("lease", {}).get("zone", []))
+    if not audit.get("pass") or not audit.get("changed_paths"):
+        fail(f"candidate write-set audit must PASS with a non-empty exact delta: {json.dumps(audit, sort_keys=True)}")
+    if set(audit.get("changed_paths", [])) != {item.get("path") for item in worker_return.get("files", [])}:
+        fail("candidate write-set audit differs from the exact validated worker return")
+
+    commit_ref = f"objects/{object_store(p, bytes(commit_receipt_raw))}"
+    audit_raw = canonical_bytes(audit)
+    audit_ref = f"objects/{object_store(p, audit_raw)}"
+    proof = {
+        "version": "1.1",
+        "run_id": state["run_id"],
+        "ticket_id": ticket["id"],
+        "attempt_id": attempt["id"],
+        "operation_id": operation_id,
+        "quality": quality,
+        "candidate_sha": candidate_sha,
+        "candidate_tree_sha": tree_sha,
+        "base_sha": base_sha,
+        "parent_sha": parents[1],
+        "checkout": str(checkout),
+        "target": str(target),
+        "authority_ref": operation["authority_ref"],
+        "parent_candidate_ref": parent_candidate_ref,
+        "packet_ref": packet_ref,
+        "packet_hash": attempt["packet_hash"],
+        "return_ref": returned_ref,
+        "commit_receipt_ref": commit_ref,
+        "write_set_audit_ref": audit_ref,
+        "write_set_audit_hash": sha256_bytes(audit_raw),
+        "introduced_revision": state["revision"] + 1,
+    }
+    validate(proof, root["$defs"]["verified_candidate_proof"], root, "$.verified_candidate_proof")
+    proof_ref = f"objects/{object_store(p, canonical_bytes(proof))}"
+    return proof, proof_ref
+
+
+def verify_verified_candidate_proof(p: dict[str, Path], proof_ref: str) -> dict[str, Any]:
+    """Re-read every immutable object named by a published candidate proof."""
+    proof = stored_payload(p, proof_ref, "verified candidate proof")
+    root = schema()
+    validate(proof, root["$defs"]["verified_candidate_proof"], root, "$.verified_candidate_proof")
+    packet = stored_payload(p, proof.get("packet_ref"), "candidate proof packet")
+    returned = stored_payload(p, proof.get("return_ref"), "candidate proof worker return")
+    receipt = stored_payload(p, proof.get("commit_receipt_ref"), "candidate proof commit receipt")
+    audit = stored_payload(p, proof.get("write_set_audit_ref"), "candidate proof write-set audit")
+    audit_hash = sha256_bytes(canonical_bytes(audit))
+    if audit_hash != proof.get("write_set_audit_hash") or audit.get("pass") is not True or not audit.get("changed_paths"):
+        fail("candidate proof write-set audit is missing, changed, or no longer PASS")
+    if (
+        receipt.get("status") != "PASS"
+        or receipt.get("commit_sha") != proof.get("candidate_sha")
+        or receipt.get("tree_sha") != proof.get("candidate_tree_sha")
+        or receipt.get("base_sha") != proof.get("base_sha")
+        or receipt.get("authority_ref") != proof.get("authority_ref")
+        or not receipt.get("checkout")
+        or Path(receipt["checkout"]).expanduser().resolve() != Path(proof["checkout"]).expanduser().resolve()
+    ):
+        fail("candidate proof commit receipt is missing or conflicts with its bound identity")
+    if (
+        packet.get("identity", {}).get("attempt_id") != proof.get("attempt_id")
+        or proof.get("packet_ref") != f"objects/{proof.get('packet_hash')}"
+        or returned.get("identity", {}).get("attempt_id") != proof.get("attempt_id")
+        or returned.get("identity", {}).get("packet_hash") != proof.get("packet_hash")
+    ):
+        fail("candidate proof packet/return identity objects are missing or mismatched")
+    if proof.get("parent_sha") != proof.get("base_sha"):
+        fail("candidate proof parent SHA does not equal its exact base SHA")
+    return proof
 
 
 def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
@@ -4352,27 +4617,75 @@ def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
-    receipt = read_json(Path(args.commit_receipt), "Git candidate receipt")
-    if receipt.get("status") != "PASS" or not GIT_SHA_RE.fullmatch(receipt.get("commit_sha", "")) or not GIT_SHA_RE.fullmatch(receipt.get("tree_sha", "")):
-        fail("candidate requires PASS receipt with commit_sha and tree_sha")
     observed, _ = load_mutation_state(p, args.owner_token)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
     observed_attempt = attempt_by_id(observed, args.attempt_id)
     admit_event(observed, "candidate.publish")
-    observed_operation = next((item for item in observed.get("operations", []) if item.get("id") == args.operation_id), None)
     observed_ticket = next((item for item in observed.get("tickets", []) if item.get("id") == observed_attempt.get("subject_ref")), None)
     observed_candidate = current_candidate_record(observed, observed_ticket) if observed_ticket else None
     observed_producer = current_candidate_producer(observed, observed_ticket) if observed_ticket else None
+    already_published = bool(
+        observed_candidate and observed_candidate.get("quality") == "DONE"
+        and observed_producer and observed_producer.get("id") == args.attempt_id
+    )
+    if not already_published:
+        if observed_attempt.get("state") != "RETURNED":
+            fail("candidate requires a validated RETURNED worker attempt")
+        if observed_attempt.get("kind") != "worker":
+            fail("candidate requires a worker attempt")
+        if observed_attempt.get("lease", {}).get("state") != "active":
+            fail("candidate requires an active, non-quarantined worker lease")
+        observed_return = stored_payload(p, observed_attempt.get("return_ref"), "worker return")
+        if observed_return.get("status") != "DONE":
+            fail("only a semantically complete worker DONE return may become a candidate; BLOCKED/FAILED/HANDOFF are durable non-candidate outcomes")
+    observed_operation = next((item for item in observed.get("operations", []) if item.get("id") == args.operation_id), None)
+    if observed_operation is None:
+        fail("candidate requires a durable candidate_commit operation")
+    supplied_raw: bytes | None = None
+    if args.commit_receipt:
+        supplied_path = Path(args.commit_receipt).expanduser().resolve()
+        regular_non_symlink(supplied_path)
+        supplied_raw = supplied_path.read_bytes()
+        receipt = read_json(supplied_path, "Git candidate receipt")
+    elif observed_operation.get("state") in ("applied", "finalized"):
+        receipt_ref = observed_operation.get("receipt_ref")
+        receipt = stored_payload(p, receipt_ref, "applied candidate effect receipt")
+        digest_match = re.fullmatch(r"objects/([0-9a-f]{64})", receipt_ref or "")
+        if digest_match is None:
+            fail("applied candidate effect has no immutable receipt; it cannot be adopted")
+        receipt_path = p["objects"] / digest_match.group(1)
+        regular_non_symlink(receipt_path)
+        supplied_raw = receipt_path.read_bytes()
+        if sha256_bytes(supplied_raw) != digest_match.group(1):
+            fail("applied candidate receipt hash does not match its immutable reference")
+    else:
+        fail("prepared candidate publication requires the exact commit receipt")
+    if receipt.get("status") != "PASS" or not GIT_SHA_RE.fullmatch(receipt.get("commit_sha", "")) or not GIT_SHA_RE.fullmatch(receipt.get("tree_sha", "")):
+        fail("candidate requires PASS receipt with commit_sha and tree_sha")
+    if supplied_raw is None:
+        fail("candidate receipt bytes are unavailable")
+    supplied_receipt_hash = sha256_bytes(supplied_raw)
+    if observed_operation.get("state") in ("applied", "finalized"):
+        stored_ref = observed_operation.get("receipt_ref")
+        if stored_ref != f"objects/{supplied_receipt_hash}":
+            fail("candidate adoption receipt differs from the immutable applied-effect receipt")
     if (
         observed_candidate and observed_candidate.get("quality") == "DONE"
         and observed_producer and observed_producer.get("id") == args.attempt_id
         and observed_candidate.get("sha") == receipt["commit_sha"]
         and observed_candidate.get("tree_sha") == receipt["tree_sha"]
-        and observed_operation and observed_operation.get("state") == "applied"
+        and observed_candidate.get("proof_ref") == observed_attempt.get("candidate_proof_ref")
+        and observed_operation.get("state") == "finalized"
+        and observed_operation.get("proof_ref") == observed_attempt.get("candidate_proof_ref")
         and observed_ticket and observed_ticket.get("state") in ("CANDIDATE", "REVIEW", "INTEGRATED")
     ):
-        return {"candidate": receipt["commit_sha"], "idempotent": True, "revision": observed["revision"], "next_action": observed["lifecycle"]["next_action"]}
+        proof = verify_verified_candidate_proof(p, observed_operation["proof_ref"])
+        if proof.get("candidate_sha") != receipt["commit_sha"] or proof.get("operation_id") != args.operation_id:
+            fail("finalized candidate proof does not match the exact replay")
+        return {"candidate": receipt["commit_sha"], "proof_ref": observed_operation["proof_ref"], "idempotent": True, "revision": observed["revision"], "next_action": observed["lifecycle"]["next_action"]}
+    if observed_operation.get("state") == "finalized":
+        fail("candidate operation was finalized with a different candidate proof")
     def change(state: dict[str, Any]) -> None:
         admit_event(state, "candidate.publish")
         control = state.get("lifecycle", {}).get("control")
@@ -4386,7 +4699,13 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
         worker_return = stored_payload(p, attempt.get("return_ref"), "worker return")
         if worker_return.get("status") != "DONE":
             fail("only a semantically complete worker DONE return may become a candidate; BLOCKED/FAILED/HANDOFF are durable non-candidate outcomes")
-        if control == "BLOCKED":
+        effect_recovery_adoption = bool(
+            control == "BLOCKED"
+            and state.get("lifecycle", {}).get("reason") == "uncertain_effect_requires_authority_resolution"
+            and (operation_for_recovery := next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None))
+            and operation_for_recovery.get("state") == "applied"
+        )
+        if control == "BLOCKED" and not effect_recovery_adoption:
             blocked_attempt = attempt
             blocked_ticket = next((item for item in state.get("tickets", []) if blocked_attempt and item.get("id") == blocked_attempt.get("subject_ref")), None)
             blocked_operation = next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None)
@@ -4411,7 +4730,7 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
                 and blocked_ticket.get("last_worker_attempt") == blocked_attempt.get("id")
                 and blocked_ticket.get("current_worker_attempt") is None
                 and blocked_operation.get("kind") == "candidate_commit"
-                and blocked_operation.get("state") == "prepared"
+                and blocked_operation.get("state") in ("prepared", "applied")
                 and blocked_operation.get("authority_ref") == authorization.get("id")
                 and blocked_operation.get("expected_before") == blocked_attempt.get("base_sha")
                 and blocked_operation.get("intended_after") in (None, receipt.get("commit_sha"))
@@ -4421,36 +4740,55 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
             )
             if not exact_blocked_repair:
                 fail("BLOCKED candidate publication requires the exact current authorized repair worker and prepared candidate_commit proof")
-        elif control != "ACTIVE":
+        elif control != "ACTIVE" and not effect_recovery_adoption:
             fail("ordinary candidate publication requires ACTIVE control")
         if receipt.get("base_sha") and attempt.get("base_sha") and receipt["base_sha"] != attempt["base_sha"]:
             fail("candidate base SHA mismatch")
         operation = next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None)
         if operation is None:
-            fail("candidate requires a durable prepared operation; call prepare-effect before the Git effect")
+            fail("candidate requires the exact durable candidate_commit operation")
         if operation.get("kind") != "candidate_commit":
-            fail("candidate requires a prepared candidate_commit operation")
-        if operation.get("state") != "prepared":
-            fail("candidate operation is not in prepared state")
-        if operation.get("intended_after") not in (None, receipt["commit_sha"]):
-            fail("candidate receipt does not match prepared operation")
+            fail("candidate requires a candidate_commit operation")
+        if operation.get("state") not in ("prepared", "applied"):
+            fail("candidate operation is not adoptable from prepared/applied state")
+        if operation.get("state") == "applied" and operation.get("receipt_ref") != f"objects/{supplied_receipt_hash}":
+            fail("applied candidate effect receipt differs from its immutable journal receipt")
+        ticket = next((t for t in state.get("tickets", []) if t.get("id") == attempt.get("subject_ref")), None)
+        if ticket is None:
+            fail("candidate attempt has no same-ticket candidate target")
+        parent_candidate_ref = ticket.get("current_candidate")
+        proof, proof_ref = build_verified_candidate_proof(
+            p, state, ticket, attempt, operation, args.operation_id, receipt, supplied_raw,
+            quality="DONE", parent_candidate_ref=parent_candidate_ref,
+        )
         attempt["candidate_sha"] = receipt["commit_sha"]
         attempt["candidate_tree_sha"] = receipt["tree_sha"]
+        attempt["candidate_proof_ref"] = proof_ref
         attempt["state"] = "RETURNED"
-        ticket = next((t for t in state.get("tickets", []) if t.get("id") == attempt.get("subject_ref")), None)
-        if ticket:
-            ticket["state"] = "CANDIDATE"
-            if state.get("candidate_model_version") == "1.1":
-                publish_candidate_projection(state, ticket, attempt, quality="DONE")
-        operation["state"] = "applied"
-        operation["target"] = receipt.get("checkout", operation.get("target", ""))
-        operation["expected_before"] = receipt.get("base_sha", operation.get("expected_before"))
-        operation["intended_after"] = receipt["commit_sha"]
-        operation["authority_ref"] = receipt.get("authority_ref", operation.get("authority_ref"))
-        operation["receipt_ref"] = receipt.get("receipt_ref") or f"external:{args.operation_id}"
+        ticket["state"] = "CANDIDATE"
+        publish_candidate_projection(state, ticket, attempt, quality="DONE", proof_ref=proof_ref)
+        if operation.get("state") == "prepared":
+            transition_effect(operation, "applied")
+        transition_effect(operation, "finalized")
+        operation["target"] = proof["target"]
+        operation["expected_before"] = proof["base_sha"]
+        operation["intended_after"] = proof["candidate_sha"]
+        operation["receipt_ref"] = proof["commit_receipt_ref"]
+        operation["proof_ref"] = proof_ref
+        operation["candidate_ref"] = f"candidate-{attempt['id']}"
+        operation["finalized_revision"] = state["revision"] + 1
+        if state.get("lifecycle", {}).get("control") == "BLOCKED" and state.get("lifecycle", {}).get("reason") == "uncertain_effect_requires_authority_resolution":
+            other_unresolved_effects = [
+                item for item in state.get("operations", [])
+                if item.get("id") != operation.get("id") and item.get("state") in ("prepared", "uncertain", "applied")
+            ]
+            blocking_issues = [item for item in state.get("issues", []) if item.get("impact") == "blocking" and not item.get("invalidated_by")]
+            if not other_unresolved_effects and not blocking_issues:
+                state["lifecycle"]["control"] = "ACTIVE"
+                state["lifecycle"]["reason"] = None
         state["lifecycle"]["next_action"] = {"kind": "review_change", "subject_refs": [args.attempt_id], "preconditions": ["candidate SHA frozen", "integrity baseline recorded"], "read_refs": ["contracts/reviewer.md", "references/safety.md"]}
     result = transaction(p, args.owner_token, args.revision, change)
-    return {"candidate": receipt["commit_sha"], "idempotent": False, "revision": result["revision"], "next_action": result["lifecycle"]["next_action"]}
+    return {"candidate": receipt["commit_sha"], "proof_ref": attempt_by_id(result, args.attempt_id).get("candidate_proof_ref"), "idempotent": False, "revision": result["revision"], "next_action": result["lifecycle"]["next_action"]}
 
 
 def validate_continuation_provenance(
@@ -4565,7 +4903,10 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
     authorization = read_json(Path(args.authorization_file).expanduser().resolve(), "continuation owner authorization")
     root_schema = schema()
     validate(authorization, root_schema["$defs"]["continuation_candidate_authorization"], root_schema, "$.authorization")
-    commit_receipt = read_json(Path(args.commit_receipt).expanduser().resolve(), "continuation candidate commit receipt")
+    commit_receipt_path = Path(args.commit_receipt).expanduser().resolve()
+    regular_non_symlink(commit_receipt_path)
+    commit_receipt_raw = commit_receipt_path.read_bytes()
+    commit_receipt = read_json(commit_receipt_path, "continuation candidate commit receipt")
     if (
         commit_receipt.get("status") != "PASS"
         or not GIT_SHA_RE.fullmatch(commit_receipt.get("commit_sha", ""))
@@ -4582,6 +4923,11 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
     observed_producer = current_candidate_producer(observed, observed_ticket) if observed_ticket else None
     if observed_attempt.get("continuation_ref"):
         existing = continuation_candidate_receipt(p, observed, observed_ticket or {}, observed_attempt)
+        proof_ref = observed_attempt.get("candidate_proof_ref")
+        if not proof_ref:
+            fail("preserved continuation candidate lacks its shared verified proof")
+        proof = verify_verified_candidate_proof(p, proof_ref)
+        supplied_commit_ref = f"objects/{sha256_bytes(commit_receipt_raw)}"
         if (
             authorization.get("id") == observed_attempt.get("continuation_authorization_ref")
             and commit_receipt.get("commit_sha") == observed_attempt.get("candidate_sha")
@@ -4591,6 +4937,10 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
             and observed_candidate.get("quality") == "CONTINUATION"
             and observed_producer is not None
             and observed_producer.get("id") == args.attempt_id
+            and observed_candidate.get("proof_ref") == proof_ref
+            and proof.get("quality") == "CONTINUATION"
+            and proof.get("operation_id") == args.operation_id
+            and proof.get("commit_receipt_ref") == supplied_commit_ref
         ):
             return {"candidate": observed_attempt["candidate_sha"], "continuation_ref": observed_attempt["continuation_ref"], "idempotent": True, "revision": observed["revision"], "control": observed["lifecycle"]["control"]}
         fail("attempt already has a different preserved continuation candidate")
@@ -4720,13 +5070,15 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
         if (
             operation is None
             or operation.get("kind") != "candidate_commit"
-            or operation.get("state") != "prepared"
+            or operation.get("state") not in ("prepared", "applied")
             or Path(operation.get("target", "")).expanduser().resolve() != checkout.resolve()
             or operation.get("expected_before") != attempt.get("base_sha")
             or operation.get("authority_ref") != authorization.get("id")
             or operation.get("intended_after") not in (None, head)
         ):
-            fail("continuation preservation requires a prepared candidate_commit operation bound to this authorization, base, and checkout")
+            fail("continuation preservation requires an exact adoptable candidate_commit operation bound to this authorization, base, and checkout")
+        if operation.get("state") == "applied" and operation.get("receipt_ref") != f"objects/{sha256_bytes(commit_receipt_raw)}":
+            fail("applied continuation effect receipt differs from its immutable journal receipt")
 
         baseline = git_tree_baseline(checkout, attempt["base_sha"])
         audit = audit_write_set(checkout, baseline, worker_return.get("files", []), attempt["lease"].get("zone", []))
@@ -4739,7 +5091,7 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
         }:
             fail("audited write-set differs from the exact validated worker return")
 
-        commit_ref = f"objects/{object_store(p, canonical_bytes(commit_receipt))}"
+        commit_ref = f"objects/{object_store(p, commit_receipt_raw)}"
         continuation = {
             "run_id": state["run_id"], "ticket_id": args.ticket_id, "attempt_id": attempt["id"],
             "return_ref": attempt["return_ref"], "return_status": worker_return["status"],
@@ -4767,12 +5119,26 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
         attempt["candidate_tree_sha"] = tree_sha
         attempt["continuation_ref"] = continuation_ref
         attempt["continuation_authorization_ref"] = authorization["id"]
-        publish_candidate_projection(state, ticket, attempt, quality="CONTINUATION", blocker_refs=[blocker_ref])
-        operation["state"] = "applied"
+        proof, proof_ref = build_verified_candidate_proof(
+            p, state, ticket, attempt, operation, args.operation_id, commit_receipt, commit_receipt_raw,
+            quality="CONTINUATION", parent_candidate_ref=ticket.get("current_candidate"),
+        )
+        if proof.get("write_set_audit_hash") != sha256_bytes(canonical_bytes(audit)):
+            fail("shared candidate proof write-set audit differs from continuation eligibility audit")
+        if proof.get("commit_receipt_ref") != commit_ref:
+            fail("shared candidate proof changed the exact continuation commit receipt reference")
+        attempt["candidate_proof_ref"] = proof_ref
+        publish_candidate_projection(state, ticket, attempt, quality="CONTINUATION", blocker_refs=[blocker_ref], proof_ref=proof_ref)
+        if operation.get("state") == "prepared":
+            transition_effect(operation, "applied")
+        transition_effect(operation, "finalized")
         operation["target"] = str(checkout)
         operation["expected_before"] = attempt["base_sha"]
         operation["intended_after"] = head
         operation["receipt_ref"] = commit_ref
+        operation["proof_ref"] = proof_ref
+        operation["candidate_ref"] = f"candidate-{attempt['id']}"
+        operation["finalized_revision"] = state["revision"] + 1
         ev_id = f"ev-continuation-{sha256_bytes(canonical_bytes(continuation))[:16]}"
         state.setdefault("evidence", []).append({
             "id": ev_id, "hash": sha256_bytes(canonical_bytes(continuation)),
@@ -4807,8 +5173,10 @@ def cmd_prepare_effect(args: argparse.Namespace) -> dict[str, Any]:
     existing = next((item for item in observed.get("operations", []) if item.get("id") == args.operation_id), None)
     proposed = {"kind": args.kind, "target": args.target, "expected_before": args.expected_before, "intended_after": args.intended_after, "authority_ref": args.authority_ref}
     if existing:
-        if all(existing.get(key) == value for key, value in proposed.items()):
+        if all(existing.get(key) == value for key, value in proposed.items()) and existing.get("state") == "prepared":
             return {"prepared": True, "idempotent": True, "operation_id": args.operation_id, "revision": observed["revision"], "state": existing.get("state")}
+        if all(existing.get(key) == value for key, value in proposed.items()):
+            fail(f"operation {args.operation_id} is terminal/in-flight ({existing.get('state')}); it cannot be re-armed")
         fail("operation ID already exists with conflicting parameters")
     def change(state: dict[str, Any]) -> None:
         admit_event(state, "effect.prepare")
@@ -4873,13 +5241,71 @@ def cmd_prepare_effect(args: argparse.Namespace) -> dict[str, Any]:
     return {"prepared": True, "idempotent": False, "operation_id": args.operation_id, "revision": result["revision"], "state": "prepared"}
 
 
+def validate_candidate_effect_receipt(operation: dict[str, Any], receipt: dict[str, Any]) -> None:
+    """Require a fully bound receipt before an applied Git effect can be adopted."""
+    expected = {
+        "operation_id": operation.get("id"),
+        "kind": operation.get("kind"),
+        "target": operation.get("target"),
+        "expected_before": operation.get("expected_before"),
+        "base_sha": operation.get("expected_before"),
+        "authority_ref": operation.get("authority_ref"),
+    }
+    if receipt.get("status") != "PASS" or any(receipt.get(key) != value for key, value in expected.items()):
+        fail("candidate effect receipt does not bind the exact operation, target, base, authority, and PASS status")
+    commit_sha = receipt.get("commit_sha")
+    tree_sha = receipt.get("tree_sha")
+    if not GIT_SHA_RE.fullmatch(commit_sha or "") or not GIT_SHA_RE.fullmatch(tree_sha or ""):
+        fail("candidate effect receipt must include valid commit_sha and tree_sha")
+    if receipt.get("intended_after") != commit_sha or operation.get("intended_after") not in (None, commit_sha):
+        fail("candidate effect receipt intended_after does not match the observed commit")
+    target = Path(operation.get("target", "")).expanduser().resolve()
+    checkout = Path(receipt.get("checkout", "")).expanduser().resolve()
+    if not receipt.get("checkout") or checkout != target:
+        fail("candidate effect receipt checkout does not match its exact operation target")
+
+
+def validate_effect_observation(operation: dict[str, Any], receipt: dict[str, Any], outcome: str) -> None:
+    """Validate an owner-supplied fresh resolution of a previously uncertain effect."""
+    expected = {
+        "operation_id": operation.get("id"),
+        "kind": operation.get("kind"),
+        "target": operation.get("target"),
+        "expected_before": operation.get("expected_before"),
+        "authority_ref": operation.get("authority_ref"),
+    }
+    if receipt.get("status") != "PASS" or any(receipt.get(key) != value for key, value in expected.items()):
+        fail("uncertain-effect resolution must be a fresh PASS receipt bound to the exact operation")
+    if outcome == "abandoned":
+        if receipt.get("result", receipt.get("outcome")) not in ("unchanged", "abandoned"):
+            fail("abandoning an uncertain effect requires receipt result unchanged/abandoned")
+        observed_state = receipt.get("observed_before", receipt.get("actual_before", receipt.get("observed_head")))
+        if operation.get("expected_before") is not None and observed_state != operation.get("expected_before"):
+            fail("uncertain-effect abandonment does not prove the target stayed at expected_before")
+        target = Path(operation.get("target", "")).expanduser().resolve()
+        if not receipt.get("checkout") or Path(receipt["checkout"]).expanduser().resolve() != target:
+            fail("uncertain-effect abandonment receipt does not bind the exact checkout")
+        regular_directory(target, "uncertain effect target")
+        try:
+            actual_head = git_output(target, "rev-parse", "HEAD").decode().strip()
+            actual_tree = git_output(target, "rev-parse", "HEAD^{tree}").decode().strip()
+        except (OSError, UnicodeError) as exc:
+            fail(f"cannot inspect uncertain effect target: {exc}")
+        if actual_head != observed_state or receipt.get("tree_sha") != actual_tree:
+            fail("uncertain-effect abandonment receipt does not match the exact observed HEAD/tree")
+        if git_output(target, "status", "--porcelain=v1", "-z", "--untracked-files=all"):
+            fail("uncertain-effect abandonment requires a clean checkout at expected_before")
+
+
 def cmd_reconcile_effect(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
+    requested_result = "abandoned" if args.result == "unchanged" else args.result
     receipt = None
     receipt_raw = None
     receipt_ref = None
     if args.receipt:
         receipt_path = Path(args.receipt).expanduser().resolve()
+        regular_non_symlink(receipt_path)
         receipt = read_json(receipt_path, "effect receipt")
         receipt_raw = receipt_path.read_bytes()
         receipt_ref = f"objects/{sha256_bytes(receipt_raw)}"
@@ -4888,53 +5314,60 @@ def cmd_reconcile_effect(args: argparse.Namespace) -> dict[str, Any]:
         fail("owner token mismatch; stale orchestrator is fenced")
     admit_event(observed, "effect.reconcile")
     observed_operation = next((item for item in observed.get("operations", []) if item.get("id") == args.operation_id), None)
-    if observed_operation and observed_operation.get("state") == args.result and observed_operation.get("receipt_ref") == receipt_ref:
-        return {"reconciled": True, "idempotent": True, "operation_id": args.operation_id, "state": args.result, "revision": observed["revision"]}
+    if observed_operation and observed_operation.get("state") == requested_result and observed_operation.get("receipt_ref") == receipt_ref:
+        return {"reconciled": True, "idempotent": True, "operation_id": args.operation_id, "state": requested_result, "revision": observed["revision"]}
     def change(state: dict[str, Any]) -> None:
         admit_event(state, "effect.reconcile")
         operation = next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None)
         if operation is None:
             fail("unknown operation")
-        if operation.get("state") != "prepared":
-            fail("only a prepared operation can be reconciled")
-        if receipt:
-            if receipt.get("operation_id") not in (None, args.operation_id):
-                fail("effect receipt operation mismatch")
-            if receipt.get("target") not in (None, operation.get("target")):
-                fail("effect receipt target mismatch")
-            if operation.get("expected_before") and receipt.get("base_sha") not in (None, operation.get("expected_before")):
-                fail("effect receipt expected-before mismatch")
-            commit_sha = receipt.get("commit_sha")
-            if commit_sha:
-                if not GIT_SHA_RE.fullmatch(commit_sha):
-                    fail("effect receipt has invalid commit SHA")
-                target = Path(operation.get("target", ""))
+        current = operation.get("state")
+        if requested_result not in EFFECT_TRANSITIONS.get(current, frozenset()):
+            fail(f"effect state {current} cannot transition to {requested_result}")
+        if receipt is not None:
+            if requested_result == "applied" and receipt.get("commit_sha"):
+                validate_candidate_effect_receipt(operation, receipt)
+                target = Path(operation.get("target", "")).expanduser().resolve()
                 regular_directory(target, "effect target")
                 try:
-                    actual_head = subprocess.run(["git", "-C", str(target), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
-                    actual_tree = subprocess.run(["git", "-C", str(target), "rev-parse", "HEAD^{tree}"], check=True, capture_output=True, text=True).stdout.strip()
-                except (OSError, subprocess.CalledProcessError) as exc:
+                    actual_head = git_output(target, "rev-parse", "HEAD").decode().strip()
+                    actual_tree = git_output(target, "rev-parse", "HEAD^{tree}").decode().strip()
+                except (OSError, UnicodeError) as exc:
                     fail(f"effect reconciliation cannot inspect Git target: {exc}")
-                if actual_head != commit_sha or (receipt.get("tree_sha") and actual_tree != receipt.get("tree_sha")):
-                    fail("effect receipt does not match actual Git target")
-            if receipt_raw is not None:
-                object_store(p, receipt_raw)
-        if args.result == "applied":
-            if not receipt:
-                fail("applied reconciliation requires an exact effect receipt")
-            operation["state"] = "applied"
+                if actual_head != receipt.get("commit_sha") or actual_tree != receipt.get("tree_sha"):
+                    fail("effect receipt does not match actual Git target HEAD/tree")
+                operation["intended_after"] = receipt["commit_sha"]
+            elif current == "uncertain":
+                validate_effect_observation(operation, receipt, requested_result)
+            else:
+                if receipt.get("operation_id") not in (None, args.operation_id):
+                    fail("effect receipt operation mismatch")
+                if receipt.get("target") not in (None, operation.get("target")):
+                    fail("effect receipt target mismatch")
+                if operation.get("expected_before") and receipt.get("base_sha") not in (None, operation.get("expected_before")):
+                    fail("effect receipt expected-before mismatch")
+                if receipt.get("status") not in (None, "PASS"):
+                    fail("effect receipt status must be PASS")
+            object_store(p, receipt_raw or b"")
+        elif current == "uncertain" and requested_result in ("applied", "abandoned"):
+            fail("resolving an uncertain effect requires fresh exact receipt evidence")
+        if requested_result == "applied" and receipt is None:
+            fail("applied reconciliation requires an exact effect receipt")
+        if requested_result == "abandoned" and current == "uncertain" and receipt is None:
+            fail("abandoning an uncertain effect requires a fresh resolution receipt")
+        transition_effect(operation, requested_result)
+        if receipt_ref is not None:
             operation["receipt_ref"] = receipt_ref
-            state["lifecycle"]["next_action"] = {"kind": "resume_after_effect_reconciliation", "subject_refs": [args.operation_id], "preconditions": ["re-read current ledger", "verify resulting subject"], "read_refs": ["phases/recover.md", "references/ledger.md"]}
-        elif args.result == "uncertain":
-            operation["state"] = "uncertain"
-            operation["receipt_ref"] = receipt_ref
+        if current == "uncertain":
+            operation["resolution_ref"] = receipt_ref
+        if requested_result == "applied":
+            state["lifecycle"]["next_action"] = {"kind": "adopt_applied_effect", "subject_refs": [args.operation_id], "preconditions": ["verify the immutable effect receipt and exact target", "finalize candidate linkage without repeating Git"], "read_refs": ["phases/recover.md", "references/ledger.md"]}
+        elif requested_result == "uncertain":
             state["lifecycle"]["control"] = "BLOCKED"
             state["lifecycle"]["reason"] = "uncertain_effect_requires_authority_resolution"
-            state["lifecycle"]["next_action"] = {"kind": "reconcile_uncertain_effect", "subject_refs": [args.operation_id], "preconditions": ["inspect actual target", "do not repeat effect"], "read_refs": ["phases/recover.md", "references/safety.md"]}
+            state["lifecycle"]["next_action"] = {"kind": "reconcile_uncertain_effect", "subject_refs": [args.operation_id], "preconditions": ["inspect actual target", "record fresh owner resolution evidence", "do not repeat the effect"], "read_refs": ["phases/recover.md", "references/safety.md"]}
         else:
-            operation["state"] = "abandoned"
-            operation["receipt_ref"] = receipt_ref
-            state["lifecycle"]["next_action"] = {"kind": "decide_effect_retry", "subject_refs": [args.operation_id], "preconditions": ["same operation ID", "fresh authority and expected-before check"], "read_refs": ["references/safety.md"]}
+            state["lifecycle"]["next_action"] = {"kind": "effect_abandoned_requires_new_operation", "subject_refs": [args.operation_id], "preconditions": ["this operation is terminal and cannot be re-armed", "use a new operation ID only after fresh authority and expected-before checks"], "read_refs": ["references/safety.md", "references/ledger.md"]}
     result = transaction(p, args.owner_token, args.revision, change, "effect-reconciled")
     return {"reconciled": True, "idempotent": False, "operation_id": args.operation_id, "state": next(item for item in result.get("operations", []) if item.get("id") == args.operation_id)["state"], "revision": result["revision"]}
 
@@ -5620,8 +6053,8 @@ def cmd_close_blocked_attempt(args: argparse.Namespace) -> dict[str, Any]:
             fail("blocked attempt closure requires the attempt's active lease")
         if attempt.get("candidate_sha") is not None or attempt.get("candidate_tree_sha") is not None:
             fail("blocked attempt closure requires candidate_sha and candidate_tree_sha to be null")
-        if any(item.get("state") in ("prepared", "uncertain") for item in state.get("operations", [])):
-            fail("blocked attempt closure requires all prepared effects to be reconciled")
+        if any(effect_is_unresolved(item) for item in state.get("operations", [])):
+            fail("blocked attempt closure requires all unresolved effects to be finalized or abandoned")
 
         returned = stored_payload(p, attempt.get("return_ref"), "blocked worker return")
         schema_root = schema()
@@ -5953,7 +6386,7 @@ def cmd_finalize_attempt(args: argparse.Namespace) -> dict[str, Any]:
 
         pending_checkout_effects = [
             item.get("id") for item in state.get("operations", [])
-            if item.get("state") in ("prepared", "uncertain")
+            if effect_is_unresolved(item)
             and checkout is not None
             and Path(item.get("target", "")).expanduser().resolve() == checkout.resolve()
         ]
@@ -5971,7 +6404,7 @@ def cmd_finalize_attempt(args: argparse.Namespace) -> dict[str, Any]:
         if not evidence_known:
             disposition_reason = "writer stop is unknown or lease remains quarantined"
         elif pending_checkout_effects:
-            disposition_reason = f"prepared or uncertain checkout effects require reconciliation: {pending_checkout_effects}"
+            disposition_reason = f"unresolved checkout effects require reconciliation or adoption: {pending_checkout_effects}"
         elif not baseline_valid:
             disposition_reason = "candidate pointer, repair base, or verified initial baseline do not match"
         elif not unchanged:
@@ -6271,7 +6704,7 @@ def cmd_reconcile_finalized_attempt(args: argparse.Namespace) -> dict[str, Any]:
             )
         pending_effects = [
             item.get("id") for item in state.get("operations", [])
-            if item.get("state") in ("prepared", "uncertain")
+            if effect_is_unresolved(item)
             and Path(item.get("target", "")).expanduser().resolve() == checkout.resolve()
         ]
         if pending_effects:
@@ -7255,7 +7688,7 @@ def cmd_adopt_requirements(args: argparse.Namespace) -> dict[str, Any]:
             fail("requirements adoption during PLAN requires an explicit repair blocker")
         if active_publication_leases(state):
             fail("requirements adoption requires stopped attempts and released leases")
-        if any(item.get("state") in ("prepared", "uncertain") for item in state.get("operations", [])):
+        if any(effect_is_unresolved(item) for item in state.get("operations", [])):
             fail("requirements adoption requires reconciled operations")
         binding = current_intent_binding(state)
         if any(item.get("status") == "PUBLISHED" and item.get("intent_revision") == binding["revision"] and item.get("intent_document_hash") == binding["document_hash"] for item in state.get("requirements_publications", [])):
@@ -8066,7 +8499,7 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
             ]
             unresolved_effects = [
                 operation for operation in state.get("operations", [])
-                if operation.get("state") in ("prepared", "uncertain")
+                if effect_is_unresolved(operation)
             ]
             if active_attempts or active_leases or unresolved_effects:
                 fail("PAUSED requires stopped writers, released leases, and reconciled effects")
@@ -8081,7 +8514,7 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
             ]
             unresolved_effects = [
                 operation for operation in state.get("operations", [])
-                if operation.get("state") in ("prepared", "uncertain")
+                if effect_is_unresolved(operation)
             ]
             if active_attempts or active_leases or unresolved_effects:
                 fail("RECOVERING -> ACTIVE requires no in-flight attempts, active/quarantined leases, or unresolved effects")
@@ -8141,12 +8574,12 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
             current_tickets = [ticket for ticket in state.get("tickets", []) if ticket.get("id") in publication.get("ticket_refs", [])]
             if not current_tickets or any(ticket.get("state") != "INTEGRATED" for ticket in current_tickets):
                 fail("G4 requires every current publication ticket to be reviewed and INTEGRATED")
-            if active_publication_leases(state) or any(op.get("state") in ("prepared", "uncertain") for op in state.get("operations", [])):
+            if active_publication_leases(state) or any(effect_is_unresolved(op) for op in state.get("operations", [])):
                 fail("G4 requires released leases and reconciled effects")
             if blockers:
                 fail("G4 is blocked by current issues")
         if control == "FAILED":
-            if current_control != "QUIESCING" or active_publication_leases(state) or any(op.get("state") in ("prepared", "uncertain") for op in state.get("operations", [])):
+            if current_control != "QUIESCING" or active_publication_leases(state) or any(effect_is_unresolved(op) for op in state.get("operations", [])):
                 fail("FAILED requires QUIESCING with stopped attempts and reconciled effects")
         if control == "ACCEPTED":
             if current_phase != "ACCEPT" or phase != "ACCEPT":
@@ -8159,7 +8592,7 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
                 item for item in finding_obligation_projection(state)["obligations"]
                 if item.get("status") != "closed"
             ]
-            if blockers or open_obligations or active_publication_leases(state) or any(op.get("state") in ("prepared", "uncertain") for op in state.get("operations", [])):
+            if blockers or open_obligations or active_publication_leases(state) or any(effect_is_unresolved(op) for op in state.get("operations", [])):
                 fail("G6 requires no blockers, active/quarantined leases, or unresolved effects")
             if state.get("candidate_model_version") == "1.1" and gate_id != "G6":
                 fail("G6 acceptance requires an explicit --gate-id G6")
@@ -8181,7 +8614,7 @@ def cmd_cancel(args: argparse.Namespace) -> dict[str, Any]:
             state["lifecycle"]["control"] = "QUIESCING"
             state["lifecycle"]["reason"] = args.reason
             state["lifecycle"]["stop_target"] = args.stop_target
-            state["lifecycle"]["next_action"] = {"kind": "stop_reconcile_then_cancel", "subject_refs": [], "preconditions": ["all known writers stopped", "leases and prepared effects reconciled"], "read_refs": ["phases/recover.md", "references/ledger.md"]}
+            state["lifecycle"]["next_action"] = {"kind": "stop_reconcile_then_cancel", "subject_refs": [], "preconditions": ["all known writers stopped", "leases and unresolved effects finalized or abandoned"], "read_refs": ["phases/recover.md", "references/ledger.md"]}
         result = transaction(p, args.owner_token, args.revision, request, "cancel-quiescing")
         return {"quiescing": True, "revision": result["revision"], "control": "QUIESCING"}
     evidence = read_json(Path(args.stop_evidence).expanduser().resolve(), "cancellation stop evidence")
@@ -8191,8 +8624,8 @@ def cmd_cancel(args: argparse.Namespace) -> dict[str, Any]:
         admit_event(state, "run.cancel.finalize")
         if state["lifecycle"]["control"] != "QUIESCING":
             fail("cancellation finalization requires QUIESCING")
-        if any(op.get("state") in ("prepared", "uncertain") for op in state.get("operations", [])):
-            fail("cancellation requires all prepared effects reconciled")
+        if any(effect_is_unresolved(op) for op in state.get("operations", [])):
+            fail("cancellation requires all unresolved effects finalized or abandoned")
         for attempt in state.get("attempts", []):
             if attempt.get("state") in ("PREPARED", "DISPATCHED"):
                 attempt["state"] = "INTERRUPTED"
@@ -8265,10 +8698,10 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_finalized = sub.add_parser("reconcile-finalized-attempt"); reconcile_finalized.add_argument("--control-root", required=True); reconcile_finalized.add_argument("--run-id", required=True); reconcile_finalized.add_argument("--owner-token", required=True); reconcile_finalized.add_argument("--revision", type=int, required=True); reconcile_finalized.add_argument("--ticket-id", required=True); reconcile_finalized.add_argument("--attempt-id", required=True); reconcile_finalized.add_argument("--evidence", required=True)
     reconcile_quarantine = sub.add_parser("reconcile-quarantined-attempt"); reconcile_quarantine.add_argument("--control-root", required=True); reconcile_quarantine.add_argument("--run-id", required=True); reconcile_quarantine.add_argument("--owner-token", required=True); reconcile_quarantine.add_argument("--revision", type=int, required=True); reconcile_quarantine.add_argument("--ticket-id", required=True); reconcile_quarantine.add_argument("--attempt-id", required=True); reconcile_quarantine.add_argument("--prior-attempt-id", required=True); reconcile_quarantine.add_argument("--finding-ref", required=True); reconcile_quarantine.add_argument("--candidate-sha", required=True); reconcile_quarantine.add_argument("--base-sha", required=True); reconcile_quarantine.add_argument("--baseline", help="optional pre-attempt manifest; omitted means derive the complete baseline from the exact Git base tree"); reconcile_quarantine.add_argument("--reconciliation-id", required=True); reconcile_quarantine.add_argument("--actor", required=True)
     terminate = sub.add_parser("terminate-attempt"); terminate.add_argument("--control-root", required=True); terminate.add_argument("--run-id", required=True); terminate.add_argument("--owner-token", required=True); terminate.add_argument("--revision", type=int, required=True); terminate.add_argument("--attempt-id", required=True); terminate.add_argument("--state", choices=["LOST", "INTERRUPTED"], required=True); terminate.add_argument("--lease-state", choices=["released", "quarantined"], required=True); terminate.add_argument("--evidence", required=True)
-    candidate = sub.add_parser("candidate"); candidate.add_argument("--control-root", required=True); candidate.add_argument("--run-id", required=True); candidate.add_argument("--owner-token", required=True); candidate.add_argument("--revision", type=int, required=True); candidate.add_argument("--attempt-id", required=True); candidate.add_argument("--commit-receipt", required=True); candidate.add_argument("--operation-id", required=True)
+    candidate = sub.add_parser("candidate"); candidate.add_argument("--control-root", required=True); candidate.add_argument("--run-id", required=True); candidate.add_argument("--owner-token", required=True); candidate.add_argument("--revision", type=int, required=True); candidate.add_argument("--attempt-id", required=True); candidate.add_argument("--commit-receipt", required=False); candidate.add_argument("--operation-id", required=True)
     continuation_candidate = sub.add_parser("preserve-blocked-candidate"); continuation_candidate.add_argument("--control-root", required=True); continuation_candidate.add_argument("--run-id", required=True); continuation_candidate.add_argument("--owner-token", required=True); continuation_candidate.add_argument("--revision", type=int, required=True); continuation_candidate.add_argument("--ticket-id", required=True); continuation_candidate.add_argument("--attempt-id", required=True); continuation_candidate.add_argument("--authorization-file", required=True); continuation_candidate.add_argument("--commit-receipt", required=True); continuation_candidate.add_argument("--operation-id", required=True)
     effect = sub.add_parser("prepare-effect"); effect.add_argument("--control-root", required=True); effect.add_argument("--run-id", required=True); effect.add_argument("--owner-token", required=True); effect.add_argument("--revision", type=int, required=True); effect.add_argument("--operation-id", required=True); effect.add_argument("--kind", required=True); effect.add_argument("--target", required=True); effect.add_argument("--expected-before", default=None); effect.add_argument("--intended-after", default=None); effect.add_argument("--authority-ref", required=True)
-    reconcile_effect = sub.add_parser("reconcile-effect"); reconcile_effect.add_argument("--control-root", required=True); reconcile_effect.add_argument("--run-id", required=True); reconcile_effect.add_argument("--owner-token", required=True); reconcile_effect.add_argument("--revision", type=int, required=True); reconcile_effect.add_argument("--operation-id", required=True); reconcile_effect.add_argument("--result", choices=["applied", "uncertain", "unchanged"], required=True); reconcile_effect.add_argument("--receipt")
+    reconcile_effect = sub.add_parser("reconcile-effect"); reconcile_effect.add_argument("--control-root", required=True); reconcile_effect.add_argument("--run-id", required=True); reconcile_effect.add_argument("--owner-token", required=True); reconcile_effect.add_argument("--revision", type=int, required=True); reconcile_effect.add_argument("--operation-id", required=True); reconcile_effect.add_argument("--result", choices=["applied", "uncertain", "abandoned", "unchanged"], required=True); reconcile_effect.add_argument("--receipt")
     review = sub.add_parser("prepare-review"); review.add_argument("--control-root", required=True); review.add_argument("--run-id", required=True); review.add_argument("--owner-token", required=True); review.add_argument("--revision", type=int, required=True); review.add_argument("--ticket-id", required=True); review.add_argument("--review-attempt-id", required=True); review.add_argument("--lease-id", required=True); review.add_argument("--packet", required=True)
     design_review = sub.add_parser("prepare-design-review"); design_review.add_argument("--control-root", required=True); design_review.add_argument("--run-id", required=True); design_review.add_argument("--owner-token", required=True); design_review.add_argument("--revision", type=int, required=True); design_review.add_argument("--review-attempt-id", required=True); design_review.add_argument("--lease-id", required=True); design_review.add_argument("--packet", required=True); design_review.add_argument("--review-kind", choices=["coverage", "plan"], required=True); design_review.add_argument("--reviewer-identity", required=True); design_review.add_argument("--reviewer-role", required=True)
     adjudicate = sub.add_parser("adjudicate"); adjudicate.add_argument("--control-root", required=True); adjudicate.add_argument("--run-id", required=True); adjudicate.add_argument("--owner-token", required=True); adjudicate.add_argument("--revision", type=int, required=True); adjudicate.add_argument("--decision-file", required=True)

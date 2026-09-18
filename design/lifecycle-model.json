@@ -56,8 +56,8 @@
     },
     "operation": {
       "initial": "prepared",
-      "terminal": ["applied", "abandoned"],
-      "transitions": [["prepared", "applied"], ["prepared", "abandoned"], ["prepared", "uncertain"], ["uncertain", "applied"], ["uncertain", "abandoned"]]
+      "terminal": ["finalized", "abandoned"],
+      "transitions": [["prepared", "applied"], ["prepared", "abandoned"], ["prepared", "uncertain"], ["uncertain", "applied"], ["uncertain", "abandoned"], ["applied", "finalized"]]
     },
     "publication": {
       "initial": "PUBLISHED",
