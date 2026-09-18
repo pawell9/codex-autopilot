@@ -120,8 +120,8 @@ class Qualification:
             "bundle_id": f"B-v{version}", "version": f"v{version}", "epoch": 0, "intent_revision": "2", "intent_document_ref": "D-intent-v2", "intent_document_hash": state["intent"]["document_hash"],
             "documents": docs,
             "contracts": [
-                {"id": f"K-1-v{version}", "version": f"v{version}", "status": "active", "provenance_refs": [f"D-interfaces-v{version}"]},
-                {"id": f"K-2-v{version}", "version": f"v{version}", "status": "active", "provenance_refs": [f"D-interfaces-v{version}"]},
+                {"id": f"K-1-v{version}", "version": f"v{version}", "status": "active", "provenance_refs": [f"D-interfaces-v{version}"], "implementation_availability": "available", "implementation_availability_evidence_refs": [f"fixture:K-1-v{version}-available"]},
+                {"id": f"K-2-v{version}", "version": f"v{version}", "status": "active", "provenance_refs": [f"D-interfaces-v{version}"], "implementation_availability": "available", "implementation_availability_evidence_refs": [f"fixture:K-2-v{version}-available"]},
             ],
             "tickets": [
                 {"id": f"T-1-v{version}", "goal_ref": "G-1", "criterion_refs": ["C-1"], "contract_refs": [f"K-1-v{version}"], "dependency_refs": [], "state": "PLANNED", "complexity": "bounded", "risk": "routine", "zone": [{"path": "app-one.txt", "operations": ["create", "modify"]}]},

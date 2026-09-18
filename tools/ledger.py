@@ -281,7 +281,7 @@ def _action_event_id(kind: Any) -> str | None:
         return "attempt.reconcile"
     if kind in {"audit_worker_return_and_prepare_candidate", "preserve_blocked_candidate", "adopt_applied_effect"}:
         return "candidate.publish"
-    if kind in {"authorize_repair", "resolve_blocker_or_authorize_candidate_bound_repair"}:
+    if kind in {"authorize_repair", "authorize_grouped_repair", "resolve_blocker_or_authorize_candidate_bound_repair"}:
         return "repair.authorize"
     if kind in {"adjudicate_review_disagreement"}:
         return "review.adjudicate"
@@ -308,6 +308,48 @@ def _action_event_id(kind: Any) -> str | None:
     if kind == "stop_reconcile_then_cancel":
         return "run.cancel.request"
     return None
+
+
+def _review05_grouped_repair_action(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Prioritize the exact reconciled Review05 group while retaining old obligations."""
+    if state.get("lifecycle", {}).get("control") != "BLOCKED":
+        return None
+    if any(item.get("state") in ("PREPARED", "DISPATCHED") for item in state.get("attempts", [])):
+        return None
+    finding_refs = {
+        binding.get("finding_ref")
+        for event in state.get("finding_binding_reconciliations", [])
+        if event.get("review_attempt_ref") == "T02-R17-REVIEW-CODE-05"
+        and event.get("ticket_ref") == "T02-R17"
+        and event.get("candidate_ref") == "candidate-T02-R17-WORKER-05"
+        for binding in event.get("finding_bindings", [])
+    }
+    projection = finding_obligation_projection(state)
+    current = {
+        item.get("finding_ref") for item in projection["items"]
+        if item.get("status") == "current" and item.get("repairable")
+    }
+    if len(finding_refs) != 3 or current != finding_refs:
+        return None
+    candidate = next((item for item in state.get("candidates", []) if item.get("id") == "candidate-T02-R17-WORKER-05"), None)
+    blocker_ref = "issue-62c0073109c9529a"
+    blocker = next((item for item in state.get("issues", []) if item.get("id") == blocker_ref), None)
+    if (
+        candidate is None or candidate.get("quality") != "CONTINUATION"
+        or blocker is None or blocker.get("impact") != "blocking" or blocker.get("invalidated_by")
+        or blocker_ref not in candidate.get("blocker_refs", [])
+    ):
+        return None
+    return {
+        "kind": "authorize_grouped_repair",
+        "subject_refs": ["T02-R17", candidate["id"], "T02-R17-REVIEW-CODE-05", *sorted(finding_refs)],
+        "preconditions": [
+            "authorize one bounded repair plan for exactly these three current Review05 findings",
+            "retain seven historical T02 carry-forward obligations and the external continuation blocker",
+            "reconcile any previously applied external effect before dispatching a repair worker",
+        ],
+        "read_refs": ["phases/execute.md", "references/routing.md", "references/ledger.md"],
+    }
 
 
 def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
@@ -344,7 +386,9 @@ def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
             and item.get("lease", {}).get("state") in ("active", "quarantined")
         ]
         pending_operations = [item for item in state.get("operations", []) if effect_is_unresolved(item)]
-        if pending_operations:
+        if (review05_group := _review05_grouped_repair_action(state)) is not None:
+            action = review05_group
+        elif pending_operations:
             operation = pending_operations[0]
             operation_id = operation.get("id")
             if operation.get("state") == "prepared":
@@ -452,7 +496,50 @@ def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
                     and obligation.get("status") != "closed" for obligation in open_obligations
                 )
             ]
-            if len(repairable) == 1 and all(
+            grouped_repair = None
+            if len(repairable) >= 2:
+                ticket_sets = [item.get("unresolved_ticket_refs", item.get("affected_ticket_refs", [])) for item in repairable]
+                candidate_refs = {item.get("source_candidate_ref") for item in repairable}
+                finding_records = {
+                    item.get("id"): item for item in state.get("findings", [])
+                }
+                source_refs = {
+                    finding_records.get(item.get("finding_ref"), {}).get("source_ref")
+                    for item in repairable
+                }
+                if (
+                    all(len(refs) == 1 for refs in ticket_sets)
+                    and len({refs[0] for refs in ticket_sets}) == 1
+                    and len(candidate_refs) == 1 and None not in candidate_refs
+                    and len(source_refs) == 1 and None not in source_refs
+                    and len(repairable) == 3
+                ):
+                    source_ref = next(iter(source_refs))
+                    source_attempt = attempt_by_id.get(source_ref)
+                    candidate_ref = next(iter(candidate_refs))
+                    ticket_ref = ticket_sets[0][0]
+                    ticket_record = next((item for item in state.get("tickets", []) if item.get("id") == ticket_ref), None)
+                    current_candidate = current_candidate_record(state, ticket_record) if ticket_record else None
+                    if (
+                        source_attempt and source_attempt.get("kind") == "review"
+                        and source_attempt.get("subject_ref") == ticket_ref
+                        and current_candidate is not None
+                        and source_attempt.get("candidate_sha") == current_candidate.get("sha")
+                        and candidate_ref == current_candidate.get("id")
+                    ):
+                        grouped_refs = sorted(item["finding_ref"] for item in repairable)
+                        grouped_repair = {
+                            "kind": "authorize_grouped_repair",
+                            "subject_refs": [ticket_ref, candidate_ref, source_ref, *grouped_refs],
+                            "preconditions": [
+                                "authorize one bounded repair plan for exactly these three current findings on the same ticket and continuation candidate",
+                                "retain historical carry-forward obligations and the external continuation blocker",
+                            ],
+                            "read_refs": ["phases/execute.md", "references/routing.md", "references/ledger.md"],
+                        }
+            if grouped_repair is not None:
+                action = grouped_repair
+            elif len(repairable) == 1 and all(
                 item.get("status") == "open" and item.get("applicability") == "current"
                 for item in open_obligations
             ):
@@ -1126,7 +1213,7 @@ def schema() -> dict[str, Any]:
 
 def validate(value: Any, spec: dict[str, Any], root: dict[str, Any], path: str = "$", seen: set[str] | None = None) -> None:
     """Validate the closed subset used by this package; unknown keywords fail closed."""
-    supported = {"$schema", "$id", "$defs", "title", "$ref", "oneOf", "type", "required", "properties", "additionalProperties", "items", "enum", "const", "pattern", "minLength", "minItems", "maxItems", "uniqueItems", "minimum", "minProperties"}
+    supported = {"$schema", "$id", "$defs", "title", "$ref", "oneOf", "allOf", "if", "then", "type", "required", "properties", "additionalProperties", "items", "enum", "const", "pattern", "minLength", "minItems", "maxItems", "uniqueItems", "minimum", "minProperties"}
     unknown = set(spec) - supported
     if unknown:
         fail(f"unsupported schema keyword(s) at {path}: {sorted(unknown)}")
@@ -1147,6 +1234,16 @@ def validate(value: Any, spec: dict[str, Any], root: dict[str, Any], path: str =
             successes += 1
         if successes != 1:
             fail(f"{path}: expected exactly one matching schema branch; matched {successes}")
+    for branch in spec.get("allOf", []):
+        validate(value, branch, root, path, seen)
+    if "if" in spec:
+        try:
+            validate(value, spec["if"], root, path, seen)
+            condition_matches = True
+        except LedgerError:
+            condition_matches = False
+        if condition_matches and "then" in spec:
+            validate(value, spec["then"], root, path, seen)
     if "const" in spec and value != spec["const"]:
         fail(f"{path}: expected constant {spec['const']!r}")
     if "enum" in spec and value not in spec["enum"]:
@@ -1196,7 +1293,7 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
     if state["run_id"] != Path(state["repository"]["control_root"]).name and state["run_id"] == "":
         fail("run_id must be nonempty")
     ids: set[str] = set()
-    for collection in ("documents", "requirements", "criteria", "contracts", "decisions", "tickets", "candidates", "attempts", "issues", "findings", "reviews", "review_qualifications", "repair_waves", "operations", "capabilities", "routes", "evidence", "invalidations"):
+    for collection in ("documents", "requirements", "criteria", "contracts", "decisions", "tickets", "candidates", "attempts", "issues", "findings", "reviews", "review_qualifications", "repair_waves", "operations", "capabilities", "routes", "evidence", "invalidations", "binding_normalizations", "finding_binding_reconciliations"):
         for item in state.get(collection, []):
             if "id" in item:
                 if item["id"] in ids:
@@ -1506,6 +1603,142 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
             safe_id(invalidation.get("amendment_ref"), "amendment_id")
         if any(ref not in all_ids for ref in invalidation.get("consumer_refs", [])):
             fail(f"invalidation references unknown consumer: {invalidation['id']}")
+    publication_by_id = {item.get("id"): item for item in [*history, *([publication] if publication else [])]}
+    migration_ids: set[str] = set()
+    normalized_pairs: set[tuple[str, str, str, str]] = set()
+    for event in state.get("binding_normalizations", []):
+        migration_id = event.get("migration_id")
+        if migration_id in migration_ids:
+            fail(f"duplicate binding normalization migration ID: {migration_id}")
+        migration_ids.add(migration_id)
+        if (
+            event.get("source_revision", -1) >= event.get("applied_revision", -1)
+            or event.get("applied_revision", -1) > state.get("revision", -1)
+            or event.get("owner_epoch", -1) > state.get("owner", {}).get("epoch", -1)
+            or event.get("manifest_ref") != f"objects/{event.get('manifest_hash')}"
+        ):
+            fail(f"binding normalization event has invalid source/applied revision, epoch, or manifest binding: {event.get('id')}")
+        bound_publication = publication_by_id.get(event.get("publication_ref"))
+        if bound_publication is None or bound_publication.get("publication_hash") != event.get("publication_hash"):
+            fail(f"binding normalization references an unknown or drifted publication: {event.get('id')}")
+        for binding in event.get("bindings", []):
+            pair = (event["publication_ref"], event["publication_hash"], binding.get("ticket_ref"), binding.get("contract_ref"))
+            if pair in normalized_pairs:
+                fail(f"overlapping binding normalization pair: {pair[2]} / {pair[3]}")
+            normalized_pairs.add(pair)
+            ticket = next((item for item in state.get("tickets", []) if item.get("id") == binding.get("ticket_ref")), None)
+            contract = next((item for item in state.get("contracts", []) if item.get("id") == binding.get("contract_ref")), None)
+            if (
+                ticket is None or contract is None
+                or binding.get("original_refs") != [binding.get("ticket_ref"), binding.get("contract_ref")]
+                or binding.get("contract_ref") not in ticket.get("contract_refs", [])
+                or binding.get("ticket_ref") not in contract.get("producer_refs", [])
+            ):
+                fail(f"binding normalization no longer identifies its exact original self-input pair: {event.get('id')}")
+        if verify_files:
+            manifest_path = Path(state["repository"]["control_root"]) / ".autopilot" / "runs" / state["run_id"] / event["manifest_ref"]
+            regular_non_symlink(manifest_path)
+            manifest_raw = manifest_path.read_bytes()
+            if sha256_bytes(manifest_raw) != event.get("manifest_hash"):
+                fail(f"binding normalization manifest hash mismatch: {event.get('id')}")
+            try:
+                manifest = json.loads(manifest_raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                fail(f"binding normalization manifest is invalid JSON: {exc}")
+            if (
+                manifest.get("migration_id") != migration_id
+                or manifest.get("source_revision") != event.get("source_revision")
+                or manifest.get("source_ledger_hash") != event.get("source_ledger_hash")
+                or manifest.get("owner_epoch") != event.get("owner_epoch")
+                or manifest.get("publication_ref") != event.get("publication_ref")
+                or manifest.get("publication_hash") != event.get("publication_hash")
+                or manifest.get("bindings") != event.get("bindings")
+            ):
+                fail(f"binding normalization manifest does not reproduce its append-only event: {event.get('id')}")
+    reconciliation_ids: set[str] = set()
+    reconciled_reviews: set[str] = set()
+    reconciled_findings: set[str] = set()
+    for event in state.get("finding_binding_reconciliations", []):
+        reconciliation_id = event.get("reconciliation_id")
+        if reconciliation_id in reconciliation_ids:
+            fail(f"duplicate finding binding reconciliation ID: {reconciliation_id}")
+        reconciliation_ids.add(reconciliation_id)
+        if (
+            event.get("source_revision", -1) >= event.get("applied_revision", -1)
+            or event.get("applied_revision", -1) > state.get("revision", -1)
+            or event.get("owner_epoch", -1) > state.get("owner", {}).get("epoch", -1)
+            or event.get("manifest_ref") != f"objects/{event.get('manifest_hash')}"
+        ):
+            fail(f"finding reconciliation has invalid source/applied revision, epoch, or manifest binding: {event.get('id')}")
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == event.get("ticket_ref")), None)
+        candidate = candidates_by_id.get(event.get("candidate_ref"))
+        attempt = attempts_by_id.get(event.get("review_attempt_ref"))
+        if (
+            ticket is None or candidate is None or attempt is None
+            or candidate.get("ticket_ref") != ticket.get("id")
+            or candidate.get("sha") != event.get("candidate_sha")
+            or candidate.get("tree_sha") != event.get("candidate_tree_sha")
+            or attempt.get("kind") != "review" or attempt.get("subject_ref") != ticket.get("id")
+            or attempt.get("candidate_sha") != event.get("candidate_sha")
+            or attempt.get("packet_ref") != event.get("packet_ref")
+            or attempt.get("packet_hash") != event.get("packet_hash")
+            or attempt.get("return_ref") != event.get("return_ref")
+            or event.get("review_attempt_ref") in reconciled_reviews
+        ):
+            fail(f"finding reconciliation is not bound to its exact ticket/candidate/review attempt: {event.get('id')}")
+        reconciled_reviews.add(event["review_attempt_ref"])
+        event_finding_refs: set[str] = set()
+        event_issue_refs: set[str] = set()
+        for binding in event.get("finding_bindings", []):
+            finding_ref, issue_ref = binding.get("finding_ref"), binding.get("issue_ref")
+            finding = next((item for item in state.get("findings", []) if item.get("id") == finding_ref), None)
+            issue = next((item for item in state.get("issues", []) if item.get("id") == issue_ref), None)
+            if (
+                finding is None or issue is None or finding_ref in event_finding_refs
+                or issue_ref in event_issue_refs or finding_ref in reconciled_findings
+                or finding.get("source_ref") != attempt.get("id")
+                or issue.get("finding_ref") != finding_ref
+                or issue.get("source_ref") != attempt.get("id")
+                or issue.get("impact") != "blocking" or issue.get("invalidated_by")
+                or finding.get("impact") != "blocking" or finding.get("invalidated_by")
+                or set(issue.get("affected_refs", [])) != set(finding.get("affected_refs", []))
+            ):
+                fail(f"finding reconciliation issue mirror is missing, stale, or incompatible: {event.get('id')}")
+            event_finding_refs.add(finding_ref)
+            event_issue_refs.add(issue_ref)
+        if not event_finding_refs:
+            fail(f"finding reconciliation has no bindings: {event.get('id')}")
+        reconciled_findings.update(event_finding_refs)
+        if verify_files:
+            event_path = Path(state["repository"]["control_root"]) / ".autopilot" / "runs" / state["run_id"] / event["manifest_ref"]
+            regular_non_symlink(event_path)
+            event_raw = event_path.read_bytes()
+            if sha256_bytes(event_raw) != event.get("manifest_hash"):
+                fail(f"finding reconciliation manifest hash mismatch: {event.get('id')}")
+            try:
+                manifest = json.loads(event_raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                fail(f"finding reconciliation manifest is invalid JSON: {exc}")
+            if any(manifest.get(key) != event.get(key) for key in (
+                "reconciliation_id", "source_revision", "source_ledger_hash", "owner_epoch",
+                "review_attempt_ref", "ticket_ref", "candidate_ref", "candidate_sha",
+                "candidate_tree_sha", "packet_ref", "packet_hash", "return_ref", "return_hash",
+                "continuation_receipt_ref", "continuation_receipt_hash", "finding_bindings",
+            )):
+                fail(f"finding reconciliation manifest does not reproduce its append-only event: {event.get('id')}")
+    if verify_files and state.get("finding_binding_reconciliations"):
+        p = paths(state["repository"]["control_root"], state["run_id"])
+        for event in state["finding_binding_reconciliations"]:
+            receipt = stored_payload(p, event["continuation_receipt_ref"], "finding reconciliation continuation receipt")
+            blocker_ref = receipt.get("blocker_ref")
+            blocker = next((item for item in state.get("issues", []) if item.get("id") == blocker_ref), None)
+            candidate = candidates_by_id.get(event.get("candidate_ref"))
+            if (
+                receipt.get("blocker_scope") != "external" or blocker is None
+                or blocker.get("impact") != "blocking" or blocker.get("invalidated_by")
+                or blocker_ref not in (candidate or {}).get("blocker_refs", [])
+            ):
+                fail(f"finding reconciliation lost its exact current external continuation blocker: {event.get('id')}")
     usage = state.get("usage")
     if usage and usage.get("tokens") is None and not usage.get("token_reason"):
         fail("usage with tokens=null requires token_reason")
@@ -1954,7 +2187,59 @@ def validate_design_bundle(bundle: dict[str, Any]) -> None:
                 fail(f"ticket zones overlap without dependency ordering: {left['id']} / {right['id']}")
 
 
-def validate_ticket_contract_bindings(contracts: list[dict[str, Any]], tickets: list[dict[str, Any]], label: str) -> None:
+def _binding_normalization_for_pair(
+    state: dict[str, Any], ticket_ref: str, contract_ref: str,
+    publication_ref: str | None = None, publication_hash: str | None = None,
+) -> dict[str, Any] | None:
+    """Return an exact current-publication normalization for one raw self-input pair."""
+    publication = state.get("design_publication") or {}
+    expected_ref = publication_ref or publication.get("id")
+    expected_hash = publication_hash or publication.get("publication_hash")
+    matches = []
+    for event in state.get("binding_normalizations", []):
+        if event.get("publication_ref") != expected_ref or event.get("publication_hash") != expected_hash:
+            continue
+        for item in event.get("bindings", []):
+            if item.get("ticket_ref") == ticket_ref and item.get("contract_ref") == contract_ref:
+                matches.append(item)
+    if len(matches) > 1:
+        fail(f"overlapping effective binding normalizations for {ticket_ref} / {contract_ref}")
+    return matches[0] if matches else None
+
+
+def effective_ticket_contract_bindings(
+    state: dict[str, Any], ticket: dict[str, Any],
+) -> dict[str, list[str]]:
+    """Project immutable raw contract refs into executable inputs and specification refs."""
+    executable: list[str] = []
+    specification: list[str] = []
+    ticket_id = ticket.get("id")
+    for ref in ticket.get("contract_refs", []):
+        contract = next((item for item in state.get("contracts", []) if item.get("id") == ref), None)
+        self_input = contract is not None and ticket_id in contract.get("producer_refs", [])
+        normalization = (
+            _binding_normalization_for_pair(state, ticket_id, ref)
+            if self_input and ticket_id else None
+        )
+        if (
+            normalization
+            and normalization.get("classification") == "metadata_only"
+            and normalization.get("effective_role") == "specification_only"
+            and normalization.get("original_relation") == "self_input"
+            and normalization.get("implementation_availability") == "not_required"
+            and normalization.get("equivalence_refs")
+            and normalization.get("evidence_refs")
+        ):
+            specification.append(ref)
+        else:
+            executable.append(ref)
+    return {"implementation_input_refs": executable, "specification_refs": specification}
+
+
+def validate_ticket_contract_bindings(
+    contracts: list[dict[str, Any]], tickets: list[dict[str, Any]], label: str,
+    *, state: dict[str, Any] | None = None,
+) -> None:
     """Keep ticket inputs distinct from contracts produced by that ticket.
 
     ``ticket.contract_refs`` has always fed readiness and is therefore an
@@ -1965,7 +2250,11 @@ def validate_ticket_contract_bindings(contracts: list[dict[str, Any]], tickets: 
     contract_by_id = {item.get("id"): item for item in contracts}
     for ticket in tickets:
         ticket_id = ticket.get("id")
-        for contract_ref in ticket.get("contract_refs", []):
+        effective_refs = (
+            effective_ticket_contract_bindings(state, ticket)["implementation_input_refs"]
+            if state is not None else ticket.get("contract_refs", [])
+        )
+        for contract_ref in effective_refs:
             contract = contract_by_id.get(contract_ref)
             if contract is None:
                 continue
@@ -1981,7 +2270,347 @@ def validate_current_design_contract_bindings(state: dict[str, Any]) -> None:
     publication = current_design_publication(state)
     ticket_refs = set(publication.get("ticket_refs", []))
     tickets = [item for item in state.get("tickets", []) if item.get("id") in ticket_refs]
-    validate_ticket_contract_bindings(state.get("contracts", []), tickets, "current design publication")
+    validate_ticket_contract_bindings(
+        state.get("contracts", []), tickets, "current design publication", state=state,
+    )
+
+
+def _contract_has_integrated_producer(state: dict[str, Any], contract: dict[str, Any]) -> bool:
+    """Treat implementation as available only with explicit evidence or a current integrated producer."""
+    tickets = {item.get("id"): item for item in state.get("tickets", [])}
+    candidates = {item.get("id"): item for item in state.get("candidates", [])}
+    for producer_ref in contract.get("producer_refs", []):
+        producer = tickets.get(producer_ref)
+        candidate = candidates.get(producer.get("current_candidate")) if producer else None
+        if (
+            producer and producer.get("state") == "INTEGRATED"
+            and candidate and candidate.get("quality") == "DONE"
+            and candidate.get("integration_status") == "INTEGRATED"
+            and not candidate.get("invalidated_by")
+        ):
+            return True
+    return False
+
+
+def validate_ticket_implementation_availability(
+    state: dict[str, Any], tickets: list[dict[str, Any]], label: str,
+    *, allow_planned_producers: bool = False,
+) -> None:
+    """Fail closed when executable inputs have no availability evidence or producer path."""
+    publication = state.get("design_publication") or {}
+    publication_tickets = {
+        item.get("id"): item for item in state.get("tickets", [])
+        if item.get("id") in set(publication.get("ticket_refs", []))
+    }
+
+    def depends_on(ticket_id: str, producer_id: str, visiting: set[str] | None = None) -> bool:
+        visiting = set() if visiting is None else visiting
+        if ticket_id in visiting:
+            return False
+        visiting.add(ticket_id)
+        ticket = publication_tickets.get(ticket_id)
+        if ticket is None:
+            return False
+        dependencies = ticket.get("dependency_refs", [])
+        return producer_id in dependencies or any(depends_on(dep, producer_id, set(visiting)) for dep in dependencies)
+
+    contracts = {item.get("id"): item for item in state.get("contracts", [])}
+    for ticket in tickets:
+        effective = effective_ticket_contract_bindings(state, ticket)
+        for ref in effective["implementation_input_refs"]:
+            contract = contracts.get(ref)
+            if contract is None or contract.get("status") != "active" or contract.get("invalidated_by"):
+                fail(f"{label} ticket {ticket.get('id')} has no current accepted contract input: {ref}")
+            availability = contract.get("implementation_availability", "unknown")
+            evidence = contract.get("implementation_availability_evidence_refs", [])
+            if availability == "available" and evidence:
+                continue
+            if availability == "unavailable":
+                fail(f"{label} ticket {ticket.get('id')} requires unavailable implementation input: {ref}")
+            if availability == "not_required":
+                fail(f"{label} ticket {ticket.get('id')} marks executable input as not_required: {ref}")
+            if _contract_has_integrated_producer(state, contract):
+                continue
+            if allow_planned_producers:
+                producers = [
+                    producer_ref for producer_ref in contract.get("producer_refs", [])
+                    if producer_ref in publication_tickets and producer_ref != ticket.get("id")
+                    and depends_on(ticket.get("id"), producer_ref)
+                ]
+                if producers:
+                    continue
+            fail(
+                f"{label} ticket {ticket.get('id')} requires implementation availability evidence or an "
+                f"current integrated producer for contract {ref} (status alone is insufficient)"
+            )
+
+
+def validate_effective_ticket_contract_bindings(
+    state: dict[str, Any], tickets: list[dict[str, Any]], label: str,
+    *, require_availability: bool = False, allow_planned_producers: bool = False,
+) -> None:
+    validate_ticket_contract_bindings(state.get("contracts", []), tickets, label, state=state)
+    contracts = {item.get("id"): item for item in state.get("contracts", [])}
+    for ticket in tickets:
+        for ref in effective_ticket_contract_bindings(state, ticket)["specification_refs"]:
+            contract = contracts.get(ref)
+            if contract is None or contract.get("status") != "active" or contract.get("invalidated_by"):
+                fail(f"{label} ticket {ticket.get('id')} has no current accepted specification binding: {ref}")
+    if require_availability:
+        validate_ticket_implementation_availability(
+            state, tickets, label, allow_planned_producers=allow_planned_producers,
+        )
+
+
+def _read_manifest(path_value: str | Path, label: str) -> tuple[dict[str, Any], bytes]:
+    path = Path(path_value).expanduser()
+    regular_non_symlink(path)
+    raw = path.read_bytes()
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"{label} is not valid UTF-8 JSON: {exc}")
+    if not isinstance(value, dict):
+        fail(f"{label} must be a JSON object")
+    return value, raw
+
+
+def legacy_contract_intersections(state: dict[str, Any]) -> list[dict[str, str]]:
+    """Enumerate every current-publication input/output self-intersection deterministically."""
+    publication = state.get("design_publication") or {}
+    tickets = {item.get("id"): item for item in state.get("tickets", [])}
+    contracts = {item.get("id"): item for item in state.get("contracts", [])}
+    pairs: list[dict[str, str]] = []
+    for ticket_ref in publication.get("ticket_refs", []):
+        ticket = tickets.get(ticket_ref)
+        if ticket is None:
+            continue
+        for contract_ref in publication.get("contract_refs", []):
+            contract = contracts.get(contract_ref)
+            if contract is not None and contract_ref in ticket.get("contract_refs", []) and ticket_ref in contract.get("producer_refs", []):
+                pairs.append({"ticket_ref": ticket_ref, "contract_ref": contract_ref})
+    return sorted(pairs, key=lambda item: (item["ticket_ref"], item["contract_ref"]))
+
+
+def assess_legacy_binding_manifest(
+    state: dict[str, Any], source_raw: bytes, manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate a frozen source binding inventory and return its classifications without mutation."""
+    root = schema()
+    validate(manifest, root["$defs"]["binding_normalization_manifest"], root, "$.binding_manifest")
+    publication = state.get("design_publication") or {}
+    source_hash = sha256_bytes(source_raw)
+    checks = {
+        "source_revision": (manifest.get("source_revision"), state.get("revision")),
+        "source_ledger_hash": (manifest.get("source_ledger_hash"), source_hash),
+        "owner_epoch": (manifest.get("owner_epoch"), (state.get("owner") or {}).get("epoch")),
+        "publication_ref": (manifest.get("publication_ref"), publication.get("id")),
+        "publication_hash": (manifest.get("publication_hash"), publication.get("publication_hash")),
+    }
+    for name, (supplied, expected) in checks.items():
+        if supplied != expected:
+            fail(f"binding manifest {name} does not match exact source state")
+
+    pairs = legacy_contract_intersections(state)
+    supplied_items = manifest.get("bindings", [])
+    supplied_pairs = [
+        (item.get("ticket_ref"), item.get("contract_ref")) for item in supplied_items
+    ]
+    expected_pairs = [(item["ticket_ref"], item["contract_ref"]) for item in pairs]
+    if len(supplied_pairs) != len(set(supplied_pairs)) or sorted(supplied_pairs) != expected_pairs:
+        fail("binding manifest must classify every current self-input intersection exactly once")
+
+    classified: list[dict[str, Any]] = []
+    for item in sorted(supplied_items, key=lambda row: (row["ticket_ref"], row["contract_ref"])):
+        if item.get("original_relation") != "self_input":
+            fail("binding manifest original_relation must preserve the exact self_input relation")
+        if item.get("original_refs") != [item["ticket_ref"], item["contract_ref"]]:
+            fail("binding manifest original_refs must be the exact [ticket_ref, contract_ref] pair")
+        if not item.get("evidence_refs") or not item.get("equivalence_refs"):
+            fail("binding classifications require exact evidence_refs and equivalence_refs")
+        row = copy.deepcopy(item)
+        if row.get("classification") == "metadata_only":
+            if row.get("effective_role") == "specification_only":
+                if row.get("implementation_availability") != "not_required":
+                    fail("specification_only normalization must declare implementation_availability=not_required")
+                if not row.get("implementation_availability_evidence_refs"):
+                    fail("specification_only normalization requires availability evidence refs")
+            elif row.get("implementation_availability") != "available":
+                fail("implementation_input normalization requires explicit available implementation evidence")
+        classified.append(row)
+    counts = {
+        classification: sum(1 for item in classified if item.get("classification") == classification)
+        for classification in ("metadata_only", "material_change", "ambiguous")
+    }
+    return {
+        "valid": True,
+        "migration_eligible": bool(classified) and counts["metadata_only"] == len(classified)
+        and all(item.get("effective_role") == "specification_only" for item in classified),
+        "source_revision": state["revision"],
+        "source_ledger_hash": source_hash,
+        "publication_ref": publication.get("id"),
+        "publication_hash": publication.get("publication_hash"),
+        "intersection_count": len(pairs),
+        "distinct_ticket_count": len({item["ticket_ref"] for item in pairs}),
+        "metadata_only_count": counts["metadata_only"],
+        "material_change_count": counts["material_change"],
+        "ambiguous_count": counts["ambiguous"],
+        "intersections": classified,
+    }
+
+
+def _cmd_assess_legacy_bindings(args: argparse.Namespace) -> dict[str, Any]:
+    """Read-only compatibility assessment against exact standalone ledger bytes."""
+    source_file = Path(args.file).expanduser()
+    regular_non_symlink(source_file)
+    source_raw = source_file.read_bytes()
+    try:
+        state = json.loads(source_raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"legacy source ledger is not valid UTF-8 JSON: {exc}")
+    if not isinstance(state, dict):
+        fail("legacy source ledger must be a JSON object")
+    validate_ledger(state, verify_files=False)
+    manifest, manifest_raw = _read_manifest(args.manifest, "binding normalization manifest")
+    assessment = assess_legacy_binding_manifest(state, source_raw, manifest)
+    return {
+        **assessment,
+        "read_only": True,
+        "manifest_hash": sha256_bytes(manifest_raw),
+    }
+
+
+def _bootstrap_legacy_candidate_model(p: dict[str, Path], state: dict[str, Any]) -> None:
+    """Conservatively bootstrap only R58's exact continuation candidate from its immutable receipt."""
+    if state.get("candidate_model_version") == "1.1":
+        return
+    if state.get("candidates") or any(ticket.get("current_candidate") for ticket in state.get("tickets", [])):
+        fail("legacy candidate bootstrap is ambiguous: candidate records or pointers already exist")
+    ticket = next((item for item in state.get("tickets", []) if item.get("id") == "T02-R17"), None)
+    if ticket is None or ticket.get("state") != "BLOCKED":
+        fail("legacy candidate bootstrap requires the exact blocked T02-R17 ticket")
+    worker = next((item for item in state.get("attempts", []) if item.get("id") == "T02-R17-WORKER-05"), None)
+    if (
+        worker is None or worker.get("kind") != "worker" or worker.get("subject_ref") != ticket["id"]
+        or worker.get("state") != "RETURNED" or ticket.get("current_attempt") != worker.get("id")
+        or not worker.get("candidate_sha") or not worker.get("candidate_tree_sha")
+        or not worker.get("continuation_ref")
+    ):
+        fail("legacy candidate bootstrap lacks the exact current returned Worker05 candidate identity")
+    receipt = stored_payload(p, worker.get("continuation_ref"), "Worker05 continuation receipt")
+    expected = {
+        "attempt_id": worker["id"], "candidate_sha": worker["candidate_sha"],
+        "candidate_tree_sha": worker["candidate_tree_sha"], "base_sha": worker.get("base_sha"),
+        "authorization_ref": worker.get("continuation_authorization_ref"),
+    }
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        fail("Worker05 continuation receipt does not match the exact ledger candidate identity")
+    blocker_ref = receipt.get("blocker_ref")
+    blocker = next((item for item in state.get("issues", []) if item.get("id") == blocker_ref), None)
+    if receipt.get("blocker_scope") != "external" or blocker is None or blocker.get("invalidated_by"):
+        fail("Worker05 continuation bootstrap requires its exact still-current external blocker")
+    candidate_id = f"candidate-{worker['id']}"
+    if any(item.get("id") == candidate_id for item in state.get("candidates", [])):
+        fail("legacy candidate bootstrap collides with an existing candidate ID")
+    state.setdefault("candidates", []).append({
+        "id": candidate_id, "ticket_ref": ticket["id"], "sha": worker["candidate_sha"],
+        "tree_sha": worker["candidate_tree_sha"], "base_sha": worker.get("base_sha"),
+        "producer_attempt_ref": worker["id"], "parent_candidate_ref": None,
+        "quality": "CONTINUATION", "blocker_refs": [blocker_ref],
+        "review_status": "BLOCK", "integration_status": "PENDING",
+        "proof_ref": None,
+    })
+    attempts_by_id = {item.get("id"): item for item in state.get("attempts", [])}
+    for item in state.get("tickets", []):
+        item["current_candidate"] = None
+        prior = attempts_by_id.get(item.get("current_attempt"))
+        workers = [
+            attempt for attempt in state.get("attempts", [])
+            if attempt.get("kind") == "worker" and attempt.get("subject_ref") == item.get("id")
+        ]
+        last_worker = prior if prior and prior.get("kind") == "worker" else (
+            max(workers, key=lambda attempt: attempt.get("attempt_created_revision", -1)) if workers else None
+        )
+        item["last_worker_attempt"] = last_worker.get("id") if last_worker else None
+        item["current_attempt"] = item["last_worker_attempt"]
+        item["current_worker_attempt"] = (
+            item["last_worker_attempt"]
+            if last_worker and last_worker.get("state") in ("PREPARED", "DISPATCHED") else None
+        )
+    ticket["current_candidate"] = candidate_id
+    state["candidate_model_version"] = "1.1"
+    state["review_model_version"] = "1.1"
+    state.setdefault("review_qualifications", [])
+    state.setdefault("repair_waves", [])
+    state.setdefault("acceptance", [])
+
+
+def _locked_migration_load(p: dict[str, Path], owner_token: str) -> tuple[dict[str, Any], bytes]:
+    """Load a mutation source under owner/revision fences, allowing explicit legacy migration only."""
+    state, raw = load_state(p)
+    if state.get("owner", {}).get("token") != owner_token:
+        fail("owner token mismatch; stale orchestrator is fenced")
+    return state, raw
+
+
+def _cmd_migrate_legacy_bindings(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    manifest, manifest_raw = _read_manifest(args.manifest, "binding normalization manifest")
+    manifest_hash = sha256_bytes(manifest_raw)
+    root = schema()
+    validate(manifest, root["$defs"]["binding_normalization_manifest"], root, "$.binding_manifest")
+    with Lock(p["lock"]):
+        state, previous_raw = _locked_migration_load(p, args.owner_token)
+        prior = next((item for item in state.get("binding_normalizations", []) if item.get("migration_id") == manifest["migration_id"]), None)
+        if prior is not None:
+            if prior.get("manifest_hash") == manifest_hash and prior.get("source_ledger_hash") == manifest.get("source_ledger_hash") and prior.get("source_revision") == manifest.get("source_revision"):
+                if args.revision not in {manifest.get("source_revision"), prior.get("applied_revision"), state.get("revision")}:
+                    fail(f"revision mismatch on migration replay: expected source/applied/current revision, got {args.revision}")
+                return {"migrated": True, "idempotent": True, "migration_id": manifest["migration_id"], "manifest_hash": manifest_hash, "applied_revision": prior.get("applied_revision"), "normalized_binding_count": len(prior.get("bindings", []))}
+            fail("binding migration ID already exists with conflicting manifest/source")
+        if state.get("revision") != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state.get('revision')}")
+        assessment = assess_legacy_binding_manifest(state, previous_raw, manifest)
+        if not assessment["migration_eligible"]:
+            fail("binding migration rejected: every intersection must be exact metadata_only specification_only with equivalence evidence")
+        if state.get("owner", {}).get("epoch") != manifest.get("owner_epoch"):
+            fail("binding manifest owner_epoch does not match current owner epoch")
+        _bootstrap_legacy_candidate_model(p, state)
+        manifest_ref = object_store(p, manifest_raw)
+        migration_id = manifest["migration_id"]
+        event_id = f"binding-normalization-{migration_id}"
+        if any(item.get("id") == event_id for item in state.get("binding_normalizations", [])):
+            fail("binding normalization event ID already exists")
+        applied_revision = state["revision"] + 1
+        bindings = []
+        for item in assessment["intersections"]:
+            normalized = copy.deepcopy(item)
+            normalized["implementation_availability"] = "not_required"
+            bindings.append(normalized)
+        state.setdefault("binding_normalizations", []).append({
+            "id": event_id, "migration_id": migration_id,
+            "source_revision": assessment["source_revision"],
+            "source_ledger_hash": assessment["source_ledger_hash"],
+            "publication_ref": assessment["publication_ref"],
+            "publication_hash": assessment["publication_hash"],
+            "manifest_hash": manifest_hash, "manifest_ref": f"objects/{manifest_ref}",
+            "owner_epoch": manifest["owner_epoch"], "applied_revision": applied_revision,
+            "bindings": bindings, "recorded_at": now(),
+        })
+        provenance = ensure_runtime_provenance(state)
+        provenance["state_contract_version"] = STATE_CONTRACT_VERSION
+        provenance["minimum_writer_version"] = WRITER_VERSION
+        provenance["applied_migrations"].append({
+            "id": f"legacy-bindings-{migration_id}", "helper_version": SKILL_VERSION,
+            "applied_revision": applied_revision, "manifest_hash": manifest_hash,
+            "object_ref": f"objects/{manifest_ref}",
+        })
+        state["revision"] = applied_revision
+        state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        state["updated_at"] = now()
+        validate_ledger(state, verify_files=False)
+        publish(p, state, previous_raw, "legacy-binding-normalization")
+        return {"migrated": True, "idempotent": False, "migration_id": migration_id, "manifest_hash": manifest_hash, "applied_revision": applied_revision, "normalized_binding_count": len(bindings)}
 
 
 def stored_payload(p: dict[str, Path], ref: str | None, label: str) -> dict[str, Any]:
@@ -2119,6 +2748,41 @@ def repair_finding_refs(repair: dict[str, Any]) -> list[str]:
     return [finding_ref] if isinstance(finding_ref, str) else []
 
 
+def effective_finding_ticket_refs(state: dict[str, Any], finding_ref: str) -> list[str]:
+    """Return raw ticket refs plus exact active append-only finding reconciliations."""
+    ticket_ids = {item.get("id") for item in state.get("tickets", [])}
+    finding = next((item for item in state.get("findings", []) if item.get("id") == finding_ref), None)
+    issue = next((item for item in state.get("issues", []) if item.get("id") == finding_ref), None)
+    if issue and issue.get("finding_ref"):
+        finding = next((item for item in state.get("findings", []) if item.get("id") == issue.get("finding_ref")), finding)
+    refs = {ref for ref in (finding or issue or {}).get("affected_refs", []) if ref in ticket_ids}
+    if finding is None:
+        return sorted(refs)
+    for event in state.get("finding_binding_reconciliations", []):
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == event.get("ticket_ref")), None)
+        candidate = next((item for item in state.get("candidates", []) if item.get("id") == event.get("candidate_ref")), None)
+        attempt = next((item for item in state.get("attempts", []) if item.get("id") == event.get("review_attempt_ref")), None)
+        if (
+            ticket is None or candidate is None or attempt is None
+            or ticket.get("current_candidate") != candidate.get("id")
+            or candidate.get("sha") != event.get("candidate_sha")
+            or candidate.get("tree_sha") != event.get("candidate_tree_sha")
+            or attempt.get("subject_ref") != ticket.get("id")
+            or attempt.get("candidate_sha") != event.get("candidate_sha")
+            or attempt.get("packet_ref") != event.get("packet_ref")
+            or attempt.get("packet_hash") != event.get("packet_hash")
+            or attempt.get("return_ref") != event.get("return_ref")
+        ):
+            continue
+        for binding in event.get("finding_bindings", []):
+            if binding.get("finding_ref") != finding.get("id"):
+                continue
+            mirror = next((item for item in state.get("issues", []) if item.get("id") == binding.get("issue_ref")), None)
+            if mirror and mirror.get("finding_ref") == finding.get("id") and mirror.get("source_ref") == attempt.get("id") and finding.get("source_ref") == attempt.get("id"):
+                refs.add(ticket["id"])
+    return sorted(refs)
+
+
 def repair_proofs(repair: dict[str, Any]) -> list[dict[str, str]]:
     """Return one normalized hypothesis/proof pair for each selected finding."""
     proofs = repair.get("finding_proofs")
@@ -2191,7 +2855,7 @@ def normalize_repair_contract(
         record = finding or issue
         if record is None or record.get("impact") != "blocking" or record.get("invalidated_by"):
             fail(f"repair finding is not a current blocking finding/issue: {finding_ref}")
-        if ticket.get("id") not in record.get("affected_refs", []):
+        if ticket.get("id") not in effective_finding_ticket_refs(state, finding_ref):
             fail(f"repair finding is not bound to this ticket: {finding_ref}")
         if not finding_matches_candidate(state, finding_ref, ticket["id"], candidate["sha"]):
             fail(f"repair finding is not bound to the current candidate: {finding_ref}")
@@ -2414,7 +3078,7 @@ def finding_matches_candidate(state: dict[str, Any], finding_ref: str, ticket_id
     record = finding or issue
     if record is None or record.get("impact") != "blocking" or record.get("invalidated_by"):
         return False
-    if ticket_id not in record.get("affected_refs", []):
+    if ticket_id not in effective_finding_ticket_refs(state, finding_ref):
         return False
     source_ref = record.get("source_ref")
     source_attempt = next((item for item in state.get("attempts", []) if item.get("id") == source_ref), None)
@@ -2437,7 +3101,7 @@ def finding_matches_candidate(state: dict[str, Any], finding_ref: str, ticket_id
             )
         return False
     source_review = next((item for item in state.get("reviews", []) if item.get("id") == source_ref), None)
-    return bool(source_review and source_review.get("subject_fingerprint") == candidate_sha and ticket_id in record.get("affected_refs", []))
+    return bool(source_review and source_review.get("subject_fingerprint") == candidate_sha and ticket_id in effective_finding_ticket_refs(state, finding_ref))
 
 
 def continuation_candidate_receipt(
@@ -2573,12 +3237,12 @@ def _ticket_blocking_refs(state: dict[str, Any], ticket_id: str) -> list[str]:
     refs = {
         item.get("id") for item in state.get("issues", [])
         if item.get("id") and item.get("impact") == "blocking"
-        and not item.get("invalidated_by") and ticket_id in item.get("affected_refs", [])
+        and not item.get("invalidated_by") and ticket_id in effective_finding_ticket_refs(state, item["id"])
     }
     refs.update(
         item.get("id") for item in state.get("findings", [])
         if item.get("id") and item.get("impact") == "blocking"
-        and not item.get("invalidated_by") and ticket_id in item.get("affected_refs", [])
+        and not item.get("invalidated_by") and ticket_id in effective_finding_ticket_refs(state, item["id"])
     )
     return sorted(refs)
 
@@ -2828,6 +3492,35 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
     design = state.get("design_publication") or {}
     design_history = state.get("design_publication_history", [])
     publications = {item.get("id"): item for item in [*design_history, design] if item.get("id")}
+    effective_reconciliations: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for event in state.get("finding_binding_reconciliations", []):
+        ticket = tickets.get(event.get("ticket_ref"))
+        candidate = candidates.get(event.get("candidate_ref"))
+        attempt = attempts.get(event.get("review_attempt_ref"))
+        if (
+            ticket is None or candidate is None or attempt is None
+            or ticket.get("current_candidate") != candidate.get("id")
+            or candidate.get("ticket_ref") != ticket.get("id")
+            or candidate.get("sha") != event.get("candidate_sha")
+            or candidate.get("tree_sha") != event.get("candidate_tree_sha")
+            or attempt.get("kind") != "review" or attempt.get("subject_ref") != ticket.get("id")
+            or attempt.get("candidate_sha") != event.get("candidate_sha")
+            or attempt.get("packet_ref") != event.get("packet_ref")
+            or attempt.get("packet_hash") != event.get("packet_hash")
+            or attempt.get("return_ref") != event.get("return_ref")
+        ):
+            continue
+        for binding in event.get("finding_bindings", []):
+            finding = next((item for item in state.get("findings", []) if item.get("id") == binding.get("finding_ref")), None)
+            issue = issue_by_id.get(binding.get("issue_ref"))
+            if (
+                finding is None or issue is None
+                or finding.get("source_ref") != attempt.get("id")
+                or issue.get("finding_ref") != finding.get("id")
+                or issue.get("source_ref") != attempt.get("id")
+            ):
+                continue
+            effective_reconciliations[finding["id"]] = (event, binding)
     accepted_pass_reviews = {
         item.get("id"): item for item in state.get("reviews", [])
         if item.get("id") and item.get("accepted") is True
@@ -2860,7 +3553,7 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
         if review.get("subject_fingerprint") != candidate.get("sha"):
             continue
         if (
-            ticket_ref not in finding.get("affected_refs", [])
+            ticket_ref not in effective_finding_ticket_refs(state, finding_ref)
             or ticket is None
             or ticket.get("current_candidate") != candidate_ref
             or candidate.get("quality") != "DONE"
@@ -2886,6 +3579,12 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
         source = attempts.get(source_id) or reviews.get(source_id)
         issue_refs = sorted(item["id"] for item in issues if item.get("finding_ref") == finding_id)
         affected_tickets = sorted(ref for ref in finding.get("affected_refs", []) if ref in tickets)
+        reconciliation = effective_reconciliations.get(finding_id)
+        if reconciliation is not None:
+            reconciled_ticket = reconciliation[0].get("ticket_ref")
+            if reconciled_ticket in tickets and reconciled_ticket not in affected_tickets:
+                affected_tickets.append(reconciled_ticket)
+                affected_tickets.sort()
         candidate = None
         publication = None
         source_sha = None
@@ -2925,11 +3624,31 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
                 binding_kind = "superseded"
             else:
                 binding_kind = "historical"
+        elif reconciliation is not None:
+            event = reconciliation[0]
+            candidate = candidates.get(event.get("candidate_ref"))
+            source_candidate_ref = candidate.get("id") if candidate else None
+            binding_kind = "current"
         elif source is not None and source_sha and affected_tickets:
             # Exact attempt+ticket evidence can identify legacy history, but cannot silently
             # establish a current candidate in a ledger without the explicit Phase B pointer.
             if source.get("subject_ref") in affected_tickets:
                 binding_kind = "historical"
+        if binding_kind is None and source is not None and source.get("subject_ref") in publications:
+            # A design review is immutably tied to its publication ID; this
+            # remains exact even when a copy/rehearsal rehashes the publication
+            # object and the original fingerprint no longer equals that hash.
+            publication = publications[source["subject_ref"]]
+            binding_kind = "current" if publication.get("id") == design.get("id") else "historical"
+        if binding_kind is None and source is not None and source_sha and source.get("subject_ref") in tickets:
+            # A ticket-scoped historical candidate requires both immutable source
+            # attempt linkage and a candidate fingerprint. Subject linkage alone
+            # is insufficient (an unbound finding may cite the same ticket).
+            source_ticket = source["subject_ref"]
+            if source_ticket not in affected_tickets:
+                affected_tickets.append(source_ticket)
+                affected_tickets.sort()
+            binding_kind = "historical"
 
         resolutions_by_ticket = resolutions_by_finding_ticket.get(finding_id, {})
         resolved_ticket_refs = sorted(ref for ref in affected_tickets if resolutions_by_ticket.get(ref))
@@ -2949,10 +3668,16 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
 
         is_blocking = finding.get("impact") == "blocking"
         obligation_status = "closed" if all_affected_tickets_resolved or not is_blocking else ("binding_required" if status == "unbound" else "open")
+        projection_classification = (
+            "current" if status == "current" else
+            "carry_forward" if status in ("historical", "superseded") and obligation_status == "open" else
+            "history" if status in ("historical", "superseded", "resolved") else "unbound"
+        )
         proof = finding.get("expected") or finding.get("claim") or "independent evidence that the reported defect is absent"
         item = {
             "finding_ref": finding_id,
             "status": status,
+            "projection_classification": projection_classification,
             "current_applicability": status == "current",
             "repairable": status == "current" and obligation_status == "open",
             "source_candidate_ref": source_candidate_ref,
@@ -2963,6 +3688,7 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
             "resolved_by_refs": resolved_by,
             "verification_obligation": {
                 "status": obligation_status,
+                "applicability": projection_classification,
                 "required_proof": proof,
                 "ticket_refs": unresolved_ticket_refs,
                 "issue_refs": issue_refs,
@@ -2973,7 +3699,7 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
             obligations.append({
                 "finding_ref": finding_id,
                 "status": obligation_status,
-                "applicability": status,
+                "applicability": projection_classification,
                 "required_proof": proof,
                 "issue_refs": issue_refs,
                 "ticket_refs": unresolved_ticket_refs,
@@ -3020,7 +3746,385 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
             "active": bool(issue.get("impact") == "blocking" and not issue.get("invalidated_by")),
             "repairable": bool(issue_status == "current" and issue.get("impact") == "blocking" and not issue.get("invalidated_by")),
         })
-    return {"items": records, "obligations": obligations, "mirrored_issues": mirrors}
+    return {
+        "items": records, "obligations": obligations, "mirrored_issues": mirrors,
+        "current_finding_refs": sorted(item["finding_ref"] for item in records if item["projection_classification"] == "current"),
+        "historical_finding_refs": sorted(item["finding_ref"] for item in records if item["projection_classification"] == "history"),
+        "carry_forward_finding_refs": sorted(item["finding_ref"] for item in records if item["projection_classification"] == "carry_forward"),
+    }
+
+
+def _validate_review05_reconciliation(
+    state: dict[str, Any], source_raw: bytes, manifest: dict[str, Any],
+    payload_loader: Callable[[str, str], tuple[dict[str, Any], bytes]],
+) -> dict[str, Any]:
+    root = schema()
+    validate(manifest, root["$defs"]["finding_binding_reconciliation_manifest"], root, "$.finding_binding_manifest")
+    source_hash = sha256_bytes(source_raw)
+    exact = {
+        "source_revision": state.get("revision"),
+        "source_ledger_hash": source_hash,
+        "owner_epoch": state.get("owner", {}).get("epoch"),
+        "review_attempt_ref": "T02-R17-REVIEW-CODE-05",
+        "ticket_ref": "T02-R17",
+    }
+    for field, value in exact.items():
+        if manifest.get(field) != value:
+            fail(f"finding binding manifest {field} does not match the exact current source")
+    ticket = next((item for item in state.get("tickets", []) if item.get("id") == manifest["ticket_ref"]), None)
+    attempt = next((item for item in state.get("attempts", []) if item.get("id") == manifest["review_attempt_ref"]), None)
+    worker = next((item for item in state.get("attempts", []) if item.get("id") == "T02-R17-WORKER-05"), None)
+    candidate = next((item for item in state.get("candidates", []) if item.get("id") == manifest.get("candidate_ref")), None)
+    if (
+        ticket is None or attempt is None or worker is None
+        or ticket.get("id") not in (state.get("design_publication") or {}).get("ticket_refs", [])
+        or attempt.get("kind") != "review" or attempt.get("state") != "RETURNED"
+        or attempt.get("lease", {}).get("state") != "released"
+        or attempt.get("subject_ref") != ticket.get("id")
+        or attempt.get("review_result") != "BLOCK"
+        or worker.get("kind") != "worker" or worker.get("subject_ref") != ticket.get("id")
+        or worker.get("state") != "RETURNED" or ticket.get("current_attempt") != worker.get("id")
+        or attempt.get("candidate_sha") != manifest.get("candidate_sha")
+        or attempt.get("subject_fingerprint") != manifest.get("candidate_sha")
+        or worker.get("candidate_sha") != manifest.get("candidate_sha")
+        or worker.get("candidate_tree_sha") != manifest.get("candidate_tree_sha")
+        or worker.get("continuation_ref") != manifest.get("continuation_receipt_ref")
+        or candidate is None or ticket.get("current_candidate") != candidate.get("id")
+        or candidate.get("producer_attempt_ref") != worker.get("id")
+        or candidate.get("quality") != "CONTINUATION"
+        or candidate.get("sha") != manifest.get("candidate_sha")
+        or candidate.get("tree_sha") != manifest.get("candidate_tree_sha")
+    ):
+        fail("Review05 manifest is not bound to the registered ticket and exact current continuation candidate")
+    candidate_id = f"candidate-{worker['id']}"
+    if manifest.get("candidate_ref") != candidate_id:
+        fail("Review05 manifest candidate_ref is not the durable current continuation candidate ID")
+
+    expected_refs = {
+        "packet_ref": attempt.get("packet_ref"), "packet_hash": attempt.get("packet_hash"),
+        "return_ref": attempt.get("return_ref"),
+        "continuation_receipt_ref": worker.get("continuation_ref"),
+    }
+    for field, value in expected_refs.items():
+        if manifest.get(field) != value:
+            fail(f"Review05 manifest {field} does not match exact ledger binding")
+    for ref_field, hash_field in (("packet_ref", "packet_hash"), ("return_ref", "return_hash"), ("continuation_receipt_ref", "continuation_receipt_hash")):
+        if manifest[ref_field] != f"objects/{manifest[hash_field]}":
+            fail(f"Review05 manifest {ref_field}/{hash_field} pair is inconsistent")
+
+    packet, packet_raw = payload_loader(manifest["packet_ref"], "Review05 packet")
+    returned, return_raw = payload_loader(manifest["return_ref"], "Review05 return")
+    continuation, continuation_raw = payload_loader(manifest["continuation_receipt_ref"], "Worker05 continuation receipt")
+    if sha256_bytes(packet_raw) != manifest["packet_hash"] or sha256_bytes(return_raw) != manifest["return_hash"] or sha256_bytes(continuation_raw) != manifest["continuation_receipt_hash"]:
+        fail("Review05 packet, return, or continuation receipt bytes do not match exact manifest hashes")
+    packet_identity_value = packet.get("identity", {})
+    return_identity = returned.get("identity", {})
+    if (
+        packet_identity_value.get("run_id") != state.get("run_id")
+        or packet_identity_value.get("ticket_id") != ticket.get("id")
+        or packet_identity_value.get("attempt_id") != attempt.get("id")
+        or return_identity.get("run_id") != state.get("run_id")
+        or return_identity.get("ticket_id") != ticket.get("id")
+        or return_identity.get("attempt_id") != attempt.get("id")
+        or return_identity.get("packet_hash") != manifest.get("packet_hash")
+        or returned.get("verdict") != "BLOCK"
+        or continuation.get("attempt_id") != worker.get("id")
+        or continuation.get("candidate_sha") != manifest.get("candidate_sha")
+        or continuation.get("candidate_tree_sha") != manifest.get("candidate_tree_sha")
+        or continuation.get("base_sha") != worker.get("base_sha")
+        or continuation.get("blocker_scope") != "external"
+    ):
+        fail("Review05 immutable payloads do not prove the exact ticket/attempt/candidate/blocker identity")
+    external_blocker_ref = continuation.get("blocker_ref")
+    external_blocker = next((item for item in state.get("issues", []) if item.get("id") == external_blocker_ref), None)
+    if (
+        external_blocker is None or external_blocker.get("impact") != "blocking"
+        or external_blocker.get("invalidated_by")
+        or external_blocker_ref not in candidate.get("blocker_refs", [])
+    ):
+        fail("Review05 continuation receipt does not identify its still-current registered external blocker")
+
+    return_findings = returned.get("findings", [])
+    source_findings = [item for item in state.get("findings", []) if item.get("source_ref") == attempt.get("id")]
+    if len(return_findings) != 3 or len(source_findings) != 3:
+        fail("Review05 recovery requires exactly three immutable return findings and ledger findings")
+    source_by_signature: dict[bytes, dict[str, Any]] = {}
+    compared_fields = ("axis", "impact", "claim", "expected", "actual", "evidence")
+    for finding in source_findings:
+        source_by_signature[canonical_bytes({key: finding.get(key) for key in compared_fields})] = finding
+    matched_finding_refs: set[str] = set()
+    for returned_finding in return_findings:
+        signature = canonical_bytes({key: returned_finding.get(key) for key in compared_fields})
+        matched = source_by_signature.get(signature)
+        if matched is None:
+            fail("Review05 raw finding content differs from its exact immutable ledger finding")
+        if matched.get("reported_affected_refs") != returned_finding.get("affected_refs"):
+            fail("Review05 reported_affected_refs differ from the exact immutable return order/content")
+        if set(matched.get("affected_refs", [])) != set(returned_finding.get("affected_refs", [])):
+            fail("Review05 normalized finding affected_refs differ from the exact returned reference set")
+        matched_finding_refs.add(matched["id"])
+    if set(attempt.get("finding_refs", [])) != matched_finding_refs:
+        fail("Review05 attempt finding_refs do not match exactly the three returned findings")
+    issues = [item for item in state.get("issues", []) if item.get("finding_ref") in matched_finding_refs]
+    issue_by_finding: dict[str, list[dict[str, Any]]] = {}
+    for issue in issues:
+        issue_by_finding.setdefault(issue.get("finding_ref"), []).append(issue)
+    if set(issue_by_finding) != matched_finding_refs or any(len(values) != 1 for values in issue_by_finding.values()):
+        fail("Review05 recovery requires exactly one existing mirrored issue for each of its three findings")
+    findings_by_id = {item.get("id"): item for item in source_findings}
+    ticket_contract_refs = set(ticket.get("contract_refs", []))
+    publication_contract_refs = set((state.get("design_publication") or {}).get("contract_refs", []))
+    for finding_ref, values in issue_by_finding.items():
+        issue = values[0]
+        finding = findings_by_id[finding_ref]
+        if (
+            issue.get("source_ref") != attempt.get("id")
+            or issue.get("impact") != "blocking" or issue.get("invalidated_by")
+            or finding.get("impact") != "blocking" or finding.get("invalidated_by")
+            or set(issue.get("affected_refs", [])) != set(finding.get("affected_refs", []))
+            or not ((ticket_contract_refs | publication_contract_refs) & set(issue.get("affected_refs", [])))
+        ):
+            fail("Review05 finding issue mirror is stale or has incompatible blocking/affected context")
+    expected_bindings = sorted(
+        ({"finding_ref": finding_ref, "issue_ref": values[0]["id"]} for finding_ref, values in issue_by_finding.items()),
+        key=lambda item: (item["finding_ref"], item["issue_ref"]),
+    )
+    supplied_bindings = sorted(manifest.get("finding_bindings", []), key=lambda item: (item["finding_ref"], item["issue_ref"]))
+    if supplied_bindings != expected_bindings:
+        fail("Review05 manifest finding_bindings must exactly match the three existing finding/issue mirrors")
+
+    return {
+        "source_revision": state["revision"], "source_ledger_hash": source_hash,
+        "owner_epoch": manifest["owner_epoch"], "review_attempt_ref": attempt["id"],
+        "ticket_ref": ticket["id"], "candidate_ref": candidate_id,
+        "candidate_sha": worker["candidate_sha"], "candidate_tree_sha": worker["candidate_tree_sha"],
+        "packet_ref": attempt["packet_ref"], "packet_hash": attempt["packet_hash"],
+        "return_ref": attempt["return_ref"], "return_hash": manifest["return_hash"],
+        "continuation_receipt_ref": worker["continuation_ref"],
+        "continuation_receipt_hash": manifest["continuation_receipt_hash"],
+        "finding_bindings": expected_bindings,
+    }
+
+
+def _stored_payload_with_bytes(p: dict[str, Path], ref: str, label: str) -> tuple[dict[str, Any], bytes]:
+    payload = stored_payload(p, ref, label)
+    match = re.fullmatch(r"objects/([0-9a-f]{64})", ref)
+    if match is None:
+        fail(f"{label} is not an immutable object reference")
+    raw = (p["objects"] / match.group(1)).read_bytes()
+    return payload, raw
+
+
+def _cmd_reconcile_finding_bindings(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    manifest, manifest_raw = _read_manifest(args.manifest, "finding binding reconciliation manifest")
+    root = schema()
+    validate(manifest, root["$defs"]["finding_binding_reconciliation_manifest"], root, "$.finding_binding_manifest")
+    manifest_hash = sha256_bytes(manifest_raw)
+    with Lock(p["lock"]):
+        state, raw = load_state(p)
+        if state.get("owner", {}).get("token") != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        prior = next((item for item in state.get("finding_binding_reconciliations", []) if item.get("reconciliation_id") == manifest.get("reconciliation_id")), None)
+        if prior is not None:
+            if prior.get("manifest_hash") == manifest_hash and prior.get("source_ledger_hash") == manifest.get("source_ledger_hash") and prior.get("source_revision") == manifest.get("source_revision"):
+                if args.revision not in {manifest.get("source_revision"), prior.get("applied_revision"), state.get("revision")}:
+                    fail(f"revision mismatch on reconciliation replay: expected source/applied/current revision, got {args.revision}")
+                return {"reconciled": True, "idempotent": True, "reconciliation_id": manifest["reconciliation_id"], "manifest_hash": manifest_hash, "applied_revision": prior.get("applied_revision"), "finding_refs": [item["finding_ref"] for item in prior.get("finding_bindings", [])], "issue_refs": [item["issue_ref"] for item in prior.get("finding_bindings", [])]}
+            fail("finding reconciliation ID already exists with conflicting manifest/source")
+        if state.get("revision") != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {state.get('revision')}")
+        require_mutation_eligible(state)
+        if manifest.get("source_revision") != args.revision or manifest.get("source_ledger_hash") != sha256_bytes(raw):
+            fail("finding binding manifest must bind the exact current ledger revision and hash")
+        if manifest.get("owner_epoch") != state.get("owner", {}).get("epoch"):
+            fail("finding binding manifest owner_epoch does not match current owner epoch")
+        record_fields = _validate_review05_reconciliation(
+            state, raw, manifest, lambda ref, label: _stored_payload_with_bytes(p, ref, label),
+        )
+        for event in state.get("finding_binding_reconciliations", []):
+            if event.get("review_attempt_ref") == record_fields["review_attempt_ref"] or any(
+                binding.get("finding_ref") in {item["finding_ref"] for item in record_fields["finding_bindings"]}
+                for binding in event.get("finding_bindings", [])
+            ):
+                fail("conflicting finding binding reconciliation already exists")
+        event_id = f"finding-binding-reconciliation-{manifest['reconciliation_id']}"
+        applied_revision = state["revision"] + 1
+        manifest_digest = object_store(p, manifest_raw)
+        event = {
+            "id": event_id, "reconciliation_id": manifest["reconciliation_id"],
+            **record_fields, "manifest_hash": manifest_hash,
+            "manifest_ref": f"objects/{manifest_digest}",
+            "applied_revision": applied_revision, "recorded_at": now(),
+        }
+        state.setdefault("finding_binding_reconciliations", []).append(event)
+        state["revision"] = applied_revision
+        state["previous_publication_hash"] = sha256_bytes(raw)
+        state["updated_at"] = now()
+        ensure_runtime_provenance(state)
+        refresh_control_projection(state)
+        validate_ledger(state, verify_files=False)
+        publish(p, state, raw, "finding-binding-reconciliation")
+        return {"reconciled": True, "idempotent": False, "reconciliation_id": manifest["reconciliation_id"], "manifest_hash": manifest_hash, "applied_revision": applied_revision, "finding_refs": [item["finding_ref"] for item in record_fields["finding_bindings"]], "issue_refs": [item["issue_ref"] for item in record_fields["finding_bindings"]]}
+
+
+def _fixture_payload_loader(source_file: Path) -> Callable[[str, str], tuple[dict[str, Any], bytes]]:
+    fixture_files = {
+        "review05-packet.json": "packet",
+        "review05-return.json": "return",
+        "worker05-continuation-receipt.json": "continuation",
+    }
+    def load(ref: str, label: str) -> tuple[dict[str, Any], bytes]:
+        expected_name = next((name for name in fixture_files if (
+            name.startswith("review05-packet") and "packet" in label.lower()
+            or name.startswith("review05-return") and "return" in label.lower()
+            or name.startswith("worker05-continuation") and "continuation" in label.lower()
+        )), None)
+        if expected_name is None:
+            fail(f"no frozen R58 fixture artifact is defined for {label}")
+        target = source_file.parent / expected_name
+        regular_non_symlink(target)
+        raw = target.read_bytes()
+        digest = sha256_bytes(raw)
+        if ref != f"objects/{digest}":
+            fail(f"frozen R58 {label} bytes do not match the exact immutable reference")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            fail(f"frozen R58 {label} is not valid JSON: {exc}")
+        if not isinstance(payload, dict):
+            fail(f"frozen R58 {label} must be a JSON object")
+        return payload, raw
+    return load
+
+
+def _cmd_rehearse_legacy_recovery(args: argparse.Namespace) -> dict[str, Any]:
+    source_file = Path(args.file).expanduser()
+    regular_non_symlink(source_file)
+    source_raw = source_file.read_bytes()
+    try:
+        source_state = json.loads(source_raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"legacy source ledger is not valid UTF-8 JSON: {exc}")
+    if not isinstance(source_state, dict):
+        fail("legacy source ledger must be a JSON object")
+    validate_ledger(source_state, verify_files=False)
+    binding_manifest, _ = _read_manifest(args.binding_manifest, "binding normalization manifest")
+    finding_manifest, _ = _read_manifest(args.finding_manifest, "finding binding reconciliation manifest")
+    assessment = assess_legacy_binding_manifest(source_state, source_raw, binding_manifest)
+    if not assessment.get("migration_eligible"):
+        fail("R58 rehearsal cannot normalize material or ambiguous bindings; owner must replan affected G2/G3")
+
+    rehearsal = copy.deepcopy(source_state)
+    loader = _fixture_payload_loader(source_file)
+    # Bootstrap only into the in-memory copy; raw source ticket/findings/publication records remain untouched.
+    continuation, _continuation_raw = loader(
+        next((item.get("continuation_receipt_ref") for item in [finding_manifest] if item), ""),
+        "Worker05 continuation receipt",
+    )
+    _bootstrap_legacy_candidate_model_from_receipt(rehearsal, continuation)
+    finding_fields = _validate_review05_reconciliation(rehearsal, source_raw, finding_manifest, loader)
+    effective_bindings = []
+    for item in assessment["intersections"]:
+        normalized = copy.deepcopy(item)
+        normalized["implementation_availability"] = "not_required"
+        effective_bindings.append(normalized)
+    rehearsal.setdefault("binding_normalizations", []).append({
+        "id": "rehearsal-binding-normalization", "migration_id": binding_manifest["migration_id"],
+        "source_revision": assessment["source_revision"], "source_ledger_hash": assessment["source_ledger_hash"],
+        "publication_ref": assessment["publication_ref"], "publication_hash": assessment["publication_hash"],
+        "manifest_hash": sha256_bytes(canonical_bytes(binding_manifest)), "manifest_ref": "objects/" + "0" * 64,
+        "owner_epoch": binding_manifest["owner_epoch"], "applied_revision": source_state["revision"] + 1,
+        "bindings": effective_bindings, "recorded_at": "rehearsal",
+    })
+    rehearsal.setdefault("finding_binding_reconciliations", []).append({
+        "id": "rehearsal-finding-binding", "reconciliation_id": finding_manifest["reconciliation_id"],
+        **finding_fields, "manifest_hash": sha256_bytes(canonical_bytes(finding_manifest)),
+        "manifest_ref": "objects/" + "0" * 64,
+        "applied_revision": source_state["revision"] + 1, "recorded_at": "rehearsal",
+    })
+    projection = finding_obligation_projection(rehearsal)
+    finding_by_id = {item.get("id"): item for item in rehearsal.get("findings", [])}
+    ticket_findings = [
+        item for item in source_state.get("findings", [])
+        if (attempt := next((row for row in source_state.get("attempts", []) if row.get("id") == item.get("source_ref")), None))
+        and attempt.get("subject_ref") == "T02-R17"
+        and attempt.get("id") != "T02-R17-REVIEW-CODE-05"
+    ]
+    historical_ticket_count = sum(
+        1 for finding in ticket_findings
+        if next((row for row in projection["items"] if row["finding_ref"] == finding["id"]), {}).get("projection_classification") in ("history", "carry_forward")
+    )
+    historical_design_count = sum(
+        1 for finding in source_state.get("findings", [])
+        if (attempt := next((row for row in source_state.get("attempts", []) if row.get("id") == finding.get("source_ref")), None))
+        and attempt.get("kind") == "review" and attempt.get("mode") in ("coverage", "plan")
+        and next((row for row in projection["items"] if row["finding_ref"] == finding["id"]), {}).get("projection_classification") in ("history", "carry_forward")
+    )
+    external_blocker_ref = continuation.get("blocker_ref")
+    external_blocker = next((item for item in source_state.get("issues", []) if item.get("id") == external_blocker_ref), None)
+    if external_blocker is None or external_blocker.get("invalidated_by"):
+        fail("R58 rehearsal must retain the exact current external continuation blocker")
+    if len(projection["current_finding_refs"]) != 3:
+        fail("R58 rehearsal did not produce exactly three current Review05 findings")
+    return {
+        "read_only": True,
+        "source_hash_unchanged": sha256_bytes(source_file.read_bytes()) == sha256_bytes(source_raw),
+        "source_revision": source_state["revision"],
+        "source_ledger_hash": sha256_bytes(source_raw),
+        "intersection_count": assessment["intersection_count"],
+        "current_finding_count": len(projection["current_finding_refs"]),
+        "historical_ticket_finding_count": historical_ticket_count,
+        "historical_design_finding_count": historical_design_count,
+        "external_blocker_ref": external_blocker_ref,
+        "next_action": "authorize bounded repair for the three current Review05 findings; retain historical obligations and external blocker",
+        "finding_projection": projection,
+    }
+
+
+def _bootstrap_legacy_candidate_model_from_receipt(state: dict[str, Any], receipt: dict[str, Any]) -> None:
+    """In-memory counterpart of the exact R58 candidate bootstrap used by rehearsal."""
+    if state.get("candidate_model_version") == "1.1":
+        return
+    if state.get("candidates") or any(ticket.get("current_candidate") for ticket in state.get("tickets", [])):
+        fail("legacy candidate bootstrap is ambiguous: candidate records or pointers already exist")
+    ticket = next((item for item in state.get("tickets", []) if item.get("id") == "T02-R17"), None)
+    worker = next((item for item in state.get("attempts", []) if item.get("id") == "T02-R17-WORKER-05"), None)
+    if (
+        ticket is None or ticket.get("state") != "BLOCKED" or worker is None
+        or worker.get("state") != "RETURNED" or ticket.get("current_attempt") != worker.get("id")
+        or receipt.get("attempt_id") != worker.get("id")
+        or receipt.get("candidate_sha") != worker.get("candidate_sha")
+        or receipt.get("candidate_tree_sha") != worker.get("candidate_tree_sha")
+        or receipt.get("base_sha") != worker.get("base_sha")
+    ):
+        fail("frozen R58 continuation receipt cannot conservatively bootstrap the current candidate")
+    blocker_ref = receipt.get("blocker_ref")
+    if receipt.get("blocker_scope") != "external" or not any(item.get("id") == blocker_ref for item in state.get("issues", [])):
+        fail("frozen R58 continuation candidate is missing its exact external blocker")
+    candidate_id = f"candidate-{worker['id']}"
+    state.setdefault("candidates", []).append({
+        "id": candidate_id, "ticket_ref": ticket["id"], "sha": worker["candidate_sha"],
+        "tree_sha": worker["candidate_tree_sha"], "base_sha": worker.get("base_sha"),
+        "producer_attempt_ref": worker["id"], "parent_candidate_ref": None,
+        "quality": "CONTINUATION", "blocker_refs": [blocker_ref],
+        "review_status": "BLOCK", "integration_status": "PENDING",
+    })
+    attempts_by_id = {item.get("id"): item for item in state.get("attempts", [])}
+    for item in state.get("tickets", []):
+        prior = attempts_by_id.get(item.get("current_attempt"))
+        workers = [attempt for attempt in state.get("attempts", []) if attempt.get("kind") == "worker" and attempt.get("subject_ref") == item.get("id")]
+        last = prior if prior and prior.get("kind") == "worker" else (max(workers, key=lambda attempt: attempt.get("attempt_created_revision", -1)) if workers else None)
+        item["last_worker_attempt"] = last.get("id") if last else None
+        item["current_attempt"] = item["last_worker_attempt"]
+        item["current_worker_attempt"] = item["last_worker_attempt"] if last and last.get("state") in ("PREPARED", "DISPATCHED") else None
+        item["current_candidate"] = None
+    ticket["current_candidate"] = candidate_id
+    state["candidate_model_version"] = "1.1"
+    state["review_model_version"] = "1.1"
+    state.setdefault("review_qualifications", [])
+    state.setdefault("repair_waves", [])
+    state.setdefault("acceptance", [])
 
 
 def open_ticket_finding_obligations(state: dict[str, Any], ticket_id: str) -> list[dict[str, Any]]:
@@ -4423,6 +5527,12 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
     admit_event(observed, "worker.dispatch")
+    observed_ticket = next((item for item in observed.get("tickets", []) if item.get("id") == args.ticket_id), None)
+    if observed_ticket is None:
+        fail("dispatch references unknown ticket")
+    validate_effective_ticket_contract_bindings(
+        observed, [observed_ticket], "worker dispatch", require_availability=True,
+    )
     if observed.get("lifecycle", {}).get("control") == "BLOCKED" and packet.get("mode") != "repair":
         fail("BLOCKED dispatch requires an explicitly authorized repair packet")
     existing_attempt = next((item for item in observed.get("attempts", []) if item.get("id") == args.attempt_id), None)
@@ -4443,6 +5553,9 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         ticket = next((t for t in state.get("tickets", []) if t.get("id") == args.ticket_id), None)
         if ticket is None:
             fail("dispatch references unknown ticket")
+        validate_effective_ticket_contract_bindings(
+            state, [ticket], "worker dispatch", require_availability=True,
+        )
         if ticket.get("state") != "READY":
             fail(f"ticket is not READY: {ticket.get('state')}")
         if route:
@@ -4543,16 +5656,16 @@ def cmd_ready_ticket(args: argparse.Namespace) -> dict[str, Any]:
             fail("ticket is not part of the current design publication")
         if ticket.get("state") != "PLANNED":
             fail(f"ticket readiness requires PLANNED, got {ticket.get('state')}")
+        validate_effective_ticket_contract_bindings(
+            state, [ticket], "ticket readiness", require_availability=True,
+        )
         for dependency in ticket.get("dependency_refs", []):
             dependency_ticket = next(item for item in state.get("tickets", []) if item.get("id") == dependency)
             if dependency_ticket.get("state") != "INTEGRATED":
                 fail(f"dependency is not reviewed INTEGRATED: {dependency}")
         active_criteria = {item["id"] for item in state.get("criteria", []) if item.get("status") == "active" and not item.get("invalidated_by")}
-        active_contracts = {item["id"] for item in state.get("contracts", []) if item.get("status") == "active" and not item.get("invalidated_by")}
         if not ticket.get("criterion_refs") or not set(ticket["criterion_refs"]).issubset(active_criteria):
             fail("ticket readiness requires current criterion bindings")
-        if not set(ticket.get("contract_refs", [])).issubset(active_contracts):
-            fail("ticket readiness requires current contract bindings")
         ticket["state"] = "READY"
         state["lifecycle"]["next_action"] = {"kind": "dispatch_ticket", "subject_refs": [args.ticket_id], "preconditions": ["fresh packet and attempt", "lease zone available"], "read_refs": ["phases/execute.md", "contracts/worker.md"]}
     result = transaction(paths(args.control_root, args.run_id), args.owner_token, args.revision, change, "ticket-ready")
@@ -5967,7 +7080,7 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
                     candidate is None
                     or candidate_ref != candidate.get("id")
                     or finding is None
-                    or ticket["id"] not in finding.get("affected_refs", [])
+                    or ticket["id"] not in effective_finding_ticket_refs(next_state, repair_ref)
                     or repair_ref not in initially_open_ticket_findings
                     or repair_ref in seen_resolution_findings
                 ):
@@ -9055,8 +10168,15 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
         g2_claim = control == "ACTIVE" and gate_id == "G2"
         g3_claim = control == "ACTIVE" and gate_id == "G3"
         if state.get("intent") and (g2_claim or g3_claim):
-            current_design_publication(state)
-            validate_current_design_contract_bindings(state)
+            current_publication = current_design_publication(state)
+            current_design_tickets = [
+                item for item in state.get("tickets", [])
+                if item.get("id") in set(current_publication.get("ticket_refs", []))
+            ]
+            validate_effective_ticket_contract_bindings(
+                state, current_design_tickets, f"{gate_id} design publication",
+                require_availability=True, allow_planned_producers=True,
+            )
             if not design_review_pass(state, "coverage"):
                 fail("G2 cannot pass without a PASS coverage review of the current published design bundle")
             if g3_claim and not design_review_pass(state, "plan"):
@@ -9095,7 +10215,14 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
             fail(f"illegal phase jump: {current_phase} -> {phase}")
         if current_phase == "PLAN" and phase == "EXECUTE":
             publication = current_design_publication(state)
-            validate_current_design_contract_bindings(state)
+            current_design_tickets = [
+                item for item in state.get("tickets", [])
+                if item.get("id") in set(publication.get("ticket_refs", []))
+            ]
+            validate_effective_ticket_contract_bindings(
+                state, current_design_tickets, "execution entry",
+                require_availability=True, allow_planned_producers=True,
+            )
             if not design_review_pass(state, "coverage") or not design_review_pass(state, "plan"):
                 fail("execution requires current G2 coverage PASS and G3 plan PASS")
             if any(ticket.get("id") in publication.get("ticket_refs", []) and ticket.get("state") not in ("PLANNED", "READY") for ticket in state.get("tickets", [])):
@@ -9234,6 +10361,10 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status"); status.add_argument("--control-root", required=True); status.add_argument("--run-id", required=True); status.add_argument("--brief", action="store_true")
     diagnose = sub.add_parser("diagnose"); diagnose.add_argument("--control-root", required=True); diagnose.add_argument("--run-id", required=True)
     legacy_diagnose = sub.add_parser("diagnose-legacy", help="read-only structural analysis of a standalone ledger file"); legacy_diagnose.add_argument("--file", required=True)
+    assess_bindings = sub.add_parser("assess-legacy-bindings", help="read-only binding compatibility assessment against exact source bytes"); assess_bindings.add_argument("--file", required=True); assess_bindings.add_argument("--manifest", required=True)
+    migrate_bindings = sub.add_parser("migrate-legacy-bindings", help="owner-authorized append-only legacy binding normalization"); migrate_bindings.add_argument("--control-root", required=True); migrate_bindings.add_argument("--run-id", required=True); migrate_bindings.add_argument("--owner-token", required=True); migrate_bindings.add_argument("--revision", type=int, required=True); migrate_bindings.add_argument("--manifest", required=True)
+    reconcile_bindings = sub.add_parser("reconcile-finding-bindings", help="owner-authorized append-only finding binding recovery"); reconcile_bindings.add_argument("--control-root", required=True); reconcile_bindings.add_argument("--run-id", required=True); reconcile_bindings.add_argument("--owner-token", required=True); reconcile_bindings.add_argument("--revision", type=int, required=True); reconcile_bindings.add_argument("--manifest", required=True)
+    rehearse_recovery = sub.add_parser("rehearse-legacy-recovery", help="read-only in-memory rehearsal using only frozen fixture artifacts"); rehearse_recovery.add_argument("--file", required=True); rehearse_recovery.add_argument("--binding-manifest", required=True); rehearse_recovery.add_argument("--finding-manifest", required=True)
     brief = sub.add_parser("brief"); brief.add_argument("--control-root", required=True); brief.add_argument("--run-id", required=True); brief.set_defaults(brief=True)
     view = sub.add_parser("render-view"); view.add_argument("--control-root", required=True); view.add_argument("--run-id", required=True); view.add_argument("--kind", choices=["status", "final-report"], default="status")
     valid = sub.add_parser("validate"); valid.add_argument("--file", required=True); valid.add_argument("--kind", default="ledger")
@@ -9278,6 +10409,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status": result = cmd_status(args)
         elif args.command == "diagnose": result = cmd_diagnose(args)
         elif args.command == "diagnose-legacy": result = cmd_diagnose_legacy(args)
+        elif args.command == "assess-legacy-bindings": result = _cmd_assess_legacy_bindings(args)
+        elif args.command == "migrate-legacy-bindings": result = _cmd_migrate_legacy_bindings(args)
+        elif args.command == "reconcile-finding-bindings": result = _cmd_reconcile_finding_bindings(args)
+        elif args.command == "rehearse-legacy-recovery": result = _cmd_rehearse_legacy_recovery(args)
         elif args.command == "brief": result = cmd_status(args)
         elif args.command == "render-view": result = cmd_render_view(args)
         elif args.command == "validate": result = cmd_validate(args)

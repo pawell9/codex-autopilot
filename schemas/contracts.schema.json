@@ -43,11 +43,103 @@
     "capabilities": {"type": "array", "items": {"$ref": "#/$defs/capability"}},
     "routes": {"type": "array", "items": {"$ref": "#/$defs/route"}},
     "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}},
+    "binding_normalizations": {"type": "array", "items": {"$ref": "#/$defs/binding_normalization"}},
+    "finding_binding_reconciliations": {"type": "array", "items": {"$ref": "#/$defs/finding_binding_reconciliation"}},
     "usage": {"$ref": "#/$defs/usage"}
   },
   "$defs": {
     "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$", "minLength": 1},
     "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "implementation_availability": {"type": "string", "enum": ["available", "unavailable", "unknown", "not_required"]},
+    "binding_normalization_assessment_binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ticket_ref", "contract_ref", "original_relation", "original_refs", "classification", "effective_role", "implementation_availability", "implementation_availability_evidence_refs", "equivalence_refs", "evidence_refs"],
+      "properties": {
+        "ticket_ref": {"$ref": "#/$defs/id"}, "contract_ref": {"$ref": "#/$defs/id"},
+        "original_relation": {"const": "self_input"}, "original_refs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+        "classification": {"type": "string", "enum": ["metadata_only", "material_change", "ambiguous"]},
+        "effective_role": {"type": "string", "enum": ["specification_only", "implementation_input"]},
+        "implementation_availability": {"$ref": "#/$defs/implementation_availability"},
+        "implementation_availability_evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "equivalence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "binding_normalization_binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ticket_ref", "contract_ref", "original_relation", "original_refs", "classification", "effective_role", "implementation_availability", "implementation_availability_evidence_refs", "equivalence_refs", "evidence_refs"],
+      "oneOf": [
+        {"properties": {"effective_role": {"const": "specification_only"}, "implementation_availability": {"const": "not_required"}}, "required": ["effective_role", "implementation_availability"]},
+        {"properties": {"effective_role": {"const": "implementation_input"}, "implementation_availability": {"const": "available"}}, "required": ["effective_role", "implementation_availability"]}
+      ],
+      "properties": {
+        "ticket_ref": {"$ref": "#/$defs/id"}, "contract_ref": {"$ref": "#/$defs/id"},
+        "original_relation": {"const": "self_input"}, "original_refs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}},
+        "classification": {"const": "metadata_only"},
+        "effective_role": {"type": "string", "enum": ["specification_only", "implementation_input"]},
+        "implementation_availability": {"$ref": "#/$defs/implementation_availability"},
+        "implementation_availability_evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "equivalence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "binding_normalization_manifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "migration_id", "owner_epoch", "source_revision", "source_ledger_hash", "publication_ref", "publication_hash", "bindings"],
+      "properties": {
+        "schema_version": {"const": 1}, "migration_id": {"$ref": "#/$defs/id"},
+        "owner_epoch": {"type": "integer", "minimum": 0}, "source_revision": {"type": "integer", "minimum": 0}, "source_ledger_hash": {"$ref": "#/$defs/hash"},
+        "publication_ref": {"$ref": "#/$defs/id"}, "publication_hash": {"$ref": "#/$defs/hash"},
+        "bindings": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/binding_normalization_assessment_binding"}}
+      }
+    },
+    "binding_normalization": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "migration_id", "source_revision", "source_ledger_hash", "publication_ref", "publication_hash", "manifest_hash", "manifest_ref", "owner_epoch", "applied_revision", "bindings", "recorded_at"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "migration_id": {"$ref": "#/$defs/id"},
+        "source_revision": {"type": "integer", "minimum": 0}, "source_ledger_hash": {"$ref": "#/$defs/hash"},
+        "publication_ref": {"$ref": "#/$defs/id"}, "publication_hash": {"$ref": "#/$defs/hash"},
+        "manifest_hash": {"$ref": "#/$defs/hash"}, "manifest_ref": {"type": "string", "pattern": "^objects/[0-9a-f]{64}$"},
+        "owner_epoch": {"type": "integer", "minimum": 0}, "applied_revision": {"type": "integer", "minimum": 0},
+        "bindings": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/binding_normalization_binding"}},
+        "recorded_at": {"type": "string", "minLength": 1}
+      }
+    },
+    "finding_issue_binding": {
+      "type": "object", "additionalProperties": false, "required": ["finding_ref", "issue_ref"],
+      "properties": {"finding_ref": {"$ref": "#/$defs/id"}, "issue_ref": {"$ref": "#/$defs/id"}}
+    },
+    "finding_binding_reconciliation_manifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "reconciliation_id", "source_revision", "source_ledger_hash", "owner_epoch", "review_attempt_ref", "ticket_ref", "candidate_ref", "candidate_sha", "candidate_tree_sha", "packet_ref", "packet_hash", "return_ref", "return_hash", "continuation_receipt_ref", "continuation_receipt_hash", "finding_bindings"],
+      "properties": {
+        "schema_version": {"const": 1}, "reconciliation_id": {"$ref": "#/$defs/id"},
+        "source_revision": {"type": "integer", "minimum": 0}, "source_ledger_hash": {"$ref": "#/$defs/hash"}, "owner_epoch": {"type": "integer", "minimum": 0},
+        "review_attempt_ref": {"$ref": "#/$defs/id"}, "ticket_ref": {"$ref": "#/$defs/id"},
+        "candidate_ref": {"$ref": "#/$defs/id"}, "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$"}, "candidate_tree_sha": {"type": "string", "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$"},
+        "packet_ref": {"type": "string", "pattern": "^objects/[0-9a-f]{64}$"}, "packet_hash": {"$ref": "#/$defs/hash"},
+        "return_ref": {"type": "string", "pattern": "^objects/[0-9a-f]{64}$"}, "return_hash": {"$ref": "#/$defs/hash"},
+        "continuation_receipt_ref": {"type": "string", "pattern": "^objects/[0-9a-f]{64}$"}, "continuation_receipt_hash": {"$ref": "#/$defs/hash"},
+        "finding_bindings": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/finding_issue_binding"}}
+      }
+    },
+    "finding_binding_reconciliation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "reconciliation_id", "source_revision", "source_ledger_hash", "owner_epoch", "applied_revision", "review_attempt_ref", "ticket_ref", "candidate_ref", "candidate_sha", "candidate_tree_sha", "packet_ref", "packet_hash", "return_ref", "return_hash", "continuation_receipt_ref", "continuation_receipt_hash", "finding_bindings", "manifest_hash", "manifest_ref", "recorded_at"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "reconciliation_id": {"$ref": "#/$defs/id"},
+        "source_revision": {"type": "integer", "minimum": 0}, "source_ledger_hash": {"$ref": "#/$defs/hash"}, "owner_epoch": {"type": "integer", "minimum": 0},
+        "applied_revision": {"type": "integer", "minimum": 0}, "review_attempt_ref": {"$ref": "#/$defs/id"}, "ticket_ref": {"$ref": "#/$defs/id"},
+        "candidate_ref": {"$ref": "#/$defs/id"}, "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$"}, "candidate_tree_sha": {"type": "string", "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$"},
+        "packet_ref": {"type": "string", "pattern": "^objects/[0-9a-f]{64}$"}, "packet_hash": {"$ref": "#/$defs/hash"},
+        "return_ref": {"type": "string", "pattern": "^objects/[0-9a-f]{64}$"}, "return_hash": {"$ref": "#/$defs/hash"},
+        "continuation_receipt_ref": {"type": "string", "pattern": "^objects/[0-9a-f]{64}$"}, "continuation_receipt_hash": {"$ref": "#/$defs/hash"},
+        "finding_bindings": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/finding_issue_binding"}},
+        "manifest_hash": {"$ref": "#/$defs/hash"}, "manifest_ref": {"type": "string", "pattern": "^objects/[0-9a-f]{64}$"},
+        "recorded_at": {"type": "string", "minLength": 1}
+      }
+    },
     "phase": {"type": "string", "enum": ["PREFLIGHT", "INTENT", "DESIGN", "PLAN", "EXECUTE", "VERIFY", "ACCEPT"]},
     "control": {"type": "string", "enum": ["ACTIVE", "QUIESCING", "PAUSED", "BLOCKED", "RECOVERING", "ACCEPTED", "FAILED", "CANCELLED"]},
     "ticket_state": {"type": "string", "enum": ["PLANNED", "READY", "RUNNING", "CANDIDATE", "REVIEW", "INTEGRATED", "BLOCKED", "REPAIR", "STALE", "CANCELLED"]},
@@ -154,7 +246,7 @@
       "type": "object", "additionalProperties": false, "required": ["id", "version", "requirement_refs", "oracle", "status"],
       "properties": {"id": {"$ref": "#/$defs/id"}, "version": {"type": "string"}, "requirement_refs": {"type": "array", "items": {"$ref": "#/$defs/id"}}, "oracle": {"type": "string"}, "status": {"type": "string", "enum": ["active", "deferred", "dropped", "superseded"]}, "source_ref": {"type": ["string", "null"]}, "invalidated_by": {"type": "array", "items": {"$ref": "#/$defs/id"}}}
     },
-    "contract": {"type": "object", "additionalProperties": false, "required": ["id", "version", "status", "provenance_refs"], "properties": {"id": {"$ref": "#/$defs/id"}, "version": {"type": "string"}, "status": {"type": "string"}, "provenance_refs": {"type": "array", "items": {"type": "string"}}, "producer_refs": {"type": "array", "items": {"$ref": "#/$defs/id"}}, "consumer_refs": {"type": "array", "items": {"$ref": "#/$defs/id"}}, "invalidated_by": {"type": "array", "items": {"$ref": "#/$defs/id"}}}},
+    "contract": {"type": "object", "additionalProperties": false, "required": ["id", "version", "status", "provenance_refs"], "properties": {"id": {"$ref": "#/$defs/id"}, "version": {"type": "string"}, "status": {"type": "string"}, "provenance_refs": {"type": "array", "items": {"type": "string"}}, "producer_refs": {"type": "array", "items": {"$ref": "#/$defs/id"}}, "consumer_refs": {"type": "array", "items": {"$ref": "#/$defs/id"}}, "implementation_availability": {"$ref": "#/$defs/implementation_availability"}, "implementation_availability_evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}, "invalidated_by": {"type": "array", "items": {"$ref": "#/$defs/id"}}}},
     "decision": {"type": "object", "additionalProperties": false, "required": ["id", "type", "status", "decision", "reason", "evidence_refs", "affected_refs"], "properties": {"id": {"$ref": "#/$defs/id"}, "type": {"type": "string"}, "status": {"type": "string"}, "decision": {"type": "string"}, "reason": {"type": "string"}, "evidence_refs": {"type": "array", "items": {"type": "string"}}, "affected_refs": {"type": "array", "items": {"$ref": "#/$defs/id"}}, "candidate_ref": {"$ref": "#/$defs/id"}, "introduced_revision": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}}, "superseded_by": {"type": ["string", "null"]}, "consumed_by": {"type": ["string", "null"]}, "revoked_by": {"type": ["string", "null"]}, "revocation_reason": {"type": ["string", "null"]}, "legacy_unbound_attempt_plan": {"type": "boolean"}, "repair_plan_ref": {"type": ["string", "null"], "pattern": "^objects/[0-9a-f]{64}$"}, "attempt_plan_ref": {"type": ["string", "null"], "pattern": "^objects/[0-9a-f]{64}$"}, "intent_revision": {"type": ["string", "null"]}, "invalidated_by": {"type": "array", "items": {"$ref": "#/$defs/id"}}, "blocker_ref": {"$ref": "#/$defs/id"}, "blocker_scope": {"type": "string", "enum": ["external", "out_of_scope"]}, "external_check_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}}, "external_criterion_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}}}},
     "continuation_candidate_authorization": {"type": "object", "additionalProperties": false, "required": ["id", "type", "status", "decision", "reason", "evidence_refs", "affected_refs", "blocker_ref", "blocker_scope", "external_check_ids", "external_criterion_ids"], "properties": {"id": {"$ref": "#/$defs/id"}, "type": {"type": "string", "enum": ["continuation_candidate_authorization"]}, "status": {"type": "string", "enum": ["authorized"]}, "decision": {"type": "string", "enum": ["PRESERVE_CONTINUATION"]}, "reason": {"type": "string", "minLength": 1}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "affected_refs": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/id"}}, "blocker_ref": {"$ref": "#/$defs/id"}, "blocker_scope": {"type": "string", "enum": ["external", "out_of_scope"]}, "external_check_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}}, "external_criterion_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}}}},
     "zone_entry": {"type": "object", "additionalProperties": false, "required": ["path", "operations"], "properties": {"path": {"type": "string"}, "operations": {"type": "array", "items": {"type": "string", "enum": ["create", "modify", "delete", "rename"]}}}},

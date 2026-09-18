@@ -249,7 +249,7 @@ class PhaseDEffectTests(unittest.TestCase):
             "bundle_id": "B-effect", "version": "v1", "epoch": 0,
             "intent_revision": "v1", "intent_document_ref": "D-intent", "intent_document_hash": state["intent"]["document_hash"],
             "documents": documents,
-            "contracts": [{"id": "K-effect", "version": "v1", "status": "active", "provenance_refs": ["D-interfaces"], "producer_refs": [], "consumer_refs": ["C-effect"]}],
+            "contracts": [{"id": "K-effect", "version": "v1", "status": "active", "provenance_refs": ["D-interfaces"], "producer_refs": [], "consumer_refs": ["C-effect"], "implementation_availability": "available", "implementation_availability_evidence_refs": ["fixture:effect-contract-available"]}],
             "tickets": [{"id": TICKET_ID, "goal_ref": "G-effect", "criterion_refs": ["C-effect"], "contract_refs": ["K-effect"], "dependency_refs": [], "state": "PLANNED", "verification_ref": "effect-oracle", "complexity": "bounded", "risk": "routine", "zone": [{"path": "app.txt", "operations": ["modify"]}], "current_attempt": None, "replacement_refs": []}],
             "routes": [{"id": "ROUTE-effect", "capability": "worker", "reasoning": "focused effect regression", "requested_binding": "fixture-worker", "observed_binding": "fixture-worker", "adequacy": "CONFIRMED", "context_grade": "PACKET_SCOPED"}],
         }

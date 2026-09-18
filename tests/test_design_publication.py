@@ -46,7 +46,7 @@ class DesignPublicationTests(unittest.TestCase):
             "bundle_id": bundle_id, "version": "v1", "epoch": state["owner"]["epoch"], "intent_revision": state["intent"]["current_revision"],
             "intent_document_ref": state["intent"]["document_ref"], "intent_document_hash": state["intent"]["document_hash"],
             "documents": docs,
-            "contracts": [{"id": "K-design", "version": "v1", "status": "active", "provenance_refs": ["D-interfaces"], "producer_refs": [], "consumer_refs": ["C-1"]}],
+            "contracts": [{"id": "K-design", "version": "v1", "status": "active", "provenance_refs": ["D-interfaces"], "producer_refs": [], "consumer_refs": ["C-1"], "implementation_availability": "available", "implementation_availability_evidence_refs": ["fixture:design-contract-available"]}],
             "tickets": [{"id": "T-design", "goal_ref": "G-design", "criterion_refs": ["C-1"], "contract_refs": ["K-design"], "dependency_refs": [], "state": "PLANNED", "verification_ref": "design-oracle", "complexity": "bounded", "risk": "routine", "zone": [{"path": "app.txt", "operations": ["create"]}], "current_attempt": None, "replacement_refs": []}],
             "routes": [{"id": "R-design", "capability": "reviewer", "reasoning": "qualified fixture", "requested_binding": "fixture-reviewer", "observed_binding": "fixture-reviewer", "adequacy": "CONFIRMED", "context_grade": "PACKET_SCOPED"}],
         }
@@ -430,7 +430,7 @@ class DesignPublicationTests(unittest.TestCase):
 
             rejected = run("ready-ticket", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--ticket-id", "T-design", expect=2)
 
-            self.assertIn("current contract bindings", rejected.stderr)
+            self.assertIn("no current accepted contract input", rejected.stderr)
             unchanged, _ = ledger.load_state(paths)
             self.assertEqual("PLANNED", unchanged["tickets"][0]["state"])
 

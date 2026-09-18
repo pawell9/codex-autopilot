@@ -155,7 +155,7 @@ class Wave1Tests(unittest.TestCase):
                 "intent": {"current_revision": "intent-v1", "document_ref": "doc-1", "approved_amendments": []},
                 "requirements": [{"id": "R-1", "version": "v1", "status": "active", "provenance_refs": ["doc-1"], "criterion_refs": ["C-1"]}],
                 "criteria": [{"id": "C-1", "version": "v1", "requirement_refs": ["R-1"], "oracle": "app", "status": "active"}],
-                "contracts": [{"id": "contract-1", "version": "v1", "status": "active", "provenance_refs": ["doc-1"]}],
+                "contracts": [{"id": "contract-1", "version": "v1", "status": "active", "provenance_refs": ["doc-1"], "implementation_availability": "available", "implementation_availability_evidence_refs": ["fixture:contract-1-available"]}],
                 "tickets": [{"id": "T-1", "goal_ref": "G-1", "criterion_refs": ["C-1"], "contract_refs": ["contract-1"], "dependency_refs": [], "state": "READY", "complexity": "bounded", "risk": "routine", "zone": [{"path": "app.txt", "operations": ["modify"]}], "current_attempt": None, "replacement_refs": []}],
                 "lifecycle": {"phase": "EXECUTE", "control": "ACTIVE", "next_action": {"kind": "dispatch", "subject_refs": [], "preconditions": [], "read_refs": []}},
             })
