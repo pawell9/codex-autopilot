@@ -42,6 +42,70 @@ CONTROLS = ("ACTIVE", "QUIESCING", "PAUSED", "BLOCKED", "RECOVERING", "ACCEPTED"
 CAUSES = ("implementation", "contract", "oracle", "environment", "permission", "ownership", "orchestration", "user_intent", "unknown")
 VALID_CONTEXT_GRADES = {"PACKET_SCOPED", "DEGRADED_CONTEXT", "MANUAL_ATTESTED_CLEAN", "STRICT_FRESH"}
 DEFAULT_RUN_SETTINGS = {"interaction_mode": "semi", "depth": "normal"}
+EVENT_CONTROL_TABLE = {
+    "ACTIVE": frozenset({
+        "worker.dispatch", "review.dispatch", "run.recover", "lifecycle.advance", "run.cancel.request",
+        "attempt.ingest", "attempt.reconcile", "candidate.publish", "review.integrate",
+        "repair.authorize", "review.adjudicate", "effect.prepare", "effect.reconcile",
+        "handoff.prepare", "acceptance.import", "intent.amend", "usage.publish",
+        "ticket.ready", "intent.publish", "requirements.adopt", "design.publish", "review.currentness.migrate",
+    }),
+    "BLOCKED": frozenset({
+        "worker.dispatch", "review.dispatch", "run.recover", "lifecycle.advance", "run.cancel.request",
+        "attempt.ingest", "attempt.reconcile", "candidate.publish",
+        "repair.authorize", "review.adjudicate", "effect.prepare", "effect.reconcile",
+        "handoff.prepare", "acceptance.import", "intent.amend", "usage.publish",
+        "intent.publish", "requirements.adopt", "design.publish", "review.currentness.migrate",
+    }),
+    "QUIESCING": frozenset({"lifecycle.advance", "run.cancel.finalize", "attempt.ingest", "attempt.reconcile", "effect.reconcile", "usage.publish"}),
+    "PAUSED": frozenset({"run.resume", "run.recover", "attempt.ingest", "attempt.reconcile", "effect.reconcile", "intent.amend", "usage.publish"}),
+    "RECOVERING": frozenset({"lifecycle.advance", "run.cancel.request", "attempt.ingest", "attempt.reconcile", "effect.reconcile", "intent.publish", "usage.publish"}),
+    "ACCEPTED": frozenset(),
+    "FAILED": frozenset(),
+    "CANCELLED": frozenset(),
+}
+EVENT_PHASE_TABLE = {
+    "worker.dispatch": frozenset({"EXECUTE"}),
+    "review.dispatch": frozenset({"DESIGN", "PLAN", "EXECUTE", "VERIFY", "ACCEPT"}),
+    "run.recover": frozenset(PHASES),
+    "lifecycle.advance": frozenset(PHASES),
+    "run.cancel.request": frozenset(PHASES),
+    "run.cancel.finalize": frozenset(PHASES),
+    "run.resume": frozenset(PHASES),
+    "attempt.ingest": frozenset(PHASES),
+    "attempt.reconcile": frozenset(PHASES),
+    "candidate.publish": frozenset({"EXECUTE"}),
+    "review.integrate": frozenset({"EXECUTE"}),
+    "repair.authorize": frozenset({"EXECUTE"}),
+    "review.adjudicate": frozenset({"DESIGN", "PLAN", "EXECUTE", "VERIFY", "ACCEPT"}),
+    "effect.prepare": frozenset(PHASES),
+    "effect.reconcile": frozenset(PHASES),
+    "handoff.prepare": frozenset({"EXECUTE", "VERIFY", "ACCEPT"}),
+    "acceptance.import": frozenset({"VERIFY", "ACCEPT"}),
+    "intent.amend": frozenset(PHASES),
+    "usage.publish": frozenset(PHASES),
+    "ticket.ready": frozenset({"EXECUTE"}),
+    "intent.publish": frozenset({"PREFLIGHT", "INTENT"}),
+    "requirements.adopt": frozenset({"DESIGN"}),
+    "design.publish": frozenset({"DESIGN"}),
+    "review.currentness.migrate": frozenset({"DESIGN", "PLAN"}),
+}
+PHASE_TRANSITION_TABLE = {
+    phase: frozenset({phase, *([PHASES[index + 1]] if index + 1 < len(PHASES) else [])})
+    for index, phase in enumerate(PHASES)
+}
+CONTROL_TRANSITION_TABLE = {
+    "ACTIVE": frozenset({"ACTIVE", "BLOCKED", "QUIESCING", "FAILED", "ACCEPTED"}),
+    "BLOCKED": frozenset({"ACTIVE", "BLOCKED", "QUIESCING", "RECOVERING", "FAILED"}),
+    "QUIESCING": frozenset({"QUIESCING", "PAUSED", "FAILED"}),
+    "PAUSED": frozenset({"PAUSED", "ACTIVE", "RECOVERING", "QUIESCING"}),
+    "RECOVERING": frozenset({"RECOVERING", "ACTIVE", "BLOCKED", "QUIESCING", "PAUSED"}),
+    "ACCEPTED": frozenset({"ACCEPTED"}),
+    "FAILED": frozenset({"FAILED"}),
+    "CANCELLED": frozenset({"CANCELLED"}),
+}
+TERMINAL_ATTEMPT_STATES = frozenset({"RETURNED", "LOST", "INTERRUPTED"})
+TERMINAL_CONTROLS = frozenset({"ACCEPTED", "FAILED", "CANCELLED"})
 RUN_SETTING_LABELS = {
     "interaction_mode": {"semi": "полуавтомат", "full": "полный автомат"},
     "depth": {"normal": "обычная", "deep": "глубокая"},
@@ -140,6 +204,539 @@ def zero_usage() -> dict[str, int]:
     return {field: 0 for field in USAGE_FIELDS}
 
 
+def allowed_events(state: dict[str, Any]) -> list[str]:
+    """Return the canonical event IDs admitted by the current phase/control."""
+    lifecycle = state.get("lifecycle", {})
+    control = lifecycle.get("control")
+    phase = lifecycle.get("phase")
+    events = set(EVENT_CONTROL_TABLE.get(control, ()))
+    events = {event_id for event_id in events if phase in EVENT_PHASE_TABLE.get(event_id, frozenset())}
+    if control != "QUIESCING":
+        events.discard("run.cancel.finalize")
+    if control != "PAUSED":
+        events.discard("run.resume")
+    if control == "BLOCKED" and _blocked_repair_review_integrate_ready(state):
+        events.add("review.integrate")
+    return sorted(events)
+
+
+def admit_event(state: dict[str, Any], event_id: str) -> None:
+    """Fail closed when a typed lifecycle event is not in the shared admission projection."""
+    lifecycle = state.get("lifecycle", {})
+    phase = lifecycle.get("phase")
+    required_phases = EVENT_PHASE_TABLE.get(event_id, frozenset())
+    if phase not in required_phases:
+        fail(
+            f"event {event_id!r} requires phase {'/'.join(sorted(required_phases))}; "
+            f"current phase/control is {phase} × {lifecycle.get('control')}"
+        )
+    if event_id not in allowed_events(state):
+        fail(
+            f"event {event_id!r} is not admitted in "
+            f"{phase} × {lifecycle.get('control')}"
+        )
+
+
+def validate_control_transition(current: str, target: str) -> None:
+    """Validate control changes against the shared transition table."""
+    if target not in CONTROL_TRANSITION_TABLE.get(current, frozenset()):
+        fail(f"illegal control transition: {current} -> {target}")
+
+
+def _action_event_id(kind: Any) -> str | None:
+    if not isinstance(kind, str):
+        return None
+    if kind.startswith("await_"):
+        return "attempt.ingest"
+    if kind in {"prepare_g2_coverage_review", "prepare_g3_plan_review", "review_change"}:
+        return "review.dispatch" if kind.startswith("prepare_") or kind == "review_change" else None
+    if kind in {
+        "dispatch_ticket", "dispatch_repair", "dispatch_repair_with_blocker_retained",
+        "prepare_g2_coverage_review", "prepare_g3_plan_review",
+    }:
+        return "worker.dispatch"
+    if kind == "recover_attempt":
+        return "run.recover"
+    if kind in {"reconcile_actual_state", "reconcile_terminal_attempts"}:
+        return "attempt.reconcile"
+    if kind in {"audit_worker_return_and_prepare_candidate", "preserve_blocked_candidate"}:
+        return "candidate.publish"
+    if kind in {"authorize_repair", "resolve_blocker_or_authorize_candidate_bound_repair"}:
+        return "repair.authorize"
+    if kind in {"adjudicate_review_disagreement"}:
+        return "review.adjudicate"
+    if kind in {"integrate_candidate", "integrate_reviewed_repair"}:
+        return "review.integrate"
+    if kind in {"review_candidate", "review_change"}:
+        return "review.dispatch"
+    if kind == "import_manual_review":
+        return "acceptance.import"
+    if kind == "prepare_acceptance_handoff":
+        return "handoff.prepare"
+    if kind == "mark_ticket_ready":
+        return "ticket.ready"
+    if kind == "publish_design_bundle":
+        return "design.publish"
+    if kind in {"apply_prepared_effect"}:
+        return "effect.prepare"
+    if kind in {"reconcile_effect", "reconcile_uncertain_effect"}:
+        return "effect.reconcile"
+    if kind == "resume_run":
+        return "run.resume"
+    if kind in {"advance_to_intent", "complete_g1", "advance_to_execute", "finalize_acceptance"}:
+        return "lifecycle.advance"
+    if kind == "stop_reconcile_then_cancel":
+        return "run.cancel.request"
+    return None
+
+
+def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
+    """Derive a safe typed disposition from control, attempts, obligations, and candidate pointers."""
+    lifecycle = state.get("lifecycle", {})
+    stored = lifecycle.get("next_action", {})
+    if not isinstance(stored, dict):
+        stored = {}
+    phase_b = state.get("candidate_model_version") == "1.1"
+    action = {
+        "kind": stored.get("kind", "inspect_state") if not phase_b else "inspect_state",
+        "subject_refs": list(stored.get("subject_refs", [])) if not phase_b else [],
+        "preconditions": list(stored.get("preconditions", [])) if not phase_b else [],
+        "read_refs": list(stored.get("read_refs", [])) if not phase_b else [],
+    }
+    attempts = [item for item in state.get("attempts", []) if isinstance(item, dict)]
+    attempt_by_id = {item.get("id"): item for item in attempts if item.get("id")}
+    refs = action["subject_refs"]
+    targets = [attempt_by_id[ref] for ref in refs if ref in attempt_by_id]
+    control = lifecycle.get("control")
+
+    if control in TERMINAL_CONTROLS:
+        action = {
+            "kind": f"terminal_{str(control).lower()}",
+            "subject_refs": [], "preconditions": [], "read_refs": ["references/ledger.md"],
+            "human_input_required": False,
+        }
+    elif phase_b:
+        user_assisted = [item for item in attempts if item.get("mode") == "user_assisted" and item.get("state") == "PREPARED"]
+        active = [item for item in attempts if item.get("mode") != "user_assisted" and item.get("state") in ("PREPARED", "DISPATCHED")]
+        stranded = [
+            item for item in attempts
+            if item.get("state") in ("LOST", "INTERRUPTED")
+            and item.get("lease", {}).get("state") in ("active", "quarantined")
+        ]
+        # Only an actual in-flight attempt creates a wait. A cached await or terminal
+        # attempt is not executable orchestration authority.
+        if active:
+            if control in ("QUIESCING", "PAUSED", "RECOVERING"):
+                safe_active = [item for item in active if item.get("state") in ("PREPARED", "DISPATCHED")]
+                if safe_active:
+                    active = safe_active
+            if len(active) == 1:
+                attempt = active[0]
+                kind = "await_review_return" if attempt.get("kind") == "review" else "await_worker_return"
+                action = {
+                    "kind": kind, "subject_refs": [attempt["id"]],
+                    "preconditions": ["internal orchestration wait; not a user checkpoint", "attempt remains nonterminal; ingest its exact return"],
+                    "read_refs": ["phases/execute.md", "phases/recover.md"],
+                }
+            else:
+                action = {
+                    "kind": "human_input_required",
+                    "subject_refs": [item.get("id") for item in active if item.get("id")],
+                    "preconditions": ["multiple nonterminal attempts require owner reconciliation before choosing a next action"],
+                    "read_refs": ["phases/recover.md", "references/ledger.md"],
+                    "human_input_required": True,
+                }
+        elif stranded and control in ("ACTIVE", "BLOCKED", "PAUSED"):
+            action = {
+                "kind": "recover_attempt",
+                "subject_refs": [item["id"] for item in stranded if item.get("id")],
+                "preconditions": ["reconcile the exact lost/interrupted attempts and their active or quarantined leases before repair authorization or dispatch"],
+                "read_refs": ["phases/recover.md", "references/ledger.md"],
+            }
+        elif stranded and control in ("QUIESCING", "RECOVERING"):
+            action = {
+                "kind": "reconcile_actual_state",
+                "subject_refs": [item["id"] for item in stranded if item.get("id")],
+                "preconditions": ["reconcile the exact lost/interrupted attempts and their active or quarantined leases before further work"],
+                "read_refs": ["phases/recover.md", "references/ledger.md"],
+            }
+        elif user_assisted and control == "BLOCKED":
+            action = {
+                "kind": "import_manual_review", "subject_refs": [item["id"] for item in user_assisted],
+                "preconditions": ["exact external return, clean environment/context receipts, and unchanged integrity baseline"],
+                "read_refs": ["phases/accept.md", "references/safety.md"],
+            }
+        elif control == "BLOCKED" and (blocked_repair_action := _blocked_repair_candidate_action(state)) is not None:
+            action = blocked_repair_action
+        elif control == "BLOCKED":
+            projection = finding_obligation_projection(state)
+            open_obligations = [item for item in projection["obligations"] if item.get("status") != "closed"]
+            active_blockers = [item for item in state.get("issues", []) if item.get("impact") == "blocking" and not item.get("invalidated_by")]
+            repairable = [
+                item for item in projection["items"]
+                if item.get("repairable") and any(
+                    obligation.get("finding_ref") == item.get("finding_ref")
+                    and obligation.get("status") != "closed" for obligation in open_obligations
+                )
+            ]
+            if len(repairable) == 1 and all(
+                item.get("status") == "open" and item.get("applicability") == "current"
+                for item in open_obligations
+            ):
+                finding_ref = repairable[0]["finding_ref"]
+                ticket_refs = repairable[0].get("unresolved_ticket_refs", repairable[0].get("affected_ticket_refs", []))
+                action = {
+                    "kind": "authorize_repair",
+                    "subject_refs": [*ticket_refs, finding_ref],
+                    "preconditions": ["authorize only this current ticket-scoped finding with a bounded repair contract"],
+                    "read_refs": ["phases/execute.md", "references/routing.md"],
+                }
+            elif not open_obligations and len(active_blockers) == 1 and any(
+                item.get("issue_ref") == active_blockers[0].get("id") and item.get("repairable")
+                for item in projection["mirrored_issues"]
+            ):
+                blocker = active_blockers[0]
+                ticket_refs = sorted(ref for ref in blocker.get("affected_refs", []) if ref in {item.get("id") for item in state.get("tickets", [])})
+                if len(ticket_refs) == 1:
+                    action = {
+                        "kind": "authorize_repair", "subject_refs": [ticket_refs[0], blocker["id"]],
+                        "preconditions": ["authorize only this current ticket-scoped blocking issue with a bounded repair contract"],
+                        "read_refs": ["phases/execute.md", "references/routing.md"],
+                    }
+                else:
+                    action = {
+                        "kind": "human_input_required", "subject_refs": [blocker["id"]],
+                        "preconditions": ["blocking issue must be bound to exactly one ticket before repair authorization"],
+                        "read_refs": ["references/routing.md", "references/ledger.md"],
+                        "human_input_required": True,
+                    }
+            elif open_obligations or active_blockers:
+                action = {
+                    "kind": "human_input_required", "subject_refs": [
+                        ref for item in open_obligations
+                        for ref in ([item.get("finding_ref")] + item.get("issue_refs", [])) if ref
+                    ],
+                    "preconditions": ["resolve or explicitly bind every current blocking obligation before resuming"],
+                    "read_refs": ["phases/execute.md", "references/routing.md"],
+                    "human_input_required": True,
+                }
+            else:
+                action = {
+                    "kind": "human_input_required", "subject_refs": [],
+                    "preconditions": ["BLOCKED state has no verified repairable finding; owner disposition is required"],
+                    "read_refs": ["references/routing.md", "references/ledger.md"],
+                    "human_input_required": True,
+                }
+        elif control in ("QUIESCING", "PAUSED", "RECOVERING"):
+            if control == "PAUSED":
+                action = {
+                    "kind": "resume_run", "subject_refs": [],
+                    "preconditions": ["resume only after safe reconciliation is complete"],
+                    "read_refs": ["phases/recover.md", "references/ledger.md"],
+                }
+            elif control == "RECOVERING":
+                action = {
+                    "kind": "reconcile_actual_state", "subject_refs": [],
+                    "preconditions": ["reconcile effects and stale writer state before ordinary dispatch"],
+                    "read_refs": ["phases/recover.md", "references/ledger.md"],
+                }
+            else:
+                action = {
+                    "kind": "human_input_required", "subject_refs": [],
+                    "preconditions": ["complete stop evidence and choose safe pause or cancellation finalization"],
+                    "read_refs": ["phases/recover.md", "references/ledger.md"],
+                    "human_input_required": True,
+                }
+        else:
+            projection = finding_obligation_projection(state)
+            open_obligations = [item for item in projection["obligations"] if item.get("status") != "closed"]
+            repairable = [
+                item for item in projection["items"]
+                if item.get("repairable") and any(
+                    obligation.get("finding_ref") == item.get("finding_ref")
+                    and obligation.get("status") == "open" and obligation.get("applicability") == "current"
+                    for obligation in open_obligations
+                )
+            ]
+            if open_obligations:
+                if len(repairable) == 1 and all(
+                    item.get("status") == "open" and item.get("applicability") == "current"
+                    for item in open_obligations
+                ):
+                    finding_ref = repairable[0]["finding_ref"]
+                    action = {
+                        "kind": "authorize_repair",
+                        "subject_refs": [*repairable[0].get("unresolved_ticket_refs", repairable[0].get("affected_ticket_refs", [])), finding_ref],
+                        "preconditions": ["authorize only this current ticket-scoped finding with a bounded repair contract"],
+                        "read_refs": ["phases/execute.md", "references/routing.md"],
+                    }
+                else:
+                    action = {
+                        "kind": "human_input_required", "subject_refs": [
+                            ref for item in open_obligations
+                            for ref in ([item.get("finding_ref")] + item.get("issue_refs", [])) if ref
+                        ],
+                        "preconditions": ["resolve or explicitly bind every blocking obligation before integration or lifecycle advancement"],
+                        "read_refs": ["phases/execute.md", "references/routing.md"],
+                        "human_input_required": True,
+                    }
+            elif any(item.get("impact") == "blocking" and not item.get("invalidated_by") for item in state.get("issues", [])):
+                action = {
+                    "kind": "human_input_required", "subject_refs": [
+                        item["id"] for item in state.get("issues", [])
+                        if item.get("impact") == "blocking" and not item.get("invalidated_by")
+                    ],
+                    "preconditions": ["inspect and disposition every active blocking issue before advancing"],
+                    "read_refs": ["references/routing.md", "references/ledger.md"],
+                    "human_input_required": True,
+                }
+            else:
+                candidate_preparations = []
+                for ticket in state.get("tickets", []):
+                    attempt_ref = ticket.get("last_worker_attempt")
+                    attempt = attempt_by_id.get(attempt_ref)
+                    if (
+                        attempt is not None
+                        and attempt.get("kind") == "worker"
+                        and attempt.get("subject_ref") == ticket.get("id")
+                        and attempt.get("state") == "RETURNED"
+                        and attempt.get("return_ref")
+                        and attempt.get("candidate_sha") is None
+                        and attempt.get("candidate_tree_sha") is None
+                        and attempt.get("lease", {}).get("state") == "active"
+                        and ticket.get("current_attempt") == attempt_ref
+                        and ticket.get("current_worker_attempt") is None
+                        and ticket.get("state") not in ("CANCELLED", "STALE", "INTEGRATED")
+                    ):
+                        # A validated non-DONE worker return moves the run to BLOCKED
+                        # and creates a durable issue. Under ACTIVE control with no
+                        # open blockers, this exact latest return is the only legal
+                        # source for starting candidate audit/publication.
+                        candidate_preparations.append((ticket, attempt))
+                if candidate_preparations:
+                    ticket, attempt = candidate_preparations[0]
+                    action = {
+                        "kind": "audit_worker_return_and_prepare_candidate",
+                        "subject_refs": [ticket["id"], attempt["id"]],
+                        "preconditions": ["exact latest same-ticket worker return is validated DONE", "audit the actual write set and prepare the candidate effect before publication"],
+                        "read_refs": ["phases/execute.md", "references/safety.md"],
+                    }
+                else:
+                    candidates_ready: list[tuple[dict[str, Any], dict[str, Any]]] = []
+                    for ticket in state.get("tickets", []):
+                        candidate = current_candidate_record(state, ticket)
+                        if candidate is not None:
+                            candidates_ready.append((ticket, candidate))
+                    pending_review = next((pair for pair in candidates_ready if pair[1].get("review_status") != "PASS"), None)
+                    pending_integration = next((pair for pair in candidates_ready if pair[1].get("review_status") == "PASS" and pair[1].get("integration_status") != "INTEGRATED"), None)
+                    if pending_integration is not None:
+                        ticket, candidate = pending_integration
+                        if candidate.get("quality") == "CONTINUATION":
+                            action = {
+                                "kind": "human_input_required", "subject_refs": [ticket["id"], candidate["id"]],
+                                "preconditions": ["continuation-only candidates require an authorized repair and fresh review; do not integrate"],
+                                "read_refs": ["phases/execute.md", "references/routing.md"],
+                                "human_input_required": True,
+                            }
+                        else:
+                            action = {
+                                "kind": "integrate_candidate", "subject_refs": [ticket["id"], candidate["id"]],
+                                "preconditions": ["accepted PASS review is current and all finding obligations are closed"],
+                                "read_refs": ["phases/execute.md", "references/ledger.md"],
+                            }
+                    elif pending_review is not None:
+                        ticket, candidate = pending_review
+                        action = {
+                            "kind": "review_candidate", "subject_refs": [ticket["id"], candidate["id"]],
+                            "preconditions": ["prepare an independent review bound to the explicit current candidate"],
+                            "read_refs": ["contracts/reviewer.md", "phases/execute.md"],
+                        }
+                    elif state.get("lifecycle", {}).get("phase") == "EXECUTE":
+                        ready_ticket = next((item for item in state.get("tickets", []) if item.get("state") == "READY" and not item.get("current_candidate")), None)
+                        planned_ticket = next((item for item in state.get("tickets", []) if item.get("state") == "PLANNED"), None)
+                        if ready_ticket is not None:
+                            action = {
+                                "kind": "dispatch_ticket", "subject_refs": [ready_ticket["id"]],
+                                "preconditions": ["fresh packet, admitted worker.dispatch event, and available lease zone"],
+                                "read_refs": ["phases/execute.md", "contracts/worker.md"],
+                            }
+                        elif planned_ticket is not None:
+                            action = {
+                                "kind": "mark_ticket_ready", "subject_refs": [planned_ticket["id"]],
+                                "preconditions": ["current dependencies, criteria, and contracts are satisfied"],
+                                "read_refs": ["phases/execute.md", "references/ledger.md"],
+                            }
+                        else:
+                            action = {
+                                "kind": "human_input_required", "subject_refs": [],
+                                "preconditions": ["no current executable ticket or candidate disposition is available"],
+                                "read_refs": ["phases/execute.md", "references/ledger.md"],
+                                "human_input_required": True,
+                            }
+                    elif state.get("lifecycle", {}).get("phase") == "DESIGN":
+                        if not isinstance(state.get("design_publication"), dict) or state.get("design_publication", {}).get("status") != "PUBLISHED":
+                            action = {
+                                "kind": "publish_design_bundle", "subject_refs": [],
+                                "preconditions": ["requirements and design bundle are complete and current"],
+                                "read_refs": ["phases/design.md", "references/ledger.md"],
+                            }
+                        elif not design_review_pass(state, "coverage"):
+                            action = {
+                                "kind": "prepare_g2_coverage_review", "subject_refs": [state["design_publication"].get("id")],
+                                "preconditions": ["independent coverage review of the current design bundle"],
+                                "read_refs": ["phases/design.md", "contracts/reviewer.md"],
+                            }
+                        else:
+                            action = {
+                                "kind": "prepare_g3_plan_review", "subject_refs": [state["design_publication"].get("id")],
+                                "preconditions": ["independent plan review of the current design bundle; G3 advances to PLAN"],
+                                "read_refs": ["phases/design.md", "contracts/reviewer.md"],
+                            }
+                    elif state.get("lifecycle", {}).get("phase") == "PLAN":
+                        if design_review_pass(state, "coverage") and design_review_pass(state, "plan"):
+                            action = {
+                                "kind": "advance_to_execute", "subject_refs": [state.get("design_publication", {}).get("id")],
+                                "preconditions": ["current G2 coverage PASS, G3 plan PASS, and every ticket PLANNED/READY"],
+                                "read_refs": ["phases/execute.md", "references/ledger.md"],
+                            }
+                        else:
+                            action = {
+                                "kind": "human_input_required", "subject_refs": [],
+                                "preconditions": ["current G2/G3 evidence is incomplete; inspect design review state"],
+                                "read_refs": ["phases/design.md", "references/ledger.md"],
+                                "human_input_required": True,
+                            }
+                    elif state.get("lifecycle", {}).get("phase") == "PREFLIGHT":
+                        action = {
+                            "kind": "advance_to_intent", "subject_refs": [],
+                            "preconditions": ["repository preflight and owner setup are complete"],
+                            "read_refs": ["phases/start.md", "references/ledger.md"],
+                        }
+                    elif state.get("lifecycle", {}).get("phase") == "INTENT":
+                        action = {
+                            "kind": "complete_g1", "subject_refs": [state.get("intent", {}).get("document_ref")] if state.get("intent", {}).get("document_ref") else [],
+                            "preconditions": ["current intent document hash and G1 inputs are verified"],
+                            "read_refs": ["phases/intent.md", "references/ledger.md"],
+                        }
+                    elif state.get("lifecycle", {}).get("phase") == "VERIFY":
+                        action = {
+                            "kind": "prepare_acceptance_handoff", "subject_refs": [],
+                            "preconditions": ["G4 evidence is current and the exact acceptance projection is bound to this candidate"],
+                            "read_refs": ["phases/accept.md", "contracts/reviewer.md"],
+                        }
+                    elif state.get("lifecycle", {}).get("phase") == "ACCEPT":
+                        acceptance = state.get("acceptance", [])
+                        latest = acceptance[-1] if acceptance else None
+                        binding = current_intent_binding(state) if state.get("intent") else None
+                        if (
+                            latest and latest.get("verdict") == "PASS"
+                            and binding and latest.get("intent_revision") == binding["revision"]
+                            and not latest.get("invalidated_by")
+                            and not any(item.get("impact") == "blocking" and not item.get("invalidated_by") for item in state.get("issues", []))
+                            and not active_publication_leases(state)
+                            and not any(item.get("state") in ("prepared", "uncertain") for item in state.get("operations", []))
+                        ):
+                            action = {
+                                "kind": "finalize_acceptance", "subject_refs": [latest["return_ref"]] if latest.get("return_ref") else [],
+                                "preconditions": ["current G5 PASS; supply --gate-id G6 to record terminal acceptance"],
+                                "read_refs": ["phases/accept.md", "references/ledger.md"],
+                            }
+                        else:
+                            action = {
+                                "kind": "human_input_required", "subject_refs": [],
+                                "preconditions": ["fresh current-intent G5 PASS and all blockers, leases, and effects must be resolved"],
+                                "read_refs": ["phases/accept.md", "references/ledger.md"],
+                                "human_input_required": True,
+                            }
+                    else:
+                        action = {
+                            "kind": "human_input_required", "subject_refs": [],
+                            "preconditions": ["inspect verified lifecycle and choose the next owner-authorized gate action"],
+                            "read_refs": ["phases/start.md", "references/ledger.md"],
+                            "human_input_required": True,
+                        }
+    elif (
+        action["kind"].startswith("await_")
+        and targets
+        and all(item.get("state") in TERMINAL_ATTEMPT_STATES for item in targets)
+    ):
+        action = {
+            "kind": "human_input_required",
+            "subject_refs": list(refs),
+            "preconditions": ["inspect the recorded terminal attempt outcome; owner must choose a safe next action"],
+            "read_refs": ["phases/recover.md", "references/ledger.md"],
+            "human_input_required": True,
+        }
+    if str(action.get("kind", "")).startswith("await_") and not any(
+        "not a user checkpoint" in str(item) for item in action.get("preconditions", [])
+    ):
+        action.setdefault("preconditions", []).insert(0, "internal orchestration wait; not a user checkpoint")
+    action["event_id"] = _action_event_id(action.get("kind"))
+    action.setdefault("human_input_required", False)
+    action["terminal_wait"] = False
+    return action
+
+
+def _blocked_repair_candidate_action(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Derive candidate publication for an exact returned owner-authorized repair worker."""
+    tickets = {item.get("id"): item for item in state.get("tickets", [])}
+    attempts = {item.get("id"): item for item in state.get("attempts", [])}
+    findings = {item.get("id"): item for item in state.get("findings", [])}
+    issues = {item.get("id"): item for item in state.get("issues", [])}
+    for ticket in state.get("tickets", []):
+        attempt_ref = ticket.get("last_worker_attempt")
+        attempt = attempts.get(attempt_ref)
+        contract = attempt.get("repair_contract") if attempt else None
+        finding_ref = contract.get("finding_ref") if isinstance(contract, dict) else None
+        if (
+            attempt is None
+            or attempt.get("kind") != "worker"
+            or attempt.get("mode") != "repair"
+            or attempt.get("state") != "RETURNED"
+            or not attempt.get("return_ref")
+            or attempt.get("candidate_sha") is not None
+            or attempt.get("candidate_tree_sha") is not None
+            or attempt.get("lease", {}).get("state") != "active"
+            or attempt.get("subject_ref") != ticket.get("id")
+            or ticket.get("current_attempt") != attempt_ref
+            or ticket.get("current_worker_attempt") is not None
+            or not finding_ref
+        ):
+            continue
+        authorization = active_repair_authorization(state, ticket["id"], finding_ref)
+        record = findings.get(finding_ref) or issues.get(finding_ref)
+        if (
+            authorization is None
+            or attempt.get("repair_authorization_ref") != authorization.get("id")
+            or record is None
+            or record.get("impact") != "blocking"
+            or record.get("invalidated_by")
+            or ticket["id"] not in record.get("affected_refs", [])
+        ):
+            continue
+        return {
+            "kind": "audit_worker_return_and_prepare_candidate",
+            "subject_refs": [ticket["id"], attempt["id"], finding_ref],
+            "preconditions": ["exact latest authorized repair return is validated DONE", "audit its actual write set and prepare the candidate effect without clearing BLOCKED obligations"],
+            "read_refs": ["phases/execute.md", "references/safety.md", "references/routing.md"],
+        }
+    return None
+
+
+def derive_control_projection(state: dict[str, Any]) -> dict[str, Any]:
+    """Shared read projection used by status and publication admission metadata."""
+    return {"next_action": derive_next_action(state), "allowed_events": allowed_events(state)}
+
+
+def refresh_control_projection(state: dict[str, Any]) -> None:
+    """Persist the derived projection for Phase B ledgers before validation/publication."""
+    if state.get("candidate_model_version") != "1.1":
+        return
+    projection = derive_control_projection(state)
+    state.setdefault("lifecycle", {})["next_action"] = projection["next_action"]
+    state["lifecycle"]["allowed_events"] = projection["allowed_events"]
+
+
 def default_usage() -> dict[str, Any]:
     return {
         "counters": zero_usage(),
@@ -213,6 +810,13 @@ def mutation_ineligibility(state: dict[str, Any]) -> str | None:
         return (
             "runtime provenance current_schema_version does not match ledger schema_version; "
             "repair through an explicit owner-authorized migration"
+        )
+    if state.get("candidate_model_version") != "1.1" and any(
+        state.get(collection) for collection in ("tickets", "attempts", "candidates", "findings")
+    ):
+        return (
+            "populated state lacks the explicit Phase B candidate model marker; read/status/diagnose only "
+            "until an explicit owner-authorized append-only migration defines candidate authority"
         )
     return None
 
@@ -504,7 +1108,7 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
     if state["run_id"] != Path(state["repository"]["control_root"]).name and state["run_id"] == "":
         fail("run_id must be nonempty")
     ids: set[str] = set()
-    for collection in ("documents", "requirements", "criteria", "contracts", "decisions", "tickets", "attempts", "issues", "findings", "reviews", "operations", "capabilities", "routes", "evidence", "invalidations"):
+    for collection in ("documents", "requirements", "criteria", "contracts", "decisions", "tickets", "candidates", "attempts", "issues", "findings", "reviews", "operations", "capabilities", "routes", "evidence", "invalidations"):
         for item in state.get(collection, []):
             if "id" in item:
                 if item["id"] in ids:
@@ -646,6 +1250,41 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
             fail(f"attempt epoch is ahead of owner epoch: {attempt['id']}")
         if state.get("runtime_provenance") and attempt.get("kind") == "review" and attempt.get("state") == "RETURNED" and attempt.get("lease", {}).get("state") == "active":
             fail(f"returned reviewer attempt retains an active lease: {attempt['id']}")
+    candidates_by_id = {item["id"]: item for item in state.get("candidates", [])}
+    for candidate in state.get("candidates", []):
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == candidate.get("ticket_ref")), None)
+        producer = next((item for item in state.get("attempts", []) if item.get("id") == candidate.get("producer_attempt_ref")), None)
+        if ticket is None or producer is None or producer.get("subject_ref") != candidate.get("ticket_ref") or producer.get("kind") != "worker":
+            fail(f"candidate has no exact same-ticket worker producer: {candidate['id']}")
+        if producer.get("candidate_sha") != candidate.get("sha") or producer.get("candidate_tree_sha") != candidate.get("tree_sha"):
+            fail(f"candidate identity does not match its immutable producer attempt: {candidate['id']}")
+        parent_ref = candidate.get("parent_candidate_ref")
+        if parent_ref is not None:
+            parent = candidates_by_id.get(parent_ref)
+            if parent is None or parent.get("ticket_ref") != candidate.get("ticket_ref"):
+                fail(f"candidate parent is missing or belongs to another ticket: {candidate['id']}")
+        if candidate.get("superseded_by") is not None:
+            successor = candidates_by_id.get(candidate["superseded_by"])
+            if successor is None or successor.get("parent_candidate_ref") != candidate["id"]:
+                fail(f"candidate supersession edge is not reciprocal: {candidate['id']}")
+    for ticket in state.get("tickets", []):
+        candidate_ref = ticket.get("current_candidate")
+        if candidate_ref is not None:
+            candidate = candidates_by_id.get(candidate_ref)
+            if candidate is None or candidate.get("ticket_ref") != ticket.get("id"):
+                fail(f"ticket current_candidate does not identify a current same-ticket candidate: {ticket['id']}")
+        worker_ref = ticket.get("current_worker_attempt")
+        if worker_ref is not None:
+            worker = next((item for item in state.get("attempts", []) if item.get("id") == worker_ref), None)
+            if worker is None or worker.get("kind") != "worker" or worker.get("subject_ref") != ticket.get("id") or worker.get("state") not in ("PREPARED", "DISPATCHED"):
+                fail(f"ticket current_worker_attempt must identify its in-flight worker: {ticket['id']}")
+        last_worker_ref = ticket.get("last_worker_attempt")
+        if last_worker_ref is not None:
+            worker = next((item for item in state.get("attempts", []) if item.get("id") == last_worker_ref), None)
+            if worker is None or worker.get("kind") != "worker" or worker.get("subject_ref") != ticket.get("id"):
+                fail(f"ticket last_worker_attempt must identify a same-ticket worker: {ticket['id']}")
+        if state.get("candidate_model_version") == "1.1" and ticket.get("last_worker_attempt") is not None and ticket.get("current_attempt") != ticket.get("last_worker_attempt"):
+            fail(f"Phase B current_attempt compatibility alias diverges from last_worker_attempt: {ticket['id']}")
     if state["lifecycle"]["control"] == "ACCEPTED":
         if not any(a.get("verdict") == "PASS" for a in state.get("acceptance", [])):
             fail("ACCEPTED requires a recorded G5 PASS")
@@ -795,6 +1434,7 @@ def publish(p: dict[str, Path], state: dict[str, Any], previous_raw: bytes | Non
     # their own lock/publish flow instead of using transaction().
     require_mutation_eligible(state)
     ensure_runtime_provenance(state)
+    refresh_control_projection(state)
     validate_ledger(state)
     if previous_raw is not None:
         if not p["prev"].parent.exists():
@@ -858,6 +1498,7 @@ def transaction(
         next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
         next_state["updated_at"] = now()
         ensure_runtime_provenance(next_state)
+        refresh_control_projection(next_state)
         # All schema and state invariants run before an immutable artifact is
         # made visible. File-backed references are checked after plan publish.
         validate_ledger(next_state, verify_files=False)
@@ -1409,16 +2050,353 @@ def validated_candidate_worker_return(
     fail("candidate worker return is neither DONE nor an authorized continuation")
 
 
+def current_candidate_record(state: dict[str, Any], ticket: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve only an explicit current-candidate pointer; legacy attempt pointers are not promoted."""
+    candidate_id = ticket.get("current_candidate")
+    if candidate_id is None:
+        return None
+    matches = [item for item in state.get("candidates", []) if item.get("id") == candidate_id]
+    if len(matches) != 1 or matches[0].get("ticket_ref") != ticket.get("id"):
+        fail(f"ticket current_candidate pointer is missing, ambiguous, or cross-ticket: {ticket.get('id')}")
+    return matches[0]
+
+
+def current_candidate_producer(state: dict[str, Any], ticket: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve the producer for the explicit candidate, with a conservative legacy fallback."""
+    candidate = current_candidate_record(state, ticket)
+    if candidate is not None:
+        producer = next((item for item in state.get("attempts", []) if item.get("id") == candidate.get("producer_attempt_ref")), None)
+        if producer is None or producer.get("kind") != "worker" or producer.get("subject_ref") != ticket.get("id"):
+            fail(f"current candidate producer is not a same-ticket worker: {candidate.get('id')}")
+        return producer
+    if "current_candidate" in ticket and state.get("candidate_model_version") == "1.1":
+        return None
+    legacy = next((item for item in state.get("attempts", []) if item.get("id") == ticket.get("current_attempt")), None)
+    if (
+        legacy and legacy.get("kind") == "worker" and legacy.get("subject_ref") == ticket.get("id")
+        and legacy.get("state") == "RETURNED" and legacy.get("candidate_sha")
+    ):
+        return legacy
+    return None
+
+
+def _ticket_blocking_refs(state: dict[str, Any], ticket_id: str) -> list[str]:
+    refs = {
+        item.get("id") for item in state.get("issues", [])
+        if item.get("id") and item.get("impact") == "blocking"
+        and not item.get("invalidated_by") and ticket_id in item.get("affected_refs", [])
+    }
+    refs.update(
+        item.get("id") for item in state.get("findings", [])
+        if item.get("id") and item.get("impact") == "blocking"
+        and not item.get("invalidated_by") and ticket_id in item.get("affected_refs", [])
+    )
+    return sorted(refs)
+
+
+def publish_candidate_projection(
+    state: dict[str, Any], ticket: dict[str, Any], attempt: dict[str, Any], *,
+    quality: str, blocker_refs: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Publish the explicit candidate identity and advance its independent ticket pointer."""
+    if quality not in ("DONE", "CONTINUATION"):
+        fail(f"invalid candidate quality: {quality}")
+    if attempt.get("kind") != "worker" or attempt.get("subject_ref") != ticket.get("id"):
+        fail("candidate producer must be a worker attempt for the same ticket")
+    if not attempt.get("candidate_sha") or not attempt.get("candidate_tree_sha"):
+        fail("candidate projection requires exact commit and tree SHAs")
+    candidate_id = f"candidate-{attempt['id']}"
+    candidates = state.setdefault("candidates", [])
+    existing = next((item for item in candidates if item.get("id") == candidate_id), None)
+    parent_ref = ticket.get("current_candidate")
+    blockers = sorted(set(blocker_refs or _ticket_blocking_refs(state, ticket["id"])))
+    record = {
+        "id": candidate_id,
+        "ticket_ref": ticket["id"],
+        "sha": attempt["candidate_sha"],
+        "tree_sha": attempt["candidate_tree_sha"],
+        "base_sha": attempt.get("base_sha"),
+        "producer_attempt_ref": attempt["id"],
+        "parent_candidate_ref": parent_ref,
+        "quality": quality,
+        "blocker_refs": blockers,
+        "review_status": "PENDING",
+        "integration_status": "PENDING",
+        "superseded_by": None,
+        "invalidated_by": [],
+    }
+    if existing is not None:
+        comparable = {key: existing.get(key) for key in record}
+        if comparable != record:
+            fail(f"candidate ID already has conflicting projection: {candidate_id}")
+        record = existing
+    else:
+        if parent_ref:
+            parent = next((item for item in candidates if item.get("id") == parent_ref), None)
+            if parent is None or parent.get("ticket_ref") != ticket["id"]:
+                fail("candidate parent pointer does not resolve to a same-ticket candidate")
+            if parent.get("superseded_by") not in (None, candidate_id):
+                fail("candidate parent was already superseded by another candidate")
+            parent["superseded_by"] = candidate_id
+        candidates.append(record)
+    ticket["current_candidate"] = candidate_id
+    ticket["last_worker_attempt"] = attempt["id"]
+    ticket["current_attempt"] = attempt["id"]
+    return record
+
+
+def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
+    """Pure current/history/resolution projection over immutable findings and their issue mirrors."""
+    tickets = {item.get("id"): item for item in state.get("tickets", [])}
+    attempts = {item.get("id"): item for item in state.get("attempts", [])}
+    candidates = {item.get("id"): item for item in state.get("candidates", [])}
+    candidates_by_attempt = {item.get("producer_attempt_ref"): item for item in state.get("candidates", [])}
+    reviews = {item.get("id"): item for item in state.get("reviews", [])}
+    issues = state.get("issues", [])
+    issue_by_id = {item.get("id"): item for item in issues}
+    design = state.get("design_publication") or {}
+    design_history = state.get("design_publication_history", [])
+    publications = {item.get("id"): item for item in [*design_history, design] if item.get("id")}
+    accepted_pass_reviews = {
+        item.get("id"): item for item in state.get("reviews", [])
+        if item.get("id") and item.get("accepted") is True
+        and item.get("verdict") == "PASS" and item.get("return_ref")
+        and not item.get("invalidated_by")
+    }
+    resolutions_by_finding_ticket: dict[str, dict[str, list[str]]] = {}
+    for decision in state.get("decisions", []):
+        affected = decision.get("affected_refs", [])
+        if (
+            decision.get("type") != "finding_resolution"
+            or decision.get("status") != "accepted"
+            or decision.get("decision") != "RESOLVED"
+            or len(affected) != 1
+            or not isinstance(decision.get("reason"), str)
+            or not decision.get("reason")
+            or decision.get("invalidated_by")
+        ):
+            continue
+        finding_ref = affected[0]
+        candidate_ref = decision.get("candidate_ref")
+        candidate = candidates.get(candidate_ref)
+        finding = next((item for item in state.get("findings", []) if item.get("id") == finding_ref), None)
+        review_refs = [ref for ref in decision.get("evidence_refs", []) if ref in accepted_pass_reviews]
+        if candidate is None or finding is None or len(review_refs) != 1:
+            continue
+        review = accepted_pass_reviews[review_refs[0]]
+        ticket_ref = candidate.get("ticket_ref")
+        ticket = tickets.get(ticket_ref)
+        if review.get("subject_fingerprint") != candidate.get("sha"):
+            continue
+        if (
+            ticket_ref not in finding.get("affected_refs", [])
+            or ticket is None
+            or ticket.get("current_candidate") != candidate_ref
+            or candidate.get("quality") != "DONE"
+        ):
+            continue
+        contract = next((item for item in review.get("finding_resolution", [])
+                         if item.get("finding_ref") == finding_ref
+                         and item.get("candidate_ref") == candidate_ref), None)
+        if contract is None:
+            continue
+        contract_evidence = contract.get("evidence_refs", [])
+        decision_evidence = decision.get("evidence_refs", [])
+        if not contract_evidence or set(decision_evidence) != {review["id"], *contract_evidence}:
+            continue
+        resolutions_by_finding_ticket.setdefault(finding_ref, {}).setdefault(ticket_ref, []).append(decision["id"])
+    records: list[dict[str, Any]] = []
+    obligations: list[dict[str, Any]] = []
+    mirrors: list[dict[str, Any]] = []
+
+    for finding in state.get("findings", []):
+        finding_id = finding.get("id")
+        source_id = finding.get("source_ref")
+        source = attempts.get(source_id) or reviews.get(source_id)
+        issue_refs = sorted(item["id"] for item in issues if item.get("finding_ref") == finding_id)
+        affected_tickets = sorted(ref for ref in finding.get("affected_refs", []) if ref in tickets)
+        candidate = None
+        publication = None
+        source_sha = None
+        if source is not None:
+            source_sha = source.get("candidate_sha") or source.get("subject_fingerprint")
+            if source.get("kind") == "worker" and source.get("id") in candidates_by_attempt:
+                candidate = candidates_by_attempt[source["id"]]
+            if candidate is None and source_sha:
+                possible = [
+                    item for item in state.get("candidates", [])
+                    if item.get("sha") == source_sha and item.get("ticket_ref") in affected_tickets
+                ]
+                if len(possible) == 1:
+                    candidate = possible[0]
+            publication_matches = [
+                item for item in publications.values()
+                if source_sha and item.get("publication_hash") == source_sha
+            ]
+            if len(publication_matches) == 1:
+                publication = publication_matches[0]
+
+        binding_kind = None
+        source_candidate_ref = None
+        if candidate is not None:
+            source_candidate_ref = candidate["id"]
+            current_ticket = tickets.get(candidate.get("ticket_ref"), {})
+            if current_ticket.get("current_candidate") == candidate.get("id"):
+                binding_kind = "current"
+            elif candidate.get("superseded_by"):
+                binding_kind = "superseded"
+            else:
+                binding_kind = "historical"
+        elif publication is not None:
+            if publication.get("id") == design.get("id"):
+                binding_kind = "current"
+            elif publication.get("superseded_by") or publication.get("status") in ("SUPERSEDED", "INVALIDATED"):
+                binding_kind = "superseded"
+            else:
+                binding_kind = "historical"
+        elif source is not None and source_sha and affected_tickets:
+            # Exact attempt+ticket evidence can identify legacy history, but cannot silently
+            # establish a current candidate in a ledger without the explicit Phase B pointer.
+            if source.get("subject_ref") in affected_tickets:
+                binding_kind = "historical"
+
+        resolutions_by_ticket = resolutions_by_finding_ticket.get(finding_id, {})
+        resolved_ticket_refs = sorted(ref for ref in affected_tickets if resolutions_by_ticket.get(ref))
+        unresolved_ticket_refs = sorted(set(affected_tickets) - set(resolved_ticket_refs))
+        resolved_by = sorted({decision_id for ids in resolutions_by_ticket.values() for decision_id in ids})
+        all_affected_tickets_resolved = bool(affected_tickets) and not unresolved_ticket_refs
+        if all_affected_tickets_resolved:
+            status = "resolved"
+        elif binding_kind == "superseded":
+            status = "superseded"
+        elif binding_kind == "current":
+            status = "current"
+        elif binding_kind == "historical":
+            status = "historical"
+        else:
+            status = "unbound"
+
+        is_blocking = finding.get("impact") == "blocking"
+        obligation_status = "closed" if all_affected_tickets_resolved or not is_blocking else ("binding_required" if status == "unbound" else "open")
+        proof = finding.get("expected") or finding.get("claim") or "independent evidence that the reported defect is absent"
+        item = {
+            "finding_ref": finding_id,
+            "status": status,
+            "current_applicability": status == "current",
+            "repairable": status == "current" and obligation_status == "open",
+            "source_candidate_ref": source_candidate_ref,
+            "affected_ticket_refs": affected_tickets,
+            "resolved_ticket_refs": resolved_ticket_refs,
+            "unresolved_ticket_refs": unresolved_ticket_refs,
+            "issue_refs": issue_refs,
+            "resolved_by_refs": resolved_by,
+            "verification_obligation": {
+                "status": obligation_status,
+                "required_proof": proof,
+                "ticket_refs": unresolved_ticket_refs,
+                "issue_refs": issue_refs,
+            },
+        }
+        records.append(item)
+        if obligation_status != "closed":
+            obligations.append({
+                "finding_ref": finding_id,
+                "status": obligation_status,
+                "applicability": status,
+                "required_proof": proof,
+                "issue_refs": issue_refs,
+                "ticket_refs": unresolved_ticket_refs,
+            })
+        for issue_ref in issue_refs:
+            issue = issue_by_id.get(issue_ref, {})
+            mirrors.append({
+                "issue_ref": issue_ref,
+                "finding_ref": finding_id,
+                "status": status,
+                "impact": issue.get("impact"),
+                "active": bool(issue.get("impact") == "blocking" and obligation_status != "closed"),
+                "repairable": bool(status == "current" and issue.get("impact") == "blocking" and obligation_status == "open"),
+            })
+
+    # Preserve orphan finding-typed issue obligations; missing mirrors require explicit binding.
+    known_mirrors = {item["issue_ref"] for item in mirrors}
+    for issue in issues:
+        if issue.get("type") != "review_finding" or issue.get("id") in known_mirrors:
+            continue
+        mirrors.append({
+            "issue_ref": issue.get("id"), "finding_ref": issue.get("finding_ref"),
+            "status": "unbound", "impact": issue.get("impact"),
+            "active": issue.get("impact") == "blocking" and not issue.get("invalidated_by"),
+            "repairable": False,
+        })
+        if issue.get("impact") == "blocking" and not issue.get("invalidated_by"):
+            obligations.append({
+                "finding_ref": issue.get("finding_ref"), "issue_ref": issue.get("id"),
+                "status": "binding_required", "applicability": "unbound",
+                "required_proof": issue.get("resolution_condition") or issue.get("expected") or "bind issue to a canonical finding and verification evidence",
+                "issue_refs": [issue.get("id")], "ticket_refs": sorted(ref for ref in issue.get("affected_refs", []) if ref in tickets),
+            })
+    known_issue_refs = {item.get("issue_ref") for item in mirrors}
+    for issue in issues:
+        if issue.get("id") in known_issue_refs:
+            continue
+        issue_status = "superseded" if issue.get("invalidated_by") else "current"
+        mirrors.append({
+            "issue_ref": issue.get("id"),
+            "finding_ref": issue.get("finding_ref") or issue.get("id"),
+            "status": issue_status,
+            "impact": issue.get("impact"),
+            "active": bool(issue.get("impact") == "blocking" and not issue.get("invalidated_by")),
+            "repairable": bool(issue_status == "current" and issue.get("impact") == "blocking" and not issue.get("invalidated_by")),
+        })
+    return {"items": records, "obligations": obligations, "mirrored_issues": mirrors}
+
+
+def open_ticket_finding_obligations(state: dict[str, Any], ticket_id: str) -> list[dict[str, Any]]:
+    """Return the shared unresolved verification-obligation view for one ticket."""
+    projection = finding_obligation_projection(state)
+    return [
+        item for item in projection["obligations"]
+        if ticket_id in item.get("ticket_refs", []) and item.get("status") != "closed"
+    ]
+
+
+def _blocked_repair_review_integrate_ready(state: dict[str, Any]) -> bool:
+    """Admit BLOCKED integration only with a current DONE candidate and exact review attempt."""
+    lifecycle = state.get("lifecycle", {})
+    if lifecycle.get("control") != "BLOCKED" or lifecycle.get("phase") != "EXECUTE":
+        return False
+    attempts = [item for item in state.get("attempts", []) if isinstance(item, dict)]
+    for ticket in state.get("tickets", []):
+        candidate = current_candidate_record(state, ticket)
+        if (
+            candidate is None
+            or candidate.get("quality") != "DONE"
+            or candidate.get("review_status") == "BLOCK"
+            or candidate.get("integration_status") == "INTEGRATED"
+        ):
+            continue
+        if any(
+            attempt.get("kind") == "review"
+            and attempt.get("subject_ref") == ticket.get("id")
+            and attempt.get("candidate_sha") == candidate.get("sha")
+            and attempt.get("subject_fingerprint") == candidate.get("sha")
+            and attempt.get("state") in ("PREPARED", "RETURNED")
+            and (attempt.get("state") != "RETURNED" or attempt.get("review_result") == "PASS")
+            and not attempt.get("invalidated_by")
+            for attempt in attempts
+        ):
+            return True
+    return False
+
+
 def repair_candidate_worker(
     state: dict[str, Any], ticket: dict[str, Any], repair: dict[str, Any], packet_base: str
 ) -> dict[str, Any]:
     """Resolve the one current worker candidate authorized for this repair base."""
     source_ref = repair.get("source_attempt_ref")
     source = next((item for item in state.get("attempts", []) if item.get("id") == source_ref), None)
-    current = next(
-        (item for item in state.get("attempts", []) if item.get("id") == ticket.get("current_attempt")),
-        None,
-    )
+    current = current_candidate_producer(state, ticket)
     if (
         current is None
         or current.get("kind") != "worker"
@@ -1450,10 +2428,7 @@ def repair_requires_transitive_create_modify_provenance(
     p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any]
 ) -> bool:
     """Detect a repair of a current candidate that crosses a create-only zone."""
-    current = next(
-        (item for item in state.get("attempts", []) if item.get("id") == ticket.get("current_attempt")),
-        None,
-    )
+    current = current_candidate_producer(state, ticket)
     if (
         current is None
         or current.get("kind") != "worker"
@@ -1739,6 +2714,25 @@ def validate_review_return_semantics(payload: dict[str, Any], packet: dict[str, 
             fail("review PASS contains a blocking finding")
     if not check_ids:
         fail("review return has no usable checks")
+    resolution_entries = payload.get("finding_resolution", [])
+    if resolution_entries and payload.get("verdict") != "PASS":
+        fail("finding resolution claims require a PASS review")
+    review_evidence = {
+        *payload.get("context_refs", []),
+        *(item.get("evidence_ref") for item in payload.get("checks", []) if item.get("evidence_ref")),
+        *(ref for item in payload.get("coverage", []) for ref in item.get("evidence_refs", [])),
+    }
+    seen_resolution_pairs: set[tuple[str, str]] = set()
+    for entry in resolution_entries:
+        finding_ref = safe_id(entry.get("finding_ref"), "finding resolution finding_ref")
+        candidate_ref = safe_id(entry.get("candidate_ref"), "finding resolution candidate_ref")
+        pair = (finding_ref, candidate_ref)
+        if pair in seen_resolution_pairs:
+            fail("review return repeats a finding/candidate resolution claim")
+        seen_resolution_pairs.add(pair)
+        evidence_refs = entry.get("evidence_refs", [])
+        if not evidence_refs or not set(evidence_refs).issubset(review_evidence):
+            fail(f"finding resolution evidence must resolve to this review's own evidence: {finding_ref}")
 
 
 def ledger_record_ids(state: dict[str, Any]) -> set[str]:
@@ -1945,16 +2939,19 @@ def append_review_findings(state: dict[str, Any], payload: dict[str, Any], sourc
 
 
 def base_state(control_root: Path, run_id: str, repo_root: Path, token: str) -> dict[str, Any]:
-    return {
+    state = {
         "schema_version": SCHEMA_VERSION, "run_id": run_id, "revision": 0, "previous_publication_hash": None,
         "updated_at": now(), "skill_version": SKILL_VERSION, "policy_version": POLICY_VERSION,
+        "candidate_model_version": "1.1", "candidates": [],
         "runtime_provenance": {"creation_skill_version": SKILL_VERSION, "current_schema_version": SCHEMA_VERSION, "last_mutating_skill_version": SKILL_VERSION, "compatibility_floor": COMPATIBILITY_FLOOR, "state_contract_version": STATE_CONTRACT_VERSION, "minimum_writer_version": WRITER_VERSION, "applied_migrations": []},
         "repository": {"control_root": str(control_root), "execution_root": str(repo_root), "common_dir": "", "initial_head": None, "branch": "", "checkout": str(repo_root), "inventory_ref": None, "instruction_refs": []},
         "owner": {"token": token, "epoch": 0, "observed_session": None, "handoff_ref": None, "attestation_ref": None},
         "run_settings": dict(DEFAULT_RUN_SETTINGS),
         "usage": default_usage(),
-        "lifecycle": {"phase": "PREFLIGHT", "control": "ACTIVE", "reason": None, "issue_refs": [], "stop_target": None, "next_action": {"kind": "preflight", "subject_refs": [], "preconditions": [], "read_refs": ["phases/start.md"]}},
+        "lifecycle": {"phase": "PREFLIGHT", "control": "ACTIVE", "reason": None, "issue_refs": [], "stop_target": None, "next_action": {"kind": "preflight", "subject_refs": [], "preconditions": [], "read_refs": ["phases/start.md"]}, "allowed_events": []},
     }
+    refresh_control_projection(state)
+    return state
 
 
 def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
@@ -1987,12 +2984,14 @@ def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
 def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     state, raw = load_state(p)
+    control_projection = derive_control_projection(state)
+    findings_projection = finding_obligation_projection(state)
     if args.brief:
         lifecycle = state["lifecycle"]
         usage = copy.deepcopy(state.get("usage", default_usage()))
         binding = {"revision": state.get("intent", {}).get("current_revision"), "document_ref": state.get("intent", {}).get("document_ref"), "document_hash": state.get("intent", {}).get("document_hash")}
         settings = resolved_run_settings(state)
-        brief = {"run_id": state["run_id"], "revision": state["revision"], "phase": lifecycle["phase"], "control": lifecycle["control"], "reason": lifecycle.get("reason"), "next_action": lifecycle["next_action"], "run_settings": settings, "preset_display": run_settings_display(settings), "issues": [i["id"] for i in state.get("issues", []) if i.get("impact") == "blocking" and not i.get("invalidated_by")], "findings": [f["id"] for f in state.get("findings", [])], "finding_status": [{"id": f["id"], "impact": f.get("impact"), "current": not bool(f.get("invalidated_by"))} for f in state.get("findings", [])], "reviews": [{"id": r.get("id"), "subject": r.get("subject_fingerprint"), "verdict": r.get("verdict"), "review_kind": r.get("review_kind"), "reviewer_identity": r.get("reviewer_identity"), "reviewer_role": r.get("reviewer_role"), "current": not bool(r.get("invalidated_by")), "finding_refs": r.get("finding_refs", [])} for r in state.get("reviews", [])], "design_publication": state.get("design_publication"), "design_publication_history": state.get("design_publication_history", []), "requirements_publications": state.get("requirements_publications", []), "design_review_attempts": [{"id": a.get("id"), "kind": a.get("mode"), "state": a.get("state"), "result": a.get("review_result"), "reviewer_identity": a.get("reviewer_identity"), "reviewer_role": a.get("reviewer_role")} for a in state.get("attempts", []) if a.get("mode") in ("coverage", "plan")], "adjudications": [d.get("id") for d in state.get("decisions", []) if d.get("type") == "reviewer_adjudication"], "intent": binding, "version_provenance": state.get("runtime_provenance", {"creation_skill_version": state.get("skill_version"), "current_schema_version": state.get("schema_version"), "last_mutating_skill_version": state.get("skill_version"), "compatibility_floor": COMPATIBILITY_FLOOR, "applied_migrations": []}), "consumer_invalidation_count": len(state.get("invalidations", [])), "usage": usage, "evidence_count": len(state.get("evidence", [])), "ledger_bytes": len(raw), "ledger_hash": sha256_bytes(raw)}
+        brief = {"run_id": state["run_id"], "revision": state["revision"], "phase": lifecycle["phase"], "control": lifecycle["control"], "reason": lifecycle.get("reason"), "next_action": control_projection["next_action"], "allowed_events": control_projection["allowed_events"], "run_settings": settings, "preset_display": run_settings_display(settings), "issues": [i["id"] for i in state.get("issues", []) if i.get("impact") == "blocking" and not i.get("invalidated_by")], "findings": [f["id"] for f in state.get("findings", [])], "finding_status": [{"id": f["id"], "impact": f.get("impact"), "status": next((item["status"] for item in findings_projection["items"] if item["finding_ref"] == f["id"]), "unbound"), "current": next((item["current_applicability"] for item in findings_projection["items"] if item["finding_ref"] == f["id"]), False)} for f in state.get("findings", [])], "finding_projection": findings_projection, "candidates": state.get("candidates", []), "reviews": [{"id": r.get("id"), "subject": r.get("subject_fingerprint"), "verdict": r.get("verdict"), "review_kind": r.get("review_kind"), "reviewer_identity": r.get("reviewer_identity"), "reviewer_role": r.get("reviewer_role"), "current": not bool(r.get("invalidated_by")), "finding_refs": r.get("finding_refs", [])} for r in state.get("reviews", [])], "design_publication": state.get("design_publication"), "design_publication_history": state.get("design_publication_history", []), "requirements_publications": state.get("requirements_publications", []), "design_review_attempts": [{"id": a.get("id"), "kind": a.get("mode"), "state": a.get("state"), "result": a.get("review_result"), "reviewer_identity": a.get("reviewer_identity"), "reviewer_role": a.get("reviewer_role")} for a in state.get("attempts", []) if a.get("mode") in ("coverage", "plan")], "adjudications": [d.get("id") for d in state.get("decisions", []) if d.get("type") == "reviewer_adjudication"], "intent": binding, "version_provenance": state.get("runtime_provenance", {"creation_skill_version": state.get("skill_version"), "current_schema_version": state.get("schema_version"), "last_mutating_skill_version": state.get("skill_version"), "compatibility_floor": COMPATIBILITY_FLOOR, "applied_migrations": []}), "consumer_invalidation_count": len(state.get("invalidations", [])), "usage": usage, "evidence_count": len(state.get("evidence", [])), "ledger_bytes": len(raw), "ledger_hash": sha256_bytes(raw)}
         brief["usage"]["counters"]["brief_bytes"] = len(canonical_bytes(brief))
         return brief
     settings = resolved_run_settings(state)
@@ -2000,8 +2999,20 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         item["id"] for item in state.get("issues", [])
         if item.get("impact") == "blocking" and not item.get("invalidated_by")
     ]
-    current_findings = [item for item in state.get("findings", []) if not item.get("invalidated_by")]
-    return {"run_id": state["run_id"], "revision": state["revision"], "phase": state["lifecycle"]["phase"], "control": state["lifecycle"]["control"], "next_action": state["lifecycle"]["next_action"], "run_settings": settings, "preset_display": run_settings_display(settings), "ticket_counts": {s: sum(1 for t in state.get("tickets", []) if t.get("state") == s) for s in ("PLANNED", "READY", "RUNNING", "CANDIDATE", "REVIEW", "INTEGRATED", "BLOCKED", "STALE")}, "attempts": len(state.get("attempts", [])), "blockers": current_blockers, "finding_counts": {"current": len(current_findings), "historical": len(state.get("findings", [])) - len(current_findings), "total": len(state.get("findings", []))}, "ledger_hash": sha256_bytes(raw)}
+    status_counts = {kind: sum(1 for item in findings_projection["items"] if item["status"] == kind) for kind in ("current", "historical", "unbound", "resolved", "superseded")}
+    legacy_current_findings = sum(1 for item in state.get("findings", []) if not item.get("invalidated_by"))
+    return {
+        "run_id": state["run_id"], "revision": state["revision"],
+        "phase": state["lifecycle"]["phase"], "control": state["lifecycle"]["control"],
+        "next_action": control_projection["next_action"], "allowed_events": control_projection["allowed_events"],
+        "run_settings": settings, "preset_display": run_settings_display(settings),
+        "ticket_counts": {s: sum(1 for t in state.get("tickets", []) if t.get("state") == s) for s in ("PLANNED", "READY", "RUNNING", "CANDIDATE", "REVIEW", "INTEGRATED", "BLOCKED", "STALE")},
+        "attempts": len(state.get("attempts", [])), "blockers": current_blockers,
+        "finding_counts": {"current": legacy_current_findings, "historical": len(state.get("findings", [])) - legacy_current_findings, "total": len(state.get("findings", []))},
+        "finding_status_counts": status_counts,
+        "finding_projection": findings_projection, "candidates": state.get("candidates", []),
+        "ledger_hash": sha256_bytes(raw),
+    }
 
 
 def cmd_publish_usage(args: argparse.Namespace) -> dict[str, Any]:
@@ -2015,6 +3026,7 @@ def cmd_publish_usage(args: argparse.Namespace) -> dict[str, Any]:
     event_ref = f"objects/{event_hash}"
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
+        admit_event(state, "usage.publish")
         usage = state.setdefault("usage", default_usage())
         usage.setdefault("counters", zero_usage()); usage.setdefault("trace", []); usage.setdefault("shared_setup", zero_usage()); usage.setdefault("gate_costs", {f"G{i}": zero_usage() for i in range(7)})
         if event["id"] in {item.get("id") for item in usage["trace"]}:
@@ -2434,6 +3446,7 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token)
+        admit_event(state, "attempt.ingest")
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
             fail("terminal run is immutable; start a successor run")
         attempt = attempt_by_id(state, args.attempt_id)
@@ -2467,6 +3480,10 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
             if target.get("lease", {}).get("state") == "active":
                 target["lease"]["state"] = "released"
         target["finding_refs"] = append_review_findings(next_state, payload, args.attempt_id, digest, packet=packet if args.kind == "review" else None, subject_ref=target.get("subject_ref"))
+        if args.kind == "worker":
+            ticket_for_attempt = next((item for item in next_state.get("tickets", []) if item.get("id") == target.get("subject_ref")), None)
+            if ticket_for_attempt and ticket_for_attempt.get("current_worker_attempt") == target.get("id"):
+                ticket_for_attempt["current_worker_attempt"] = None
         write_set_violations = worker_return_write_set_violations(payload, attempt.get("lease", {})) if args.kind == "worker" else []
         if write_set_violations:
             issue_id = append_issue(next_state, {
@@ -2503,7 +3520,7 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
             }
         if args.kind == "review" and payload.get("verdict") == "PASS":
             ticket = next((item for item in next_state.get("tickets", []) if item.get("id") == target.get("subject_ref")), None)
-            worker = next((item for item in next_state.get("attempts", []) if item.get("id") == (ticket or {}).get("current_attempt") and item.get("kind") == "worker"), None)
+            worker = current_candidate_producer(next_state, ticket) if ticket else None
             if ticket and worker and worker.get("continuation_ref"):
                 next_state["lifecycle"]["control"] = "BLOCKED"
                 next_state["lifecycle"]["reason"] = "blocked_continuation_candidate_reviewed"
@@ -2513,10 +3530,15 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
                     "preconditions": ["external/out-of-scope blocker remains durable", "review PASS does not mark the ticket DONE or INTEGRATED"],
                     "read_refs": ["phases/execute.md", "references/routing.md"],
                 }
+        if args.kind == "review" and target.get("subject_ref") in {item.get("id") for item in next_state.get("tickets", [])}:
+            reviewed_ticket = next(item for item in next_state["tickets"] if item.get("id") == target.get("subject_ref"))
+            candidate = current_candidate_record(next_state, reviewed_ticket)
+            if candidate and target.get("candidate_sha") == candidate.get("sha"):
+                candidate["review_status"] = payload.get("verdict") if payload.get("verdict") in ("PASS", "BLOCK") else "PENDING"
         if args.kind == "review":
             review_id = f"REV-{digest[:16]}"
             if review_id not in {item.get("id") for item in next_state.get("reviews", [])}:
-                review = {"id": review_id, "mandate": stored_payload(p, target.get("packet_ref"), "review packet").get("mandate", "review"), "subject_fingerprint": payload.get("subject_fingerprint", ""), "verdict": payload.get("verdict"), "return_ref": f"objects/{digest}", "context_refs": payload.get("context_refs", []), "finding_refs": target["finding_refs"], "intent_revision": next_state.get("intent", {}).get("current_revision"), "reviewer_identity": target.get("reviewer_identity"), "reviewer_role": target.get("reviewer_role"), "review_kind": target.get("mode") if target.get("mode") in ("coverage", "plan") else None, "target_artifact_refs": target.get("target_artifact_refs", []), "target_artifact_versions": target.get("target_artifact_versions", []), "target_revision": target.get("target_revision"), "invalidated_by": []}
+                review = {"id": review_id, "mandate": stored_payload(p, target.get("packet_ref"), "review packet").get("mandate", "review"), "subject_fingerprint": payload.get("subject_fingerprint", ""), "verdict": payload.get("verdict"), "accepted": False, "return_ref": f"objects/{digest}", "context_refs": payload.get("context_refs", []), "finding_refs": target["finding_refs"], "finding_resolution": copy.deepcopy(payload.get("finding_resolution", [])), "intent_revision": next_state.get("intent", {}).get("current_revision"), "reviewer_identity": target.get("reviewer_identity"), "reviewer_role": target.get("reviewer_role"), "review_kind": target.get("mode") if target.get("mode") in ("coverage", "plan") else None, "target_artifact_refs": target.get("target_artifact_refs", []), "target_artifact_versions": target.get("target_artifact_versions", []), "target_revision": target.get("target_revision"), "invalidated_by": []}
                 next_state.setdefault("reviews", []).append(review)
             current_review = next(item for item in next_state.get("reviews", []) if item.get("id") == review_id)
             prior = [
@@ -2584,12 +3606,18 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
     observed, _ = load_mutation_state(p, args.owner_token)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
+    admit_event(observed, "worker.dispatch")
+    if observed.get("lifecycle", {}).get("control") == "BLOCKED" and packet.get("mode") != "repair":
+        fail("BLOCKED dispatch requires an explicitly authorized repair packet")
     existing_attempt = next((item for item in observed.get("attempts", []) if item.get("id") == args.attempt_id), None)
     if existing_attempt:
         if existing_attempt.get("packet_hash") == packet_hash and existing_attempt.get("subject_ref") == args.ticket_id and existing_attempt.get("route_ref") == args.route_id:
             return {"prepared": True, "idempotent": True, "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": observed["revision"]}
         fail("attempt ID already exists with conflicting dispatch")
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "worker.dispatch")
+        if state.get("lifecycle", {}).get("control") == "BLOCKED" and packet.get("mode") != "repair":
+            fail("BLOCKED dispatch requires an explicitly authorized repair packet")
         ticket = next((t for t in state.get("tickets", []) if t.get("id") == args.ticket_id), None)
         if ticket is None:
             fail("dispatch references unknown ticket")
@@ -2637,6 +3665,9 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": len(packet_raw), "spawn_calls": 1})
         ticket["state"] = "RUNNING"
         ticket["current_attempt"] = args.attempt_id
+        if state.get("candidate_model_version") == "1.1":
+            ticket["current_worker_attempt"] = args.attempt_id
+            ticket["last_worker_attempt"] = args.attempt_id
         if route:
             route_record = dict(route)
             route_record.setdefault("id", args.route_id)
@@ -2648,6 +3679,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_ready_ticket(args: argparse.Namespace) -> dict[str, Any]:
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "ticket.ready")
         if state["lifecycle"]["phase"] != "EXECUTE" or state["lifecycle"]["control"] != "ACTIVE":
             fail("ticket readiness requires ACTIVE EXECUTE")
         publication = current_design_publication(state)
@@ -2681,6 +3713,7 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
         fail("repair contract finding_ref does not match the command")
 
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "repair.authorize")
         ticket = next((item for item in state.get("tickets", []) if item.get("id") == args.ticket_id), None)
         prior_authorization = active_repair_authorization(state, args.ticket_id, args.finding_ref) if ticket else None
         authorization_consumed = bool(
@@ -2726,13 +3759,29 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
             fail("repair authorization requires a current blocking finding/issue")
         if args.ticket_id not in record.get("affected_refs", []):
             fail("repair authorization finding/issue is not bound to this ticket")
+        projection = finding_obligation_projection(state)
+        projected_finding = next((item for item in projection["items"] if item.get("finding_ref") == args.finding_ref), None)
+        projected_issue = next((item for item in projection["mirrored_issues"] if item.get("issue_ref") == args.finding_ref), None)
+        if finding is not None:
+            unresolved_ticket_refs = projected_finding.get(
+                "unresolved_ticket_refs", projected_finding.get("affected_ticket_refs", [])
+            ) if projected_finding else []
+            if (
+                projected_finding is None or not projected_finding.get("repairable")
+                or args.ticket_id not in unresolved_ticket_refs
+            ):
+                fail("repair authorization requires a current repairable finding obligation in the shared projection")
+        elif (
+            projected_issue is None or not projected_issue.get("repairable")
+            or args.ticket_id not in record.get("affected_refs", [])
+        ):
+            fail("repair authorization requires a current repairable issue in the shared projection")
         if any(item.get("id") == args.authorization_id for item in state.get("decisions", [])):
             fail("repair authorization ID already exists")
         if repair_requires_transitive_create_modify_provenance(p, state, ticket):
-            current = next(
-                item for item in state.get("attempts", [])
-                if item.get("id") == ticket.get("current_attempt")
-            )
+            current = current_candidate_producer(state, ticket)
+            if current is None:
+                fail("repair authorization requires an explicit current candidate producer")
             repair_candidate_worker(state, ticket, contract, current["candidate_sha"])
         continuation_blocker_refs = {
             decision.get("blocker_ref")
@@ -2751,6 +3800,18 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
                 for issue in state.get("issues", [])
             )
         )
+        unrelated_blockers = [
+            item for item in state.get("issues", [])
+            if item.get("impact") == "blocking"
+            and not item.get("invalidated_by")
+            and item.get("id") != args.finding_ref
+            and item.get("finding_ref") != args.finding_ref
+        ]
+        unrelated_obligations = [
+            item for item in projection["obligations"]
+            if item.get("status") != "closed" and item.get("finding_ref") != args.finding_ref
+        ]
+        preserve_blocked_control = preserve_blocked_control or bool(unrelated_blockers or unrelated_obligations)
         for attempt in state.get("attempts", []):
             if attempt.get("subject_ref") == args.ticket_id and attempt.get("state") in ("PREPARED", "DISPATCHED"):
                 fail("repair authorization requires stopped attempts")
@@ -2786,6 +3847,7 @@ def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
         fail("lease release requires PASS writer_stopped evidence")
 
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "attempt.reconcile")
         attempt = attempt_by_id(state, args.attempt_id)
         if attempt.get("state") not in ("PREPARED", "DISPATCHED"):
             fail("only an in-flight attempt may be terminated")
@@ -2797,6 +3859,8 @@ def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
         ticket = next((item for item in state.get("tickets", []) if item.get("current_attempt") == args.attempt_id), None)
         if ticket and ticket.get("state") not in ("INTEGRATED", "CANCELLED", "STALE"):
             ticket["state"] = "BLOCKED"
+        if ticket and ticket.get("current_worker_attempt") == args.attempt_id:
+            ticket["current_worker_attempt"] = None
         ev_id = f"ev-{evidence_digest[:16]}"
         if ev_id not in {item.get("id") for item in state.get("evidence", [])}:
             state.setdefault("evidence", []).append({"id": ev_id, "hash": evidence_digest, "source": "attempt_termination", "scenario": args.state, "outcome": args.lease_state, "observer": "ledger-helper", "subject": args.attempt_id})
@@ -2819,11 +3883,23 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
     observed_attempt = attempt_by_id(observed, args.attempt_id)
+    admit_event(observed, "candidate.publish")
     observed_operation = next((item for item in observed.get("operations", []) if item.get("id") == args.operation_id), None)
     observed_ticket = next((item for item in observed.get("tickets", []) if item.get("id") == observed_attempt.get("subject_ref")), None)
-    if observed_attempt.get("candidate_sha") == receipt["commit_sha"] and observed_attempt.get("candidate_tree_sha") == receipt["tree_sha"] and observed_operation and observed_operation.get("state") == "applied" and observed_ticket and observed_ticket.get("state") in ("CANDIDATE", "REVIEW", "INTEGRATED"):
+    observed_candidate = current_candidate_record(observed, observed_ticket) if observed_ticket else None
+    observed_producer = current_candidate_producer(observed, observed_ticket) if observed_ticket else None
+    if (
+        observed_candidate and observed_candidate.get("quality") == "DONE"
+        and observed_producer and observed_producer.get("id") == args.attempt_id
+        and observed_candidate.get("sha") == receipt["commit_sha"]
+        and observed_candidate.get("tree_sha") == receipt["tree_sha"]
+        and observed_operation and observed_operation.get("state") == "applied"
+        and observed_ticket and observed_ticket.get("state") in ("CANDIDATE", "REVIEW", "INTEGRATED")
+    ):
         return {"candidate": receipt["commit_sha"], "idempotent": True, "revision": observed["revision"], "next_action": observed["lifecycle"]["next_action"]}
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "candidate.publish")
+        control = state.get("lifecycle", {}).get("control")
         attempt = attempt_by_id(state, args.attempt_id)
         if attempt["state"] != "RETURNED":
             fail("candidate requires a validated RETURNED worker attempt")
@@ -2834,6 +3910,43 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
         worker_return = stored_payload(p, attempt.get("return_ref"), "worker return")
         if worker_return.get("status") != "DONE":
             fail("only a semantically complete worker DONE return may become a candidate; BLOCKED/FAILED/HANDOFF are durable non-candidate outcomes")
+        if control == "BLOCKED":
+            blocked_attempt = attempt
+            blocked_ticket = next((item for item in state.get("tickets", []) if blocked_attempt and item.get("id") == blocked_attempt.get("subject_ref")), None)
+            blocked_operation = next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None)
+            repair_contract = blocked_attempt.get("repair_contract") if blocked_attempt else None
+            repair_finding_ref = repair_contract.get("finding_ref") if isinstance(repair_contract, dict) else None
+            authorization = active_repair_authorization(state, blocked_ticket.get("id"), repair_finding_ref) if blocked_ticket and repair_finding_ref else None
+            same_checkout = bool(
+                blocked_attempt and isinstance(blocked_attempt.get("checkout"), str) and blocked_attempt.get("checkout")
+                and blocked_operation and isinstance(blocked_operation.get("target"), str) and blocked_operation.get("target")
+                and isinstance(receipt.get("checkout"), str) and receipt.get("checkout")
+                and Path(blocked_attempt["checkout"]).expanduser().resolve() == Path(blocked_operation["target"]).expanduser().resolve()
+                and Path(blocked_attempt["checkout"]).expanduser().resolve() == Path(receipt["checkout"]).expanduser().resolve()
+            )
+            exact_blocked_repair = bool(
+                blocked_attempt and blocked_ticket and blocked_operation and authorization
+                and blocked_attempt.get("kind") == "worker"
+                and blocked_attempt.get("mode") == "repair"
+                and blocked_attempt.get("state") == "RETURNED"
+                and blocked_attempt.get("repair_authorization_ref") == authorization.get("id")
+                and blocked_attempt.get("candidate_sha") is None
+                and blocked_ticket.get("current_attempt") == blocked_attempt.get("id")
+                and blocked_ticket.get("last_worker_attempt") == blocked_attempt.get("id")
+                and blocked_ticket.get("current_worker_attempt") is None
+                and blocked_operation.get("kind") == "candidate_commit"
+                and blocked_operation.get("state") == "prepared"
+                and blocked_operation.get("authority_ref") == authorization.get("id")
+                and blocked_operation.get("expected_before") == blocked_attempt.get("base_sha")
+                and blocked_operation.get("intended_after") in (None, receipt.get("commit_sha"))
+                and receipt.get("authority_ref") == authorization.get("id")
+                and receipt.get("base_sha") == blocked_attempt.get("base_sha")
+                and same_checkout
+            )
+            if not exact_blocked_repair:
+                fail("BLOCKED candidate publication requires the exact current authorized repair worker and prepared candidate_commit proof")
+        elif control != "ACTIVE":
+            fail("ordinary candidate publication requires ACTIVE control")
         if receipt.get("base_sha") and attempt.get("base_sha") and receipt["base_sha"] != attempt["base_sha"]:
             fail("candidate base SHA mismatch")
         operation = next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None)
@@ -2851,6 +3964,8 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
         ticket = next((t for t in state.get("tickets", []) if t.get("id") == attempt.get("subject_ref")), None)
         if ticket:
             ticket["state"] = "CANDIDATE"
+            if state.get("candidate_model_version") == "1.1":
+                publish_candidate_projection(state, ticket, attempt, quality="DONE")
         operation["state"] = "applied"
         operation["target"] = receipt.get("checkout", operation.get("target", ""))
         operation["expected_before"] = receipt.get("base_sha", operation.get("expected_before"))
@@ -2973,6 +4088,9 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
         fail("owner token mismatch; stale orchestrator is fenced")
     observed_attempt = attempt_by_id(observed, args.attempt_id)
     observed_ticket = next((item for item in observed.get("tickets", []) if item.get("id") == args.ticket_id), None)
+    admit_event(observed, "candidate.publish")
+    observed_candidate = current_candidate_record(observed, observed_ticket) if observed_ticket else None
+    observed_producer = current_candidate_producer(observed, observed_ticket) if observed_ticket else None
     if observed_attempt.get("continuation_ref"):
         existing = continuation_candidate_receipt(p, observed, observed_ticket or {}, observed_attempt)
         if (
@@ -2980,11 +4098,16 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
             and commit_receipt.get("commit_sha") == observed_attempt.get("candidate_sha")
             and commit_receipt.get("tree_sha") == observed_attempt.get("candidate_tree_sha")
             and existing.get("operation_id") == args.operation_id
+            and observed_candidate is not None
+            and observed_candidate.get("quality") == "CONTINUATION"
+            and observed_producer is not None
+            and observed_producer.get("id") == args.attempt_id
         ):
             return {"candidate": observed_attempt["candidate_sha"], "continuation_ref": observed_attempt["continuation_ref"], "idempotent": True, "revision": observed["revision"], "control": observed["lifecycle"]["control"]}
         fail("attempt already has a different preserved continuation candidate")
 
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "candidate.publish")
         if state["lifecycle"].get("control") != "BLOCKED":
             fail("continuation preservation requires lifecycle control BLOCKED")
         attempt = attempt_by_id(state, args.attempt_id)
@@ -3145,6 +4268,7 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
         attempt["candidate_tree_sha"] = tree_sha
         attempt["continuation_ref"] = continuation_ref
         attempt["continuation_authorization_ref"] = authorization["id"]
+        publish_candidate_projection(state, ticket, attempt, quality="CONTINUATION", blocker_refs=[blocker_ref])
         operation["state"] = "applied"
         operation["target"] = str(checkout)
         operation["expected_before"] = attempt["base_sha"]
@@ -3180,6 +4304,7 @@ def cmd_prepare_effect(args: argparse.Namespace) -> dict[str, Any]:
     observed, _ = load_mutation_state(p, args.owner_token)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
+    admit_event(observed, "effect.prepare")
     existing = next((item for item in observed.get("operations", []) if item.get("id") == args.operation_id), None)
     proposed = {"kind": args.kind, "target": args.target, "expected_before": args.expected_before, "intended_after": args.intended_after, "authority_ref": args.authority_ref}
     if existing:
@@ -3187,9 +4312,62 @@ def cmd_prepare_effect(args: argparse.Namespace) -> dict[str, Any]:
             return {"prepared": True, "idempotent": True, "operation_id": args.operation_id, "revision": observed["revision"], "state": existing.get("state")}
         fail("operation ID already exists with conflicting parameters")
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "effect.prepare")
         safe_id(args.operation_id, "operation_id")
         if any(item.get("id") == args.operation_id for item in state.get("operations", [])):
             fail("operation ID already exists")
+        if state.get("lifecycle", {}).get("control") == "BLOCKED":
+            if args.kind != "candidate_commit" or not args.authority_ref:
+                fail("BLOCKED effect preparation is restricted to an owner-authorized continuation candidate commit")
+            continuation_attempt = next(
+                (
+                    attempt for attempt in state.get("attempts", [])
+                    if attempt.get("kind") == "worker"
+                    and attempt.get("state") == "RETURNED"
+                    and attempt.get("subject_ref") in {ticket.get("id") for ticket in state.get("tickets", []) if ticket.get("state") == "BLOCKED"}
+                    and attempt.get("checkout")
+                    and Path(attempt["checkout"]).expanduser().resolve() == Path(args.target).expanduser().resolve()
+                    and attempt.get("base_sha") == args.expected_before
+                ),
+                None,
+            )
+            blocker = next(
+                (
+                    issue for issue in state.get("issues", [])
+                    if issue.get("impact") == "blocking"
+                    and not issue.get("invalidated_by")
+                    and continuation_attempt
+                    and issue.get("source_ref") == continuation_attempt.get("id")
+                ),
+                None,
+            )
+            if continuation_attempt is None or blocker is None:
+                repair_attempt = next((
+                    attempt for attempt in state.get("attempts", [])
+                    if attempt.get("kind") == "worker"
+                    and attempt.get("mode") == "repair"
+                    and attempt.get("state") == "RETURNED"
+                    and attempt.get("repair_authorization_ref") == args.authority_ref
+                    and attempt.get("checkout")
+                    and Path(attempt["checkout"]).expanduser().resolve() == Path(args.target).expanduser().resolve()
+                    and attempt.get("base_sha") == args.expected_before
+                    and isinstance(attempt.get("repair_contract"), dict)
+                ), None)
+                repair_contract = repair_attempt.get("repair_contract", {}) if repair_attempt else {}
+                repair_ticket = next((
+                    item for item in state.get("tickets", [])
+                    if repair_attempt and item.get("id") == repair_attempt.get("subject_ref")
+                ), None)
+                authorization = active_repair_authorization(
+                    state, repair_ticket.get("id"), repair_contract.get("finding_ref")
+                ) if repair_ticket and repair_contract.get("finding_ref") else None
+                if (
+                    repair_attempt is None
+                    or repair_ticket is None
+                    or authorization is None
+                    or authorization.get("id") != args.authority_ref
+                ):
+                    fail("BLOCKED candidate_commit must bind an exact authorized continuation or current repair worker")
         state.setdefault("operations", []).append({"id": args.operation_id, "kind": args.kind, "target": args.target, "state": "prepared", "expected_before": args.expected_before, "intended_after": args.intended_after, "authority_ref": args.authority_ref, "receipt_ref": None})
         state["lifecycle"]["next_action"] = {"kind": "apply_prepared_effect", "subject_refs": [args.operation_id], "preconditions": ["native approved effect", "same target and expected-before", "receipt or reconciliation evidence"], "read_refs": ["references/ledger.md", "references/safety.md"]}
     result = transaction(p, args.owner_token, args.revision, change, "effect-prepared")
@@ -3209,10 +4387,12 @@ def cmd_reconcile_effect(args: argparse.Namespace) -> dict[str, Any]:
     observed, _ = load_mutation_state(p, args.owner_token)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
+    admit_event(observed, "effect.reconcile")
     observed_operation = next((item for item in observed.get("operations", []) if item.get("id") == args.operation_id), None)
     if observed_operation and observed_operation.get("state") == args.result and observed_operation.get("receipt_ref") == receipt_ref:
         return {"reconciled": True, "idempotent": True, "operation_id": args.operation_id, "state": args.result, "revision": observed["revision"]}
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "effect.reconcile")
         operation = next((item for item in state.get("operations", []) if item.get("id") == args.operation_id), None)
         if operation is None:
             fail("unknown operation")
@@ -3272,11 +4452,12 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
     packet_raw = packet_path.read_bytes()
     packet_hash = sha256_bytes(packet_raw)
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "review.dispatch")
         ticket = next((t for t in state.get("tickets", []) if t.get("id") == args.ticket_id), None)
         is_blocked_continuation = bool(ticket and ticket.get("state") == "BLOCKED" and state["lifecycle"].get("control") == "BLOCKED")
         if ticket is None or (ticket.get("state") not in ("CANDIDATE", "REVIEW") and not is_blocked_continuation):
             fail("review preparation requires a CANDIDATE/REVIEW ticket or a BLOCKED continuation candidate")
-        worker = next((a for a in state.get("attempts", []) if a.get("id") == ticket.get("current_attempt") and a.get("kind") == "worker"), None)
+        worker = current_candidate_producer(state, ticket)
         if worker is None or not worker.get("candidate_sha"):
             fail("review preparation requires a frozen worker candidate")
         if is_blocked_continuation:
@@ -3332,6 +4513,7 @@ def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
     packet_hash = sha256_bytes(packet_raw)
 
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "review.dispatch")
         if state["lifecycle"]["phase"] != "DESIGN" and not (args.review_kind == "plan" and state["lifecycle"]["phase"] == "PLAN"):
             fail("design review preparation requires DESIGN phase (or PLAN for a plan review)")
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
@@ -3412,6 +4594,7 @@ def cmd_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
         fail("adjudication requires a reason and evidence references")
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
+        admit_event(state, "review.adjudicate")
         if decision["id"] in {item.get("id") for item in state.get("decisions", [])}:
             fail("decision ID already exists")
         review_ids = set(decision.get("supersedes", []))
@@ -3431,10 +4614,25 @@ def cmd_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
             if issue.get("type") == "reviewer_disagreement" and (not review_ids or set(issue.get("affected_refs", [])) & review_ids):
                 issue["decision_ref"] = decision["id"]
                 issue["disposition"] = "resolved by adjudication" if decision["decision"] == "PASS" else "adjudicated BLOCK"
+                if decision["decision"] == "PASS":
+                    issue["impact"] = "advisory"
         if decision["decision"] == "PASS":
-            state["lifecycle"]["control"] = "ACTIVE"
-            state["lifecycle"]["reason"] = "reviewer_disagreement_adjudicated"
-            state["lifecycle"]["next_action"] = {"kind": "continue_after_adjudication", "subject_refs": sorted(review_ids), "preconditions": ["re-read adjudication evidence", "candidate remains unchanged"], "read_refs": ["contracts/reviewer.md", "references/routing.md"]}
+            other_blockers = [
+                item for item in state.get("issues", [])
+                if item.get("impact") == "blocking" and not item.get("invalidated_by")
+            ]
+            open_obligations = [
+                item for item in finding_obligation_projection(state)["obligations"]
+                if item.get("status") != "closed"
+            ]
+            if other_blockers or open_obligations:
+                state["lifecycle"]["control"] = "BLOCKED"
+                state["lifecycle"]["reason"] = "reviewer_disagreement_adjudicated_with_open_obligations"
+                state["lifecycle"]["next_action"] = {"kind": "repair_or_user_decision", "subject_refs": sorted(review_ids), "preconditions": ["adjudication PASS recorded", "resolve remaining blocking issues and verification obligations"], "read_refs": ["phases/execute.md", "contracts/reviewer.md", "references/routing.md"]}
+            else:
+                state["lifecycle"]["control"] = "ACTIVE"
+                state["lifecycle"]["reason"] = "reviewer_disagreement_adjudicated"
+                state["lifecycle"]["next_action"] = {"kind": "continue_after_adjudication", "subject_refs": sorted(review_ids), "preconditions": ["re-read adjudication evidence", "candidate remains unchanged"], "read_refs": ["contracts/reviewer.md", "references/routing.md"]}
         else:
             state["lifecycle"]["control"] = "BLOCKED"
             state["lifecycle"]["reason"] = "reviewer_disagreement_adjudicated_not_pass"
@@ -3456,17 +4654,30 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
         if attempt.get("kind") != "review" or attempt.get("mode") == "user_assisted":
             fail("integration requires a separate immutable reviewer attempt")
         linked_ticket = next((item for item in state.get("tickets", []) if item.get("id") == attempt.get("subject_ref")), None)
-        linked_worker = next((item for item in state.get("attempts", []) if item.get("id") == (linked_ticket or {}).get("current_attempt") and item.get("kind") == "worker"), None)
+        linked_candidate = current_candidate_record(state, linked_ticket) if linked_ticket else None
+        linked_worker = current_candidate_producer(state, linked_ticket) if linked_ticket else None
+        if state.get("candidate_model_version") == "1.1" and linked_ticket and (linked_candidate is None or linked_worker is None):
+            fail("integration requires the explicit current candidate and its producer attempt")
+        if linked_candidate and linked_candidate.get("quality") == "CONTINUATION":
+            fail("continuation-only candidate cannot be integrated (quality CONTINUATION); resolve its blocker through an authorized repair and fresh review")
         if linked_worker and linked_worker.get("continuation_ref"):
             fail("continuation-only candidate cannot be integrated; resolve its blocker through an authorized repair and fresh review")
+        admit_event(state, "review.integrate")
         existing_review = next((item for item in state.get("reviews", []) if item.get("id") == args.review_id), None)
         if existing_review is not None:
             ticket = next((t for t in state.get("tickets", []) if t.get("id") == attempt.get("subject_ref")), None)
-            worker = next((item for item in state.get("attempts", []) if item.get("id") == (ticket or {}).get("current_attempt") and item.get("kind") == "worker"), None)
+            candidate = current_candidate_record(state, ticket) if ticket else None
+            worker = current_candidate_producer(state, ticket) if ticket else None
             if existing_review.get("verdict") != "PASS" or existing_review.get("subject_fingerprint") != attempt.get("candidate_sha"):
                 fail("existing integration review does not match this candidate")
-            if ticket is None or ticket.get("state") != "INTEGRATED" or worker is None or worker.get("candidate_sha") != attempt.get("candidate_sha"):
+            if (
+                ticket is None or ticket.get("state") != "INTEGRATED" or worker is None
+                or worker.get("candidate_sha") != attempt.get("candidate_sha")
+                or (candidate and candidate.get("quality") == "CONTINUATION")
+            ):
                 fail("existing integration state does not match this candidate")
+            if open_ticket_finding_obligations(state, ticket["id"]):
+                fail("existing integration retains unresolved ticket-scoped finding obligations")
             if attempt.get("lease", {}).get("state") not in ("active", "released") or worker.get("lease", {}).get("state") not in ("active", "released"):
                 fail("existing integration has a non-releasable lease state")
             if attempt.get("lease", {}).get("state") == "released" and worker.get("lease", {}).get("state") == "released":
@@ -3508,32 +4719,144 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
         next_attempt["lease"]["state"] = "released"
         next_attempt["state"] = "RETURNED"
         next_attempt["return_source_revision"] = packet_identity(review).get("source_revision", next_attempt.get("packet_source_revision"))
+        review_id = args.review_id
+        next_state.setdefault("reviews", []).append({
+            "id": review_id, "mandate": packet.get("mandate", "change"),
+            "subject_fingerprint": subject, "verdict": "PASS",
+            "accepted": True,
+            "return_ref": f"objects/{digest}", "context_refs": review.get("context_refs", []),
+            "finding_refs": next_attempt["finding_refs"],
+            "finding_resolution": copy.deepcopy(review.get("finding_resolution", [])),
+            "intent_revision": next_state.get("intent", {}).get("current_revision"),
+            "invalidated_by": [],
+        })
         ticket = next((t for t in next_state.get("tickets", []) if t.get("id") == next_attempt.get("subject_ref")), None)
+        if review.get("finding_resolution") and ticket is None:
+            fail("finding resolution contract requires a ticket-scoped candidate review")
+        finding_projection = finding_obligation_projection(next_state)
         if ticket:
-            worker = next((item for item in next_state.get("attempts", []) if item.get("id") == ticket.get("current_attempt") and item.get("kind") == "worker"), None)
+            candidate = current_candidate_record(next_state, ticket)
+            worker = current_candidate_producer(next_state, ticket)
             if worker is None or worker.get("candidate_sha") != next_attempt.get("candidate_sha"):
-                fail("integration requires the linked worker candidate")
+                fail("integration requires the explicit current worker candidate")
+            if candidate is not None and candidate.get("quality") == "CONTINUATION":
+                fail("continuation-only candidate cannot be integrated (quality CONTINUATION)")
             if worker.get("lease", {}).get("state") not in ("active", "released"):
                 fail("linked worker lease is not releasable")
             worker["lease"]["state"] = "released"
-            ticket["state"] = "INTEGRATED"
-            repair_ref = worker.get("repair_contract", {}).get("finding_ref")
-            if repair_ref:
-                for issue in next_state.get("issues", []):
-                    if issue.get("id") == repair_ref or issue.get("finding_ref") == repair_ref or (issue.get("type") in ("review_verdict", "review_finding") and ticket["id"] in issue.get("affected_refs", [])):
-                        issue["impact"] = "advisory"
-                        issue["disposition"] = f"resolved by reviewed repair {args.review_id}"
-                        if args.review_id not in issue.setdefault("invalidated_by", []):
-                            issue["invalidated_by"].append(args.review_id)
-                for finding in next_state.get("findings", []):
-                    if finding.get("id") == repair_ref and args.review_id not in finding.setdefault("invalidated_by", []):
-                        finding["invalidated_by"].append(args.review_id)
+            resolution_contracts = review.get("finding_resolution", [])
+            initially_open_ticket_findings = {
+                item.get("finding_ref") for item in finding_projection["obligations"]
+                if ticket["id"] in item.get("ticket_refs", []) and item.get("status") != "closed"
+            }
+            seen_resolution_findings: set[str] = set()
+            for resolution_index, resolution in enumerate(resolution_contracts, start=1):
+                repair_ref = resolution["finding_ref"]
+                candidate_ref = resolution["candidate_ref"]
+                finding = next((item for item in next_state.get("findings", []) if item.get("id") == repair_ref), None)
+                if (
+                    candidate is None
+                    or candidate_ref != candidate.get("id")
+                    or finding is None
+                    or ticket["id"] not in finding.get("affected_refs", [])
+                    or repair_ref not in initially_open_ticket_findings
+                    or repair_ref in seen_resolution_findings
+                ):
+                    fail("finding resolution must name an open finding on this ticket and the exact current candidate")
+                seen_resolution_findings.add(repair_ref)
+                resolution_id = f"finding-resolution-{review_id}-{resolution_index}"
+                if any(item.get("id") == resolution_id for item in next_state.get("decisions", [])):
+                    fail("finding resolution decision ID already exists")
+                next_state.setdefault("decisions", []).append({
+                    "id": resolution_id, "type": "finding_resolution",
+                    "status": "accepted", "decision": "RESOLVED",
+                    "reason": resolution["reason"],
+                    "evidence_refs": [review_id, *resolution["evidence_refs"]],
+                    "affected_refs": [repair_ref], "candidate_ref": candidate_ref,
+                    "introduced_revision": str(state["revision"] + 1),
+                    "intent_revision": next_state.get("intent", {}).get("current_revision"),
+                })
+            if resolution_contracts:
+                finding_projection = finding_obligation_projection(next_state)
+                resolved_refs = {
+                    item.get("finding_ref") for item in finding_projection["items"]
+                    if item.get("finding_ref") in seen_resolution_findings and item.get("status") == "resolved"
+                }
+                if resolved_refs:
+                    for issue in next_state.get("issues", []):
+                        if issue.get("id") in resolved_refs or issue.get("finding_ref") in resolved_refs:
+                            issue["impact"] = "advisory"
+                            issue["disposition"] = f"resolved by reviewed repair {args.review_id}"
                 next_state["lifecycle"]["issue_refs"] = [ref for ref in next_state["lifecycle"].get("issue_refs", []) if next((item for item in next_state.get("issues", []) if item.get("id") == ref), {}).get("impact") == "blocking"]
-                if not next_state["lifecycle"]["issue_refs"]:
-                    next_state["lifecycle"]["control"] = "ACTIVE"
-                    next_state["lifecycle"]["reason"] = "reviewed_repair_integrated"
-        review_id = args.review_id
-        next_state.setdefault("reviews", []).append({"id": review_id, "mandate": packet.get("mandate", "change"), "subject_fingerprint": subject, "verdict": "PASS", "return_ref": f"objects/{digest}", "context_refs": review.get("context_refs", []), "finding_refs": next_attempt["finding_refs"], "intent_revision": next_state.get("intent", {}).get("current_revision"), "invalidated_by": []})
+                open_finding_refs = {
+                    item.get("finding_ref") for item in finding_projection["obligations"]
+                    if item.get("status") != "closed"
+                }
+                findings_by_id = {item.get("id"): item for item in next_state.get("findings", [])}
+                reviews_by_id = {item.get("id"): item for item in next_state.get("reviews", [])}
+                attempts_by_id = {item.get("id"): item for item in next_state.get("attempts", [])}
+                for issue in next_state.get("issues", []):
+                    if (
+                        issue.get("type") != "review_verdict"
+                        or issue.get("impact") != "blocking"
+                        or issue.get("invalidated_by")
+                        or ticket["id"] not in issue.get("affected_refs", [])
+                    ):
+                        continue
+                    source_ref = issue.get("source_ref")
+                    source_record = reviews_by_id.get(source_ref) or attempts_by_id.get(source_ref)
+                    source_finding_refs = source_record.get("finding_refs", []) if source_record else []
+                    canonical_refs = {ref for ref in source_finding_refs if ref in findings_by_id}
+                    if (
+                        not source_record
+                        or not source_finding_refs
+                        or canonical_refs != set(source_finding_refs)
+                        or canonical_refs & open_finding_refs
+                    ):
+                        continue
+                    issue["impact"] = "advisory"
+                    issue["disposition"] = f"source review findings resolved by accepted repair review {args.review_id}"
+                    issue.setdefault("invalidated_by", []).append(args.review_id)
+                next_state["lifecycle"]["issue_refs"] = [
+                    ref for ref in next_state.get("lifecycle", {}).get("issue_refs", [])
+                    if next((item for item in next_state.get("issues", []) if item.get("id") == ref), {}).get("impact") == "blocking"
+                ]
+            open_obligations = [
+                item for item in finding_projection["obligations"]
+                if ticket["id"] in item.get("ticket_refs", []) and item.get("status") != "closed"
+            ]
+            if open_obligations:
+                refs = sorted({
+                    ref for item in open_obligations
+                    for ref in ([item.get("finding_ref")] + item.get("issue_refs", []))
+                    if ref
+                })
+                fail(f"integration is blocked by unresolved ticket-scoped finding obligations: {', '.join(refs)}")
+            ticket["state"] = "INTEGRATED"
+        if ticket and next_state.get("candidate_model_version") == "1.1":
+            candidate = current_candidate_record(next_state, ticket)
+            if candidate and candidate.get("sha") == subject:
+                candidate["review_status"] = "PASS"
+                candidate["integration_status"] = "INTEGRATED"
+                candidate["blocker_refs"] = sorted({
+                    ref for obligation in finding_projection["obligations"]
+                    if ticket["id"] in obligation.get("ticket_refs", [])
+                    for ref in ([obligation.get("finding_ref")] + obligation.get("issue_refs", []))
+                    if ref
+                })
+        if next_state.get("lifecycle", {}).get("control") == "BLOCKED":
+            remaining_blockers = [
+                item for item in next_state.get("issues", [])
+                if item.get("impact") == "blocking" and not item.get("invalidated_by")
+            ]
+            remaining_obligations = [
+                item for item in finding_projection["obligations"]
+                if item.get("status") != "closed"
+            ]
+            next_state["lifecycle"]["issue_refs"] = sorted(item.get("id") for item in remaining_blockers if item.get("id"))
+            if not remaining_blockers and not remaining_obligations:
+                next_state["lifecycle"]["control"] = "ACTIVE"
+                next_state["lifecycle"]["reason"] = "reviewed_repair_integrated"
         next_state["revision"] += 1
         next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
         next_state["updated_at"] = now()
@@ -3759,6 +5082,7 @@ def cmd_close_blocked_attempt(args: argparse.Namespace) -> dict[str, Any]:
 
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token)
+        admit_event(state, "attempt.reconcile")
         if state["owner"]["token"] != args.owner_token:
             fail("owner token mismatch; stale orchestrator is fenced")
         attempt = attempt_by_id(state, attempt_id)
@@ -3906,6 +5230,12 @@ def cmd_close_blocked_attempt(args: argparse.Namespace) -> dict[str, Any]:
         attempt["lease"]["state"] = "released"
         attempt["blocked_closure_ref"] = receipt_ref
         ticket["current_attempt"] = restored["id"]
+        if state.get("candidate_model_version") == "1.1":
+            ticket["last_worker_attempt"] = restored["id"]
+            ticket["current_worker_attempt"] = None
+            restored_candidate = next((item for item in state.get("candidates", []) if item.get("producer_attempt_ref") == restored["id"]), None)
+            if restored_candidate:
+                ticket["current_candidate"] = restored_candidate["id"]
         state.setdefault("decisions", []).append({
             "id": closure_id,
             "type": "blocked_attempt_closure",
@@ -3988,6 +5318,7 @@ def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any
 
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token)
+        admit_event(state, "attempt.reconcile")
         if state["owner"]["token"] != args.owner_token:
             fail("owner token mismatch; stale orchestrator is fenced")
         attempt = attempt_by_id(state, attempt_id)
@@ -4413,6 +5744,7 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
         fail(f"projection leaks forbidden history/self-rating fields: {sorted(leaked)}")
     with Lock(p["lock"]):
         state, _ = load_mutation_state(p, args.owner_token, args.revision)
+        admit_event(state, "handoff.prepare")
         binding = current_intent_binding(state)
         if projection.get("intent_revision") != binding["revision"]:
             fail("acceptance projection is not the current intent revision")
@@ -4478,6 +5810,7 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
     )
     manifest_hash = sha256_bytes(manifest_bytes)
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "handoff.prepare")
         attempt = attempt_by_id(state, args.attempt_id)
         if attempt["epoch"] != state["owner"]["epoch"]:
             fail("handoff attempt is stale")
@@ -4514,15 +5847,34 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
     baseline = read_json(baseline_path, "integrity receipt")
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token)
-        attempt = attempt_by_id(state, args.attempt_id)
+        if state.get("lifecycle", {}).get("control") in TERMINAL_CONTROLS:
+            prior_attempt = next((item for item in state.get("attempts", []) if item.get("id") == args.attempt_id), None)
+            if prior_attempt and prior_attempt.get("lease", {}).get("state") == "released":
+                try:
+                    retry_path = inbox_file(p, args.attempt_id, return_path)
+                    retry_ref = f"objects/{sha256_file(retry_path)}"
+                except (LedgerError, OSError):
+                    retry_ref = None
+                prior_acceptance = next((item for item in state.get("acceptance", []) if item.get("return_ref") == retry_ref), None)
+                if (
+                    retry_ref
+                    and prior_attempt.get("return_ref") == retry_ref
+                    and prior_acceptance is not None
+                    and prior_acceptance.get("intent_revision") == args.intent_revision
+                    and prior_acceptance.get("candidate_fingerprint") == args.candidate_fingerprint
+                ):
+                    return {"imported": True, "idempotent": True, "terminal": True, "verdict": prior_acceptance.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False, "revision": state["revision"]}
+            admit_event(state, "acceptance.import")
+        attempt = next((item for item in state.get("attempts", []) if item.get("id") == args.attempt_id), None)
         proposed_path = inbox_file(p, args.attempt_id, return_path)
         proposed_ref = f"objects/{sha256_file(proposed_path)}"
         prior_acceptance = next((item for item in state.get("acceptance", []) if item.get("return_ref") == proposed_ref), None)
-        if attempt.get("return_ref") == proposed_ref and prior_acceptance is not None:
+        if attempt is not None and attempt.get("return_ref") == proposed_ref and prior_acceptance is not None:
             if prior_acceptance.get("intent_revision") != args.intent_revision or prior_acceptance.get("candidate_fingerprint") != args.candidate_fingerprint:
                 fail("conflicting duplicate manual return binding")
             if attempt.get("lease", {}).get("state") == "released":
                 return {"imported": True, "idempotent": True, "terminal": state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"), "verdict": prior_acceptance.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False, "revision": state["revision"]}
+            admit_event(state, "acceptance.import")
             next_state = copy.deepcopy(state)
             attempt_by_id(next_state, args.attempt_id)["lease"]["state"] = "released"
             next_state["revision"] += 1
@@ -4530,6 +5882,9 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
             next_state["updated_at"] = now()
             publish(p, next_state, previous_raw, "manual-import-reconcile")
             return {"imported": True, "idempotent": True, "reconciled": True, "verdict": prior_acceptance.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False, "revision": next_state["revision"]}
+        admit_event(state, "acceptance.import")
+        if attempt is None:
+            attempt = attempt_by_id(state, args.attempt_id)
         if state["revision"] != args.revision:
             fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
         if attempt.get("mode") != "user_assisted":
@@ -4637,6 +5992,7 @@ def cmd_publish_intent(args: argparse.Namespace) -> dict[str, Any]:
 
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
+        admit_event(state, "intent.publish")
         if state.get("intent") is not None:
             fail("initial intent already exists; use amend for a new intent revision")
         if any(document.get("kind") == "intent" for document in state.get("documents", [])):
@@ -4769,6 +6125,7 @@ def cmd_adopt_requirements(args: argparse.Namespace) -> dict[str, Any]:
             fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
             fail("terminal run is immutable; start a successor run")
+        admit_event(state, "requirements.adopt")
         if state["lifecycle"]["phase"] not in ("INTENT", "DESIGN", "PLAN"):
             fail("requirements adoption is only legal before execution")
         if state["lifecycle"]["phase"] == "PLAN" and state["lifecycle"].get("control") != "BLOCKED":
@@ -5123,6 +6480,7 @@ def cmd_migrate_review_currentness(args: argparse.Namespace) -> dict[str, Any]:
         state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
             fail("terminal run is immutable; start a successor run")
+        admit_event(state, "review.currentness.migrate")
         publication = current_design_publication(state)
         marker = f"review-currentness-{publication['publication_hash']}"
         provenance = state.get("runtime_provenance", {})
@@ -5299,8 +6657,11 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
             fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
             fail("terminal run is immutable; start a successor run")
+        admit_event(state, "design.publish")
         if state["lifecycle"]["phase"] != "DESIGN":
             fail("design bundle publication requires a G1-complete DESIGN phase")
+        if state.get("candidate_model_version") != "1.1" and bundle.get("tickets"):
+            fail("legacy state without the Phase B candidate model cannot publish worker tickets; use an explicit compatible migration")
         binding = current_intent_binding(state)
         if bundle["epoch"] != state["owner"]["epoch"]:
             fail("design bundle epoch does not match current owner")
@@ -5325,8 +6686,14 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
             fail("design bundle ID was already used by a prior publication")
         for collection_name in ("documents", "contracts", "tickets", "routes"):
             for record in bundle[collection_name]:
+                normalized_record = copy.deepcopy(record)
+                if collection_name == "tickets" and state.get("candidate_model_version") == "1.1":
+                    normalized_record.setdefault("current_attempt", None)
+                    normalized_record.setdefault("current_worker_attempt", None)
+                    normalized_record.setdefault("last_worker_attempt", None)
+                    normalized_record.setdefault("current_candidate", None)
                 existing_record = collections[collection_name].get(record["id"])
-                if record["id"] in occupied and (existing_record is None or existing_record != record and collection_name != "documents"):
+                if record["id"] in occupied and (existing_record is None or existing_record != normalized_record and collection_name != "documents"):
                     fail(f"design bundle ID conflicts with an existing immutable ID: {record['id']}")
         next_state = copy.deepcopy(state)
         prior_publication = copy.deepcopy(existing) if existing else None
@@ -5343,12 +6710,18 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
             next_state["documents"].append(canonical)
         for collection_name in ("contracts", "tickets", "routes"):
             for record in bundle[collection_name]:
+                canonical_record = copy.deepcopy(record)
+                if collection_name == "tickets" and next_state.get("candidate_model_version") == "1.1":
+                    canonical_record.setdefault("current_attempt", None)
+                    canonical_record.setdefault("current_worker_attempt", None)
+                    canonical_record.setdefault("last_worker_attempt", None)
+                    canonical_record.setdefault("current_candidate", None)
                 existing_record = collections[collection_name].get(record["id"])
                 if existing_record is not None:
-                    if existing_record != record:
+                    if existing_record != canonical_record:
                         fail(f"conflicting canonical {collection_name[:-1]}: {record['id']}")
                     continue
-                next_state.setdefault(collection_name, []).append(copy.deepcopy(record))
+                next_state.setdefault(collection_name, []).append(canonical_record)
         known_criteria = {item["id"] for item in next_state.get("criteria", [])}
         known_contracts = {item["id"] for item in next_state.get("contracts", [])}
         known_tickets = {item["id"] for item in next_state.get("tickets", [])}
@@ -5458,6 +6831,7 @@ def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     def change(state: dict[str, Any]) -> None:
+        admit_event(state, "intent.amend")
         if not args.authority_ref:
             fail("amendment requires explicit user authority reference")
         old_binding = current_intent_binding(state)
@@ -5530,6 +6904,30 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
             fail("terminal run is immutable; start a successor run")
         if control == "CANCELLED":
             fail("direct CANCELLED bypass is forbidden; enter QUIESCING and use cancel --finalize")
+        if control == "PAUSED" and current_control != "QUIESCING":
+            fail("PAUSED requires a prior QUIESCING transition")
+        gate_event = "run.resume" if current_control == "PAUSED" else "lifecycle.advance"
+        admit_event(state, gate_event)
+        validate_control_transition(current_control, control)
+        gate_id = getattr(args, "gate_id", None)
+        if gate_id is not None and gate_id not in {f"G{index}" for index in range(7)}:
+            fail("gate ID must be one of G0 through G6")
+        expected_gate = None
+        if control == "ACTIVE" and current_phase == "DESIGN" and phase == "PLAN":
+            # G3 identifies the DESIGN -> PLAN lifecycle gate even when the run
+            # is resuming from BLOCKED/PAUSED/RECOVERING; same-phase recovery is
+            # not a gate and does not infer G2.
+            expected_gate = "G3"
+        elif current_control == "ACTIVE" and control == "ACTIVE":
+            expected_gate = {
+                ("DESIGN", "DESIGN"): "G2",
+                ("EXECUTE", "VERIFY"): "G4",
+                ("VERIFY", "ACCEPT"): "G5",
+            }.get((current_phase, phase))
+        if control == "ACCEPTED" and phase == "ACCEPT":
+            expected_gate = "G6"
+        if gate_id is not None and gate_id != expected_gate:
+            fail(f"gate ID {gate_id} does not match lifecycle gate {expected_gate or 'none'}")
         if control == "QUIESCING" and current_control not in ("ACTIVE", "BLOCKED", "RECOVERING"):
             fail(f"cannot enter QUIESCING from {current_control}")
         if control == "PAUSED":
@@ -5549,10 +6947,24 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
             ]
             if active_attempts or active_leases or unresolved_effects:
                 fail("PAUSED requires stopped writers, released leases, and reconciled effects")
-        action = (args.next_action or "").casefold()
+        if current_control == "RECOVERING" and control == "ACTIVE":
+            active_attempts = [
+                attempt for attempt in state.get("attempts", [])
+                if attempt.get("state") in ("PREPARED", "DISPATCHED")
+            ]
+            active_leases = [
+                attempt for attempt in state.get("attempts", [])
+                if attempt.get("lease", {}).get("state") in ("active", "quarantined")
+            ]
+            unresolved_effects = [
+                operation for operation in state.get("operations", [])
+                if operation.get("state") in ("prepared", "uncertain")
+            ]
+            if active_attempts or active_leases or unresolved_effects:
+                fail("RECOVERING -> ACTIVE requires no in-flight attempts, active/quarantined leases, or unresolved effects")
         blockers = [item for item in state.get("issues", []) if item.get("impact") == "blocking" and not item.get("invalidated_by")]
-        g2_claim = control == "ACTIVE" and phase in ("DESIGN", "PLAN") and ("g2" in action or "coverage" in action or (current_phase == "DESIGN" and phase == "PLAN"))
-        g3_claim = control == "ACTIVE" and phase in ("PLAN", "EXECUTE") and ("g3" in action or "plan" in action or (current_phase == "PLAN" and phase == "EXECUTE"))
+        g2_claim = control == "ACTIVE" and gate_id == "G2"
+        g3_claim = control == "ACTIVE" and gate_id == "G3"
         if state.get("intent") and (g2_claim or g3_claim):
             current_design_publication(state)
             validate_current_design_contract_bindings(state)
@@ -5562,6 +6974,20 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
                 fail("G3 cannot pass without a PASS plan review of the current published design bundle")
             if blockers:
                 fail("a current blocking issue prevents G2/G3 advancement")
+        if (
+            state.get("candidate_model_version") == "1.1"
+            and control == "ACTIVE"
+            and expected_gate in ("G2", "G3")
+            and gate_id is None
+        ):
+            fail(f"{expected_gate} advancement requires an explicit --gate-id {expected_gate}")
+        if current_control == "BLOCKED" and control == "ACTIVE":
+            open_obligations = [
+                item for item in finding_obligation_projection(state)["obligations"]
+                if item.get("status") != "closed"
+            ]
+            if blockers or open_obligations:
+                fail("BLOCKED -> ACTIVE requires no active blocking issues or unresolved finding obligations")
         current_index = PHASES.index(current_phase)
         requested_index = PHASES.index(phase)
         design_repair_return = (
@@ -5576,7 +7002,7 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
         execution_repair_return = phase == "EXECUTE" and current_phase in ("VERIFY", "ACCEPT") and current_control == "BLOCKED"
         contract_repair_return = phase == "DESIGN" and current_phase in ("EXECUTE", "VERIFY", "ACCEPT") and current_control == "BLOCKED"
         intent_repair_return = phase == "INTENT" and current_phase in ("DESIGN", "PLAN", "EXECUTE", "VERIFY", "ACCEPT") and current_control == "BLOCKED"
-        if requested_index not in (current_index, current_index + 1) and not (design_repair_return or execution_repair_return or contract_repair_return or intent_repair_return):
+        if phase not in PHASE_TRANSITION_TABLE.get(current_phase, frozenset()) and not (design_repair_return or execution_repair_return or contract_repair_return or intent_repair_return):
             fail(f"illegal phase jump: {current_phase} -> {phase}")
         if current_phase == "PLAN" and phase == "EXECUTE":
             publication = current_design_publication(state)
@@ -5606,8 +7032,14 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
             binding = current_intent_binding(state)
             if not latest or latest.get("verdict") != "PASS" or latest.get("intent_revision") != binding["revision"] or latest.get("invalidated_by"):
                 fail("G6 cannot mark ACCEPTED without a fresh current-intent G5 PASS")
-            if blockers or active_publication_leases(state) or any(op.get("state") in ("prepared", "uncertain") for op in state.get("operations", [])):
+            open_obligations = [
+                item for item in finding_obligation_projection(state)["obligations"]
+                if item.get("status") != "closed"
+            ]
+            if blockers or open_obligations or active_publication_leases(state) or any(op.get("state") in ("prepared", "uncertain") for op in state.get("operations", [])):
                 fail("G6 requires no blockers, active/quarantined leases, or unresolved effects")
+            if state.get("candidate_model_version") == "1.1" and gate_id != "G6":
+                fail("G6 acceptance requires an explicit --gate-id G6")
         state["lifecycle"]["phase"] = phase
         state["lifecycle"]["control"] = control
         state["lifecycle"]["reason"] = args.reason
@@ -5620,6 +7052,7 @@ def cmd_cancel(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     if not args.finalize:
         def request(state: dict[str, Any]) -> None:
+            admit_event(state, "run.cancel.request")
             if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
                 fail("terminal run is immutable; start a successor run")
             state["lifecycle"]["control"] = "QUIESCING"
@@ -5632,6 +7065,7 @@ def cmd_cancel(args: argparse.Namespace) -> dict[str, Any]:
     if evidence.get("status") != "PASS" or evidence.get("writers_stopped") is not True or evidence.get("reconciled") is not True:
         fail("cancellation finalization requires PASS stop/reconcile evidence")
     def finalize(state: dict[str, Any]) -> None:
+        admit_event(state, "run.cancel.finalize")
         if state["lifecycle"]["control"] != "QUIESCING":
             fail("cancellation finalization requires QUIESCING")
         if any(op.get("state") in ("prepared", "uncertain") for op in state.get("operations", [])):
@@ -5665,6 +7099,7 @@ def cmd_recover(args: argparse.Namespace) -> dict[str, Any]:
             recovered_from = str(source)
         if state["owner"]["token"] != args.owner_token:
             fail("owner token mismatch; stale orchestrator is fenced")
+        admit_event(state, "run.recover")
         if not args.takeover and args.revision not in (state["revision"], state["revision"] + 1):
             fail(f"recovery revision does not match verified checkpoint: {args.revision}")
         require_mutation_eligible(state)
@@ -5715,7 +7150,7 @@ def build_parser() -> argparse.ArgumentParser:
     handoff = sub.add_parser("prepare-handoff"); handoff.add_argument("--control-root", required=True); handoff.add_argument("--run-id", required=True); handoff.add_argument("--owner-token", required=True); handoff.add_argument("--revision", type=int, required=True); handoff.add_argument("--attempt-id", required=True); handoff.add_argument("--packet", required=True); handoff.add_argument("--projection", required=True); handoff.add_argument("--export-root", required=True); handoff.add_argument("--bundle-root", required=True)
     manual = sub.add_parser("import-manual"); manual.add_argument("--control-root", required=True); manual.add_argument("--run-id", required=True); manual.add_argument("--owner-token", required=True); manual.add_argument("--revision", type=int, required=True); manual.add_argument("--attempt-id", required=True); manual.add_argument("--return-file", required=True); manual.add_argument("--environment-receipt", required=True); manual.add_argument("--context-receipt", required=True); manual.add_argument("--integrity-receipt", required=True); manual.add_argument("--intent-revision", required=True); manual.add_argument("--candidate-fingerprint", required=True); manual.add_argument("--required-criteria", required=True)
     audit = sub.add_parser("audit-write-set"); audit.add_argument("--root", required=True); audit.add_argument("--baseline", required=True); audit.add_argument("--declared", required=True); audit.add_argument("--zone", required=True)
-    gate = sub.add_parser("gate"); gate.add_argument("--control-root", required=True); gate.add_argument("--run-id", required=True); gate.add_argument("--owner-token", required=True); gate.add_argument("--revision", type=int, required=True); gate.add_argument("--phase"); gate.add_argument("--control"); gate.add_argument("--reason", default=None); gate.add_argument("--next-action", default="inspect"); gate.add_argument("--subject-refs", default=""); gate.add_argument("--preconditions", default=""); gate.add_argument("--read-refs", default="")
+    gate = sub.add_parser("gate"); gate.add_argument("--control-root", required=True); gate.add_argument("--run-id", required=True); gate.add_argument("--owner-token", required=True); gate.add_argument("--revision", type=int, required=True); gate.add_argument("--phase"); gate.add_argument("--control"); gate.add_argument("--gate-id", choices=[f"G{i}" for i in range(7)]); gate.add_argument("--reason", default=None); gate.add_argument("--next-action", default="inspect"); gate.add_argument("--subject-refs", default=""); gate.add_argument("--preconditions", default=""); gate.add_argument("--read-refs", default="")
     cancel = sub.add_parser("cancel"); cancel.add_argument("--control-root", required=True); cancel.add_argument("--run-id", required=True); cancel.add_argument("--owner-token", required=True); cancel.add_argument("--revision", type=int, required=True); cancel.add_argument("--reason", default="user_cancelled"); cancel.add_argument("--stop-target", default=None); cancel.add_argument("--finalize", action="store_true"); cancel.add_argument("--stop-evidence")
     recover = sub.add_parser("recover"); recover.add_argument("--control-root", required=True); recover.add_argument("--run-id", required=True); recover.add_argument("--owner-token", required=True); recover.add_argument("--revision", type=int, required=True); recover.add_argument("--reason", default="recovery"); recover.add_argument("--takeover", action="store_true"); recover.add_argument("--new-owner-token", default=None); recover.add_argument("--attestation-ref", default=None)
     initial_intent = sub.add_parser("publish-intent"); initial_intent.add_argument("--control-root", required=True); initial_intent.add_argument("--run-id", required=True); initial_intent.add_argument("--owner-token", required=True); initial_intent.add_argument("--revision", type=int, required=True); initial_intent.add_argument("--intent-file", required=True); initial_intent.add_argument("--doc-id", required=True); initial_intent.add_argument("--doc-version", required=True); initial_intent.add_argument("--intent-revision", required=True)

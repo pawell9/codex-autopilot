@@ -55,6 +55,23 @@ def _find_attempt(state: dict[str, Any], attempt_id: str | None) -> dict[str, An
 
 
 def _candidate_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    canonical = state.get("candidates")
+    if isinstance(canonical, list) and canonical:
+        attempts = {item.get("id"): item for item in state.get("attempts", []) if item.get("id")}
+        records: list[dict[str, Any]] = []
+        for candidate in canonical:
+            if candidate.get("invalidated_by"):
+                continue
+            producer = attempts.get(candidate.get("producer_attempt_ref"), {})
+            records.append({
+                **candidate,
+                "attempt_id": candidate.get("producer_attempt_ref"),
+                "subject_ref": candidate.get("ticket_ref"),
+                "state": producer.get("state"),
+                "source": "candidate_record",
+            })
+        return records
+
     records: list[dict[str, Any]] = []
     for attempt in state.get("attempts", []):
         if attempt.get("invalidated_by"):
@@ -64,11 +81,13 @@ def _candidate_records(state: dict[str, Any]) -> list[dict[str, Any]]:
         if sha or tree_sha:
             records.append(
                 {
+                    "id": None,
                     "attempt_id": attempt.get("id"),
                     "subject_ref": attempt.get("subject_ref"),
                     "state": attempt.get("state"),
                     "sha": sha,
                     "tree_sha": tree_sha,
+                    "source": "producer_attempt_fallback",
                 }
             )
     return records
@@ -79,22 +98,43 @@ def _select_candidate(state: dict[str, Any], candidates: list[dict[str, Any]]) -
         return None
 
     subject_refs = set(state.get("lifecycle", {}).get("next_action", {}).get("subject_refs", []))
+    by_id = {candidate.get("id"): candidate for candidate in candidates if candidate.get("id")}
+    current_pointers = [
+        (ticket, by_id.get(ticket.get("current_candidate")))
+        for ticket in state.get("tickets", [])
+        if ticket.get("current_candidate")
+    ]
+    current_pointers = [(ticket, candidate) for ticket, candidate in current_pointers if candidate is not None]
+    for ticket, candidate in current_pointers:
+        if any(ref in subject_refs for ref in (
+            ticket.get("id"), candidate.get("id"), candidate.get("producer_attempt_ref")
+        )):
+            return {**candidate, "source": "ticket.current_candidate", "ambiguous": False}
+    if current_pointers:
+        ticket, candidate = current_pointers[-1]
+        return {**candidate, "source": "ticket.current_candidate", "ambiguous": len(current_pointers) > 1}
+
+    canonical_candidates = [item for item in candidates if item.get("id")]
+    if canonical_candidates:
+        latest = next(
+            (item for item in reversed(canonical_candidates) if not item.get("superseded_by")),
+            canonical_candidates[-1],
+        )
+        return {**latest, "source": "candidate_record_fallback", "ambiguous": True}
+
     for candidate in candidates:
         if candidate.get("attempt_id") in subject_refs or candidate.get("subject_ref") in subject_refs:
-            return candidate
-
+            return {**candidate, "ambiguous": True}
     current_attempt_ids = {
-        ticket.get("current_attempt")
-        for ticket in state.get("tickets", [])
+        ticket.get("current_attempt") for ticket in state.get("tickets", [])
         if ticket.get("current_attempt")
     }
     for candidate in candidates:
         if candidate.get("attempt_id") in current_attempt_ids:
-            return candidate
+            return {**candidate, "ambiguous": True}
 
-    # The ledger has no explicit current_candidate field.  Keep this fallback
-    # deterministic and expose the ambiguity as a CONCERN to the user.
-    return candidates[-1]
+    # Pre-Phase-B attempt-only ledgers have no explicit candidate authority.
+    return {**candidates[-1], "ambiguous": True}
 
 
 def _project_gate_status(
@@ -198,10 +238,17 @@ def project_ledger(state: dict[str, Any], ledger_path: Path, raw: bytes) -> dict
     candidates = _candidate_records(state)
     current_candidate = _select_candidate(state, candidates)
     if current_candidate is not None:
+        if current_candidate.get("ambiguous"):
+            _add_concern(
+                concerns,
+                "candidate-projection-ambiguous",
+                "Текущий candidate выведен из legacy producer attempt/top-level records без однозначного ticket.current_candidate pointer.",
+            )
+    elif any(ticket.get("current_candidate") for ticket in state.get("tickets", [])):
         _add_concern(
             concerns,
-            "candidate-projection",
-            "В ledger нет отдельного current_candidate; выбранный candidate выведен из attempt/next_action.",
+            "candidate-pointer-unresolved",
+            "ticket.current_candidate задан, но соответствующая canonical candidate record отсутствует; попытки не используются для подмены pointer.",
         )
     elif phase in {"EXECUTE", "VERIFY", "ACCEPT"}:
         _add_concern(concerns, "candidate-missing", "Для текущей фазы в ledger не записан candidate SHA/tree SHA.")
