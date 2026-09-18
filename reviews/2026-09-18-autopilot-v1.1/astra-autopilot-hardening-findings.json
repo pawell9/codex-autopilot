@@ -1,0 +1,3011 @@
+{
+  "format_version": "1.0",
+  "metadata": {
+    "audit_date": "2026-09-18",
+    "reviewed_version": "1.0.11",
+    "source_commit_as_declared_in_manifest": "642dc87693374cc03be407cc302cbcb136576713",
+    "context_boundary": "Only the two user-supplied ZIP archives; no web, personal memory or external repository state. User Markdown defines scope, not implementation facts.",
+    "source_archive": {
+      "name": "autopilot-hardening-source.zip",
+      "sha256": "128a729e1baea7d38e95a6af80c204c8b33e56d460a1065301f1290350c394c1",
+      "manifest_entries_verified": 59
+    },
+    "evidence_archive": {
+      "name": "autopilot-hardening-evidence.zip",
+      "sha256": "3ff2fd367680aa2066007fe66c2ded8f7835561698e4dc4a9576f6e283dc5772",
+      "SHA256SUMS_entries_verified": 57
+    },
+    "evidence_levels": {
+      "EXECUTED": "Observed on unmodified supplied Python implementation in disposable synthetic fixtures with real Git, not on live Idea Scout.",
+      "FROZEN": "Read from archived immutable snapshots/returns/receipts. Does not establish present live machine state.",
+      "STATIC": "Derived from supplied code/contract/document comparison; not asserted as live incident.",
+      "PROPOSED": "Reviewer design/fix/qualification expectation; not an existing command or performed migration."
+    },
+    "limitations": [
+      "Missing full product repository/actual Git objects/canonical docs/native runtime sessions; no product defect reproduction or live recovery performed.",
+      "Missing standalone successor rev32/37/47/52; adjacent evidence used with explicit inference.",
+      "Source manifest hashes are internally consistent, not independent proof of upstream commit authenticity.",
+      "Runtime schema bytes match source schema, but full installed runtime source is absent: no full runtime/source parity claim.",
+      "Official qualification dependencies missing from the packet prevent reproducing its complete release suite."
+    ]
+  },
+  "executive_verdict": {
+    "safe_to_resume_T02_on_v1_0_11": false,
+    "hardening_release_required": true,
+    "recommended_release": "1.1.0",
+    "full_rewrite_recommended": false,
+    "priority_counts": {
+      "P0": 9,
+      "P1": 3,
+      "P2": 1
+    },
+    "maturity": "Strong individual evidence/provenance mechanisms; incomplete transition closure, inconsistent guard enforcement and unqualified full lifecycle.",
+    "probability_estimate": "No defensible numeric probability from one run plus adversarial synthetic fixtures."
+  },
+  "tests": {
+    "official": {
+      "command": "PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v",
+      "entries_reported": 80,
+      "passed": 71,
+      "failed": 2,
+      "errors": 6,
+      "skipped": 1,
+      "duration_seconds": 270.778,
+      "interpretation": "All 8 unsuccessful entries arise from missing packet dependencies/fixtures, not demonstrated failing assertions of supplied helper semantics. Five errors are import placeholders, so 80 is unittest reported entries, not 80 fully executed test bodies.",
+      "missing": [
+        "experiments.v1_40_ticket_qualification",
+        "tools.dashboard",
+        "upstream/autopilot/tools/sync.py",
+        "experiments/fixtures/e03m/seed-repo",
+        "experiments/v104_lifecycle_qualification.py"
+      ],
+      "skipped_case": "test_exact_v5_resume_on_disposable_copy: legacy production-checkpoint audit opt-in"
+    },
+    "independent": {
+      "scenarios": 32,
+      "observations_reached": 32,
+      "harness_errors_final_run": 0,
+      "positive_control": "P20_duplicate_happy_control",
+      "adverse_or_gap_observations": 31,
+      "interpretation": "Diagnostic tests assert that the observed gap exists; OBSERVED is not qualification PASS of Autopilot. Most use public CLI implementation; P23 directly tests the production stored_payload reader. Synthetic READY fixtures are explicit and are not full G0–G6 production reproduction.",
+      "artifact": "astra-autopilot-hardening-repro.zip"
+    }
+  },
+  "findings": [
+    {
+      "id": "AH-01",
+      "severity": "P0",
+      "title": "Finding lifecycle: subject binding, current projection и групповой repair",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "Зарегистрированный subject review, reported affected refs, durable finding, mirrored issue и lifecycle.issue_refs ведутся разными правилами. Currentness определяется частично через invalidated_by, частично через current_attempt; отдельного состояния verification obligations нет. Authorization поддерживает только один finding_ref.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "1011–1033; 1640–1665; 2072–2175; 2908–2926",
+          "observation": "Ticket binding требуется позже ingest; integration инвалидирует все ticket-bound review issues, но только один finding; adjudication меняет disposition без снятия blocking impact."
+        },
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "1831–1952; 2790–2841",
+          "observation": "Обычный review ingest и adjudication оставляют несогласованные action/blocker projections."
+        },
+        {
+          "kind": "frozen_evidence",
+          "path": "evidence/state/successor/rev-058-ledger.json",
+          "selector": "/findings; /issues; /lifecycle",
+          "observation": "21 findings всего; 10 code-review T02, из них 3 на текущем candidate; 17 blocking issues и устаревший await."
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P01_missing_ticket_binding"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P24_historical_finding_reuse"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P28_adjudication_blocker_projection"
+        }
+      ],
+      "affected_functions": [
+        "append_review_findings",
+        "cmd_ingest",
+        "cmd_authorize_repair",
+        "finding_matches_candidate",
+        "cmd_integrate",
+        "cmd_adjudicate",
+        "cmd_migrate_review_currentness",
+        "schema: review_finding/repair_contract"
+      ],
+      "failure_modes": [
+        "Accepted review нельзя использовать для repair без ticket binding.",
+        "Старый finding может снова авторизовать repair нового candidate в modify-zone.",
+        "PASS adjudication оставляет blocking issue; active projection расходится с lifecycle.issue_refs.",
+        "Один repair либо искусственно дробится по finding_ref, либо устраняет несколько дефектов без поэлементного audit trail.",
+        "Отсутствие нового finding по старой проблеме ошибочно может трактоваться как доказанное исправление."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-01-F1",
+          "description": "Ввести обязательный canonical subject binding {run,ticket,intent,publication,candidate-generation,review-attempt}; reported_affected_refs сохранять как raw observation, не использовать как единственный repair target."
+        },
+        {
+          "id": "AH-01-F2",
+          "description": "Сделать ingest единым для всех review kinds; валидировать repair usability до publication. При точном одно-ticket subject допустима каноническая привязка независимо от списка глобальных refs; конфликтующий subject отвергать."
+        },
+        {
+          "id": "AH-01-F3",
+          "description": "Хранить append-only binding/resolution/supersession events и вычислять active findings, unresolved verification obligations, mirrored issues и next_action из одной projection. Не приравнивать historical к resolved."
+        },
+        {
+          "id": "AH-01-F4",
+          "description": "Добавить finding_refs[] в единую candidate-bound repair authorization; каждому finding — own expected_proof, target criterion, re-review outcome. Разрешать объединение только при общем candidate и согласованной lease-zone."
+        },
+        {
+          "id": "AH-01-F5",
+          "description": "Resolution должен ссылаться на независимое подтверждение соответствующего finding. Candidate supersession не даёт blanket resolution всех прежних findings/обязательств."
+        },
+        {
+          "id": "AH-01-F6",
+          "description": "Сделать evidence-bound recovery для уже ingested records: raw return hash и исходная история неизменны, добавляются binding events для finding и его mirrored issue."
+        }
+      ],
+      "regression_scenarios": [
+        "Q02",
+        "Q03",
+        "Q04",
+        "Q11",
+        "Q12",
+        "Q13",
+        "Q29",
+        "Q32"
+      ],
+      "backward_compatibility_risk": "Существующие findings без subject и issues с несовпадающими статусами нельзя массово молча нормализовать. Нужна версия projection и миграционный receipt; ambiguous lineage остаётся BLOCKED.",
+      "existing_run_recovery": "Для rev58 привязать ровно 3 finding-e977… к review05/candidate ef8d…; 7 старых code findings оставить историческими, с отдельным закрытием либо переносом verification obligations. Старые BLOCK verdict records и interrupted-review issue не удалять.",
+      "runtime_dependency": "Внутри skill; внешний runtime нужен только для предоставления фактических stop/isolation observations.",
+      "depends_on": [
+        "AH-07",
+        "AH-08"
+      ]
+    },
+    {
+      "id": "AH-02",
+      "severity": "P0",
+      "title": "Authorize/dispatch/return используют несовпадающий admission contract",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "Проверки readiness, authorizations, effective lease, candidate provenance, packet identity и повторяемости распределены по командам. В effective_worker_lease ветка, полностью укладывающаяся в ticket.zone, выходит раньше проверок deny/source/current finding. Source provenance обязательна только для некоторых create→modify веток.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "981–1033; 1134–1428; 1953–2175",
+          "observation": "Неполный preflight authorization; source/deny/currentness в основном проверяются лишь при expansion."
+        },
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "1479–1530; 2655–2707",
+          "observation": "Worker return не сравнивает ticket_id с registered subject; review registration принимает иной packet epoch."
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P09_allow_deny_overlap"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P10_worker_wrong_ticket"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P11_stale_modify_base"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P12_undispatchable_unchanged_auth"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P19_review_epoch_registration"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P24_historical_finding_reuse"
+        }
+      ],
+      "affected_functions": [
+        "cmd_authorize_repair",
+        "cmd_dispatch",
+        "effective_worker_lease",
+        "repair_candidate_worker",
+        "repair_requires_transitive_create_modify_provenance",
+        "validate_return_against_attempt",
+        "cmd_prepare_review"
+      ],
+      "failure_modes": [
+        "Authorization READY гарантированно отвергается следующим dispatch по unchanged signature.",
+        "Modify-zone принимает чужой source_attempt_ref и nonexistent/stale base.",
+        "Allow/deny overlap принимается как active lease.",
+        "Worker return с FOREIGN-TICKET принимается, а более строгий reader позже его не сможет использовать.",
+        "Packet epoch и attempt epoch расходятся; contract criteria/risk/route не связаны единым admission proof."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-02-F1",
+          "description": "Создать canonical AttemptPlan и единый prepare/validate admission, используемый authorize и dispatch: exact subject, base/tree, epoch, intent/publication, selected findings, scope allow+deny, route/risk, criterion/check set, liveness conflicts."
+        },
+        {
+          "id": "AH-02-F2",
+          "description": "Перед READY проверять те же детерминированные условия, что и dispatch, включая unchanged signature и source validity. Изменение внешнего состояния между командами может вызвать понятный replan, но не изначально невозможную authorization."
+        },
+        {
+          "id": "AH-02-F3",
+          "description": "Source candidate обязателен для любого repair, не только create→modify. Разрешённый source review сначала однозначно нормализуется в producing worker/candidate identity; все последующие команды используют одинаковую нормализованную ссылку."
+        },
+        {
+          "id": "AH-02-F4",
+          "description": "Consume/revoke/rebind authorization отдельными audited состояниями; exact same-byte retry возвращает прежнее решение, changed unused authorization оформляется новым ID с supersedes, а не редактированием объекта."
+        },
+        {
+          "id": "AH-02-F5",
+          "description": "Проверять return kind и все поля registered identity, включая ticket_id; packet epoch должен совпадать с owner epoch уже при регистрации."
+        },
+        {
+          "id": "AH-02-F6",
+          "description": "Проверять deny до любых ранних return; проверять пересечение checkout/common-dir/lease zones независимо от ticket.state."
+        }
+      ],
+      "regression_scenarios": [
+        "Q02",
+        "Q03",
+        "Q10",
+        "Q14",
+        "Q15",
+        "Q25",
+        "Q26",
+        "Q27",
+        "Q30"
+      ],
+      "backward_compatibility_risk": "Ранее допустимые packets/auth become invalid. Не применять новые ограничения только к следующему dispatch: миграция должна заранее выявить и отозвать/перепривязать unconsumed incompatible authorizations.",
+      "existing_run_recovery": "Rev58: auth06 уже использована Worker05 и остаётся history. Для следующего repair — новый grouped authorization с точным Worker05 candidate и свежим планом scope. Не переиспользовать auth05/06 и не менять их bytes.",
+      "runtime_dependency": "Внутри skill; внешний runtime нужен только для предоставления фактических stop/isolation observations.",
+      "depends_on": [
+        "AH-01",
+        "AH-08"
+      ]
+    },
+    {
+      "id": "AH-03",
+      "severity": "P0",
+      "title": "Неполный lifecycle попытки и continuation candidate",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "current_attempt одновременно означает последнее исполнение, текущего writer и носителя candidate. Recovery реализовано узкими исключениями для определённых status/mode/previous-return combinations, а не общей таблицей финализации попыток и disposition файлов.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "2176–2208; 2261–2353; 3147–3346; 3347–3716",
+          "observation": "Terminate работает только для PREPARED/DISPATCHED; close-blocked — только repair/BLOCKED/files=[] с предыдущим DONE; continuation source допускает только worker."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/phases/recover.md",
+          "lines": "24–31",
+          "observation": "Другие quarantines явно оставлены blocked; общего доказательного reuse transition нет."
+        },
+        {
+          "kind": "frozen_evidence",
+          "path": "evidence/receipts/worker04-blocked-closure-receipt.json",
+          "selector": "entire object",
+          "observation": "Узкий no-change recovery реально применён."
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P13_lost_partial_create"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P15_empty_HANDOFF_closure"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P18_initial_nochange_BLOCK"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P21_continuation_nochange"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P22_review_source_preserve"
+        }
+      ],
+      "affected_functions": [
+        "cmd_terminate_attempt",
+        "cmd_close_blocked_attempt",
+        "cmd_preserve_blocked_candidate",
+        "validate_continuation_provenance",
+        "cmd_reconcile_quarantined_attempt",
+        "ticket/attempt/candidate schema"
+      ],
+      "failure_modes": [
+        "Initial no-change BLOCK/HANDOFF и returned FAILED не имеют симметричного штатного close.",
+        "Continuation→repair→no-change BLOCK не восстанавливает continuation, потому что previous return обязан быть DONE.",
+        "Repair dispatch принимает source review, но preserve после реального commit отвергает этот же source.",
+        "Lost create с полезным partial file и без candidate нельзя безопасно продолжить как modify через обычный repair.",
+        "Quarantined LOST/INTERRUPTED нельзя перевести в пригодный reuse только новой stop evidence; legacy reconcile не подходит."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-03-F1",
+          "description": "Добавить отдельный immutable candidate record и authoritative current_candidate; отделить current_worker_attempt/last_worker_attempt от candidate linkage. Continuation хранит quality=CONTINUATION и blocker debt, не фальшивый DONE."
+        },
+        {
+          "id": "AH-03-F2",
+          "description": "Описать finalize-attempt матрицей status×write-set×writer-stop×audit×prior-candidate: no changes, owned audited changes, uncertain/out-of-zone changes. Для каждой строки — release/reservation/quarantine и точный следующий шаг."
+        },
+        {
+          "id": "AH-03-F3",
+          "description": "Обобщить no-change closure на implement/repair и BLOCKED/HANDOFF/FAILED, когда фактическая безопасная disposition доказана. Можно сохранить предыдущий DONE либо CONTINUATION; если candidate ещё нет — retry от проверенного initial base."
+        },
+        {
+          "id": "AH-03-F4",
+          "description": "Добавить proof-carrying reconciliation остановленных LOST/INTERRUPTED/quarantined attempts без превращения untrusted partial changes в DONE; новый worker использует проверенный snapshot либо explicitly authorized disposal."
+        },
+        {
+          "id": "AH-03-F5",
+          "description": "Свести source normalization и транзитивные create/modify/preserve hops к общей библиотеке; проверять её при candidate publication, а не только при следующем expansion."
+        },
+        {
+          "id": "AH-03-F6",
+          "description": "Повторы closure/preserve/reconcile после дальнейшего прогресса возвращают записанный результат операции и не требуют, чтобы mutable pointers навсегда остались в её старом post-state."
+        }
+      ],
+      "regression_scenarios": [
+        "Q05",
+        "Q06",
+        "Q07",
+        "Q08",
+        "Q09",
+        "Q10",
+        "Q15",
+        "Q17",
+        "Q18",
+        "Q23",
+        "Q24",
+        "Q28"
+      ],
+      "backward_compatibility_risk": "Current_attempt legacy alias потребует migration. Нельзя просто считать active returned worker lease живым процессом либо автоматически освобождать её: это может быть reservation и требуются stop/audit observations.",
+      "existing_run_recovery": "Worker05 и continuation receipt сохраняются. Старую lease release делать доказательно перед новым writer; следующий no-change repair должен восстанавливать ef8d… как CONTINUATION, а не искать более ранний DONE и терять полезные изменения.",
+      "runtime_dependency": "Внутри skill; внешний runtime нужен только для предоставления фактических stop/isolation observations.",
+      "depends_on": [
+        "AH-02",
+        "AH-05",
+        "AH-06"
+      ]
+    },
+    {
+      "id": "AH-04",
+      "severity": "P0",
+      "title": "Review/integrate могут обойти immutable verdict и обязательные review barriers",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "Integrate повторно ingest-ит переданный файл вместо потребления уже принятого immutable review. Semantic validators проверяют PASS coverage, но не проверяют PASS независимых checks. Acceptance of a candidate сведено к одному review, без aggregate policy по всем требуемым axes/rounds.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "1434–1464; 1831–1952; 2655–2707; 2842–2939",
+          "observation": "Conflicting duplicate ingest отвергается, но integrate имеет отдельный проход; integrity ledger hash optional; required review axis не enforced."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/phases/execute.md",
+          "lines": "13–17",
+          "observation": "Документация требует independent risk axis, stopped reviewer, integrity barrier."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/phases/accept.md",
+          "lines": "13–19",
+          "observation": "Для critical axis требуется user-assisted transport до отдельной qualification."
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P06_conflicting_review_integrate"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P07_failed_check_PASS"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P08_critical_policy_bypass"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P16_parallel_review_BLOCK_bypass"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P17_review_ingest_without_barrier"
+        }
+      ],
+      "affected_functions": [
+        "validate_review_return_semantics",
+        "cmd_ingest",
+        "cmd_prepare_review",
+        "cmd_integrate",
+        "check_integrity",
+        "review policy schema"
+      ],
+      "failure_modes": [
+        "Accepted BLOCK меняется на supplied PASS через integrate; review_result остаётся BLOCK, ticket становится INTEGRATED.",
+        "PASS с failed check принимается и интегрируется.",
+        "PASS одного review интегрируется при BLOCK другого текущего required review.",
+        "Critical ticket можно интегрировать с одним correctness axis без qualified route/manual protocol.",
+        "Review ingest возможен без обязательного integrity receipt; безопасность review04 обеспечил оркестратор, а не этот API."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-04-F1",
+          "description": "Integrate должен принимать review/round refs и неизменяемые content hashes, а не альтернативные return bytes. Любой conflicting duplicate во всех entry points отвергать одинаково."
+        },
+        {
+          "id": "AH-04-F2",
+          "description": "Единая semantic predicate: PASS только при fulfilled required criteria, допустимых выполненных independent checks, отсутствии blocking findings и удовлетворённой policy всех required axes. Невыполненный optional check требует явной typed policy, а не произвольного PASS."
+        },
+        {
+          "id": "AH-04-F3",
+          "description": "Ввести review round/obligations и обязательный per-ticket risk policy. Pending/failed/stale/contaminated required axis блокирует integrate; disagreement закрывается evidence-based adjudication, не выбором удобного PASS."
+        },
+        {
+          "id": "AH-04-F4",
+          "description": "Проверять current candidate generation, intent/publication и integrity receipt до ingest; hash актуального ledger/baseline, immutable export и stop evidence обязательны для authoritative verdict."
+        },
+        {
+          "id": "AH-04-F5",
+          "description": "Не закрывать все review issues ticket одним успешно исправленным finding; пользоваться projection AH-01."
+        },
+        {
+          "id": "AH-04-F6",
+          "description": "Интеграция не снимает external blocker и не делает CONTINUATION обычным candidate. Финальный predicate должен проверять current candidate quality и актуальные debts независимо от того, какой worker его произвёл."
+        }
+      ],
+      "regression_scenarios": [
+        "Q01",
+        "Q02",
+        "Q04",
+        "Q14",
+        "Q16",
+        "Q18",
+        "Q19",
+        "Q24",
+        "Q29",
+        "Q31",
+        "Q32",
+        "Q33"
+      ],
+      "backward_compatibility_risk": "Старые PASS records без required proofs нельзя ретроактивно считать qualified. Нужны fresh review либо явно классифицированное historical/unqualified evidence; original return не переписывается.",
+      "existing_run_recovery": "T02 risk=critical. Review05 можно использовать как accepted implementation evidence для repair, но сам по себе он не заменяет missing critical transport/axis qualification перед будущей интеграцией.",
+      "runtime_dependency": "Внутри skill; внешний runtime нужен только для предоставления фактических stop/isolation observations.",
+      "depends_on": [
+        "AH-01",
+        "AH-03",
+        "AH-06",
+        "AH-09"
+      ]
+    },
+    {
+      "id": "AH-05",
+      "severity": "P0",
+      "title": "Effect journal не замкнут и general candidate слабее continuation candidate",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "Состояние side effect и доменная публикация candidate независимы, completion не общее. Reconcile принимает только prepared; uncertain и abandoned не имеют пригодных повторных переходов. General candidate доверяет минимальному PASS receipt, в отличие от строго проверяемого continuation.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "2209–2260; 2354–2573; 2574–2654",
+          "observation": "Reconcile applied не связывает candidate; candidate требует prepared; uncertain resolve недоступен; abandoned prepare возвращает success без смены состояния."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/design/02-run-ledger-and-artifacts.md",
+          "lines": "section Side effects and crash reconciliation",
+          "observation": "Документированный recovery commit-without-receipt расходится с композицией команд."
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P02_uncertain_dead_end"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P03_reconciled_candidate_dead_end"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P14_unaudited_fake_candidate"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P26_abandoned_effect_retry"
+        }
+      ],
+      "affected_functions": [
+        "cmd_prepare_effect",
+        "cmd_reconcile_effect",
+        "cmd_candidate",
+        "cmd_preserve_blocked_candidate",
+        "operation schema",
+        "publish"
+      ],
+      "failure_modes": [
+        "Commit существует, reconcile-effect applied принят, candidate отвергает applied operation; attempt без candidate.",
+        "uncertain требует reconcile_uncertain_effect, которого нет.",
+        "unchanged→abandoned советует same operation ID; повтор prepare не rearm-ит этот ID.",
+        "Candidate с несуществующим SHA и чужим operation target/base/authority публикуется при минимальном JSON PASS receipt."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-05-F1",
+          "description": "Ввести typed operation state machine prepared→applied/uncertain/abandoned и audited resolution uncertain→applied/abandoned. Retry прежнего logical operation оформлять явно, не маскировать abandoned как prepared."
+        },
+        {
+          "id": "AH-05-F2",
+          "description": "Сделать finalize-effect единым для обычного candidate, continuation и recovery: проверить receipt и atomically опубликовать operation completion + candidate linkage + next_action. Existing applied effect с неполной domain projection восстанавливать без повторного commit."
+        },
+        {
+          "id": "AH-05-F3",
+          "description": "General candidate должен переиспользовать строгие Git/base/tree/parent/target/authority/write-set/cleanliness проверки continuation. Receipt и его независимый audit сохранять content-addressed, не external:ID без bytes."
+        },
+        {
+          "id": "AH-05-F4",
+          "description": "Перед эффектом фиксировать exact expected_before, intended tree, checkout/common-dir, operation identity, authorization и policy. При legacy missing intent не придумывать доказательство: fresh audit+explicit adjudication либо BLOCKED."
+        },
+        {
+          "id": "AH-05-F5",
+          "description": "Fault-inject каждый durable boundary: before/after prepare, actual commit, receipt, object publication, ledger replace, snapshot; новая попытка не повторяет уже выполненный effect."
+        }
+      ],
+      "regression_scenarios": [
+        "Q01",
+        "Q06",
+        "Q18",
+        "Q22",
+        "Q23",
+        "Q24",
+        "Q34"
+      ],
+      "backward_compatibility_risk": "Старые operations без intended tree или immutable receipt могут остаться unverifiable. Нужна отдельная migration classification и receipt-bound reconciliation; нельзя автоматически делать applied по одному HEAD.",
+      "existing_run_recovery": "У Worker05 op уже applied и continuation linkage присутствует; это не повод повторять commit. До нового worker проверить отсутствие иных prepared/uncertain ops. Нужны repairs framework, а не новый product commit сейчас.",
+      "runtime_dependency": "Внутри skill; внешний runtime нужен только для предоставления фактических stop/isolation observations.",
+      "depends_on": [
+        "AH-07",
+        "AH-06"
+      ]
+    },
+    {
+      "id": "AH-06",
+      "severity": "P0",
+      "title": "Нет единого phase/control/terminal/owner precondition для mutators",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "Transaction обеспечивает token/revision CAS, но не общую допустимость transition. Guards локальны; часть команд mutates terminal/QUIESCING/RECOVERING state. next_action — вручную записываемый текст, не следствие фактов. Epoch не представляет фактическую остановку writer.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "624–650; 1953–2045; 2072–2175; 4808–5037",
+          "observation": "Dispatch не запрещён после cancel request; recover не запрещён после CANCELLED; amend пишет ACTIVE при quarantined attempts."
+        },
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "4969–5003",
+          "observation": "Cancel finalize читает stop evidence, но не сохраняет его immutable reference в transition."
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P04_dispatch_while_quiescing"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P05_terminal_recover"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P19_review_epoch_registration"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P31_manual_interrupted_import"
+        }
+      ],
+      "affected_functions": [
+        "transaction",
+        "cmd_dispatch",
+        "cmd_authorize_repair",
+        "cmd_gate",
+        "cmd_amend",
+        "cmd_cancel",
+        "cmd_recover",
+        "cmd_import_manual",
+        "validate_ledger"
+      ],
+      "failure_modes": [
+        "QUIESCING run принимает новый worker.",
+        "Terminal CANCELLED run reopens through recover.",
+        "Legacy/terminal transitions могут сменить control не закрыв blockers/leases; import-manual принимает INTERRUPTED attempt.",
+        "Generic gate может выражать action, для которого не существует штатной команды.",
+        "При takeover returned worker с active reservation не проходит ту же quarantine/reuse процедуру, что PREPARED."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-06-F1",
+          "description": "Ввести centralized transition table с pre/post invariants для каждого mutator, включая phase, control, epoch, subject, terminal immutability, expected revision и effects. Exceptions только именованные и доказуемые, например authorized repair while external blocker retained."
+        },
+        {
+          "id": "AH-06-F2",
+          "description": "В QUIESCING/PAUSED/RECOVERING запретить new dispatch до proof-carrying resume. CANCELLED/FAILED/ACCEPTED не открываются recover; successor — новая namespace."
+        },
+        {
+          "id": "AH-06-F3",
+          "description": "Сделать next_action/allowed_commands derivation из active facts; каждый emitted action обязан иметь handler или explicit external/owner decision с точным условием снятия."
+        },
+        {
+          "id": "AH-06-F4",
+          "description": "Cancel/takeover/lease release должны сохранять validated stop/reconciliation evidence refs; static bool receipt не заменяет runtime proof, но сама evidence не должна теряться."
+        },
+        {
+          "id": "AH-06-F5",
+          "description": "Amendment quiesces affected writers и не возвращает ACTIVE до доказательства stop/reuse; ownership invalidation не означает исчезновение процессов."
+        },
+        {
+          "id": "AH-06-F6",
+          "description": "Разделить replay исторической операции и новый переход. Same-byte idempotent response не выдаёт разрешения повторно spawn-ить старую попытку."
+        }
+      ],
+      "regression_scenarios": [
+        "Q14",
+        "Q15",
+        "Q16",
+        "Q20",
+        "Q21",
+        "Q22",
+        "Q23",
+        "Q26",
+        "Q35",
+        "Q36",
+        "Q37"
+      ],
+      "backward_compatibility_risk": "Central guards обнаружат ранее допустимые составные состояния. В read-only diagnostics выводить причину и migration path; не переписывать автоматически terminal control или releases.",
+      "existing_run_recovery": "Перед migration ревизии58 остановка/проверка writers и snapshot. Не использовать текущий recover как универсальный reset; original frozen run остаётся BLOCKED до доказанного targeted recovery.",
+      "runtime_dependency": "Внутри skill; внешний runtime нужен только для предоставления фактических stop/isolation observations.",
+      "depends_on": [
+        "AH-07"
+      ]
+    },
+    {
+      "id": "AH-07",
+      "severity": "P0",
+      "title": "Immutable evidence/canonical publication не защищены единообразно",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "cmd_amend пишет canonical path до owner/revision/duplicate checks и допускает overwrite. Content-addressed reads stored_payload не сверяют bytes с hash из имени. Atomic ledger replace не обеспечивает атомарность всего набора canonical side effects.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "895–903; 4808–4870; 610–622",
+          "observation": "Unverified object reads и pre-fence canonical write. Snapshot/write ordering требует replay после commit."
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P23_hash_addressed_read"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P27_failed_amend_mutates_document"
+        }
+      ],
+      "affected_functions": [
+        "cmd_amend",
+        "stored_payload",
+        "object_store",
+        "atomic_write",
+        "publish",
+        "canonical_document_path",
+        "verify_manual_inventory"
+      ],
+      "failure_modes": [
+        "Отклонённый stale-owner amend изменяет canonical document при неизменном ledger revision.",
+        "Изменённый object под прежним SHA name используется provenance reader без hash error.",
+        "Crash/failure после canonical write до ledger commit оставляет не orphan, а повреждение ранее referenced immutable bytes."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-07-F1",
+          "description": "Все authority/CAS/existence checks делать под lock до canonical publication; existing canonical path допускает только identical bytes и не переписывается. Unique staged objects публиковать без overwrite, после полного validation."
+        },
+        {
+          "id": "AH-07-F2",
+          "description": "Добавить verified_object_read: namespace+regular non-symlink+hash name+content hash+schema. Использовать для packets/returns/receipts/auth/provenance; design-only hash validation недостаточно."
+        },
+        {
+          "id": "AH-07-F3",
+          "description": "Нормализовать transactional write plan: side effects могут оставлять только безопасные unreferenced immutable objects, никогда изменить уже referenced document при ошибке."
+        },
+        {
+          "id": "AH-07-F4",
+          "description": "Сделать reconcile после ledger-replace/snapshot failure распознаваемым по operation/event ID; не интерпретировать диагностическую ошибку post-publication как отсутствие commit."
+        },
+        {
+          "id": "AH-07-F5",
+          "description": "Проверять complete manual export inventory, а не произвольное непустое подмножество receipt hashes (совместно AH-09)."
+        }
+      ],
+      "regression_scenarios": [
+        "Q22",
+        "Q23",
+        "Q34",
+        "Q35",
+        "Q38"
+      ],
+      "backward_compatibility_risk": "Проверка hash всех referenced объектов может обнаружить старую corruption. Никакого silent rewriting hash; restore only independently verified source bytes либо explicit unavailable evidence.",
+      "existing_run_recovery": "Проверить hashes frozen packet, live objects и canonical docs до binding migration. В evidence нет полного installed runtime и live canonical files, поэтому их current integrity нельзя объявить проверенной этим audit.",
+      "runtime_dependency": "Core fixes полностью внутри skill. Файловая атомарность и процессные блокировки должны быть квалифицированы на используемом runtime/filesystem.",
+      "depends_on": []
+    },
+    {
+      "id": "AH-08",
+      "severity": "P0",
+      "title": "Legacy admitted state сохраняет self-produced input contracts после исправления публикации",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "Новый design_bundle имеет early input/output guard, но общий validator, ready-ticket и dispatch не применяют тот же invariant к уже существующему run. Schema version 1.0 не выражает семантический разрыв старых и новых bindings.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "790–903; 346–524; 2046–2071",
+          "observation": "Specialized binding validator не часть общего consistency validator."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/SKILL.md",
+          "lines": "22–42",
+          "observation": "ticket.contract_refs объявлены executable inputs, producer_refs — outputs; self-input запрещён."
+        },
+        {
+          "kind": "frozen_evidence",
+          "path": "evidence/state/successor/rev-058-ledger.json",
+          "selector": "/design_publication/ticket_refs; /tickets; /contracts",
+          "observation": "9 текущих tickets пересекают input contract_refs и собственные producer_refs; все эти contracts active. validate_ledger(verify_files=False) PASS, specialized binding validation FAIL."
+        }
+      ],
+      "affected_functions": [
+        "validate_design_bundle",
+        "validate_ticket_contract_bindings",
+        "validate_current_design_contract_bindings",
+        "validate_ledger",
+        "cmd_ready_ticket",
+        "cmd_dispatch",
+        "schema version/migrations"
+      ],
+      "failure_modes": [
+        "Release исправляет new publication, но admitted legacy state остаётся несовместимым с новым guard.",
+        "Повтор affected G2/G3/republish после repair способен обнаружить ранее скрытый self-input; successor сам по себе не очищает модель bindings.",
+        "Нельзя понять по active flag, доказана ли доступность contract deliverable/переданных resources."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-08-F1",
+          "description": "Сформировать authoritative contract model: input specification/version отдельно от produced implementation/deliverable proof. Если ticket читает ранее опубликованный interface и производит его реализацию, это две разные связи, не self-dependency одного readiness объекта."
+        },
+        {
+          "id": "AH-08-F2",
+          "description": "Вынести binding invariant в общий validator и admission preflight для всех текущих tickets, а не только новых bundles."
+        },
+        {
+          "id": "AH-08-F3",
+          "description": "Сделать owner-approved, hash-addressed legacy binding migration с original+replacement refs и scope-effect classification. Ни молча удалять refs, ни превращать proposed в active."
+        },
+        {
+          "id": "AH-08-F4",
+          "description": "No-scope-change correction должна иметь явный validated equivalence contract; material contract/intent change требует нового publication и affected G2/G3. Отсутствие такого migration path в v1.0.11 — отдельный release blocker."
+        },
+        {
+          "id": "AH-08-F5",
+          "description": "Определить typed proof активации output contract и readiness consumers, включая наследуемые predecessor artifacts."
+        }
+      ],
+      "regression_scenarios": [
+        "Q11",
+        "Q20",
+        "Q21",
+        "Q27",
+        "Q35",
+        "Q39"
+      ],
+      "backward_compatibility_risk": "Главный migration риск: новый strict validator немедленно отвергает реальные current tickets. Поэтому нужен диагностический read path и dry-run migration прежде первого live write новой версией.",
+      "existing_run_recovery": "Rev58: T02 ARCHITECTURE; T03 RUNTIME+ARCHITECTURE; T04 SEMANTIC+QUICK; T05 EVIDENCE+SECURITY; T06 ASSESSMENT+ARCHITECTURE; T07 API-UI; T08 SECURITY; T10 MIGRATION; T11 ARCHITECTURE. Реальное значение связей надо подтвердить документами/owner decision, недостающие live design bytes в пакете не заменять предположением.",
+      "runtime_dependency": "Полностью внутри skill/schema; решение о смысле contract и допустимом scope принадлежит owner.",
+      "depends_on": [
+        "AH-07"
+      ]
+    },
+    {
+      "id": "AH-09",
+      "severity": "P0",
+      "title": "Manual critical/G5 transport не замкнут в общий review→repair lifecycle",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "prepare-handoff принимает review или acceptance packet и меняет существующий attempt; import-manual валидирует только acceptance packet, не выполняет обычный review ingestion/resolution и безусловно трактует PASS как переход к ACCEPT. Нет разделения per-ticket critical axis и final G5.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "1550–1565; 3741–4013",
+          "observation": "Manual BLOCK не materializes findings; PASS check outcomes не проверены, inventory лишь subset; нет guard INTERRUPTED; per-ticket PASS не releases worker reservation."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/phases/accept.md",
+          "lines": "13–39",
+          "observation": "Требуются critical axes, repair wave при BLOCK и fresh G5; native behavior не должен обходить manual protocol."
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P29_manual_BLOCK_findings"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P30_manual_failed_PASS"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P31_manual_interrupted_import"
+        },
+        {
+          "kind": "independent_execution",
+          "probe_id": "P32_manual_packet_mismatch"
+        }
+      ],
+      "affected_functions": [
+        "cmd_prepare_handoff",
+        "cmd_import_manual",
+        "validate_acceptance_return_semantics",
+        "verify_manual_inventory",
+        "acceptance/review round schemas"
+      ],
+      "failure_modes": [
+        "Manual BLOCK принят, но durable findings/issues отсутствуют, next_action всё ещё import_manual_review; authorize-repair нечем обосновать.",
+        "Manual PASS с failed check и inventory без candidate-export принимается.",
+        "Per-ticket manual PASS помечает ticket INTEGRATED и phase ACCEPT, оставляя worker lease active.",
+        "Interrupted reviewer return становится authoritative через import-manual.",
+        "Review-kind handoff регистрируется, но следующий import отвергает его как не acceptance."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-09-F1",
+          "description": "Разделить review purpose: ticket_change, critical_axis, final_g5; transport независим от purpose. Тип packet/return должен быть согласован при prepare и import."
+        },
+        {
+          "id": "AH-09-F2",
+          "description": "Импортировать любой authoritative review через единый identity/currentness/integrity/semantic admission AH-04; BLOCK materializes individually repairable findings и obligations, next_action переходит к triage, не wait."
+        },
+        {
+          "id": "AH-09-F3",
+          "description": "Critical-axis PASS закрывает axis obligation текущего ticket, не переносит run сразу в ACCEPT. Ticket integration отдельно закрывает required reviews и reservation. Только final G5 PASS разрешает G6 candidate."
+        },
+        {
+          "id": "AH-09-F4",
+          "description": "Проверять complete export manifest/inventory, packet/projection hashes, explicit stop receipt, epoch/current state, candidate generation. Interrupted/old-epoch payload остаётся historical либо получает специальную current-owner revalidation, не silent import."
+        },
+        {
+          "id": "AH-09-F5",
+          "description": "New handoff — новый immutable attempt/packet registration; не переписывать accepted packet/return/attempt role ради повторного транспорта."
+        },
+        {
+          "id": "AH-09-F6",
+          "description": "G5 findings группировать в dependency-ordered repair wave с per-finding re-review и одним fresh full G5 после общего candidate."
+        }
+      ],
+      "regression_scenarios": [
+        "Q04",
+        "Q16",
+        "Q19",
+        "Q22",
+        "Q23",
+        "Q31",
+        "Q33",
+        "Q36",
+        "Q38",
+        "Q40"
+      ],
+      "backward_compatibility_risk": "Старые manual acceptance records lacking outcome refs/current candidate binding нельзя повышать до новой qualification автоматически. Они остаются historical with evidence grade.",
+      "existing_run_recovery": "T02 critical: сначала исправить механизм, затем нужные fresh axis reviews на конечном repaired candidate. Review05 implementation findings сохраняются, но manual G5 scope нельзя подменить только этим review.",
+      "runtime_dependency": "Admission/projection fixes внутри skill. Реальная чистота session, доступные connectors и границы sandbox подтверждаются только scoped runtime/operator receipts; абсолютной изоляции helper не доказывает.",
+      "depends_on": [
+        "AH-01",
+        "AH-03",
+        "AH-06",
+        "AH-07"
+      ]
+    },
+    {
+      "id": "AH-10",
+      "severity": "P1",
+      "title": "Successor, predecessor evidence и wave boundary не имеют единого executable closure",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "В предоставленном helper нет отдельного successor/wave transition и структуры wave/parent lineage с proofs. Init создаёт новую namespace; перенос scope/contracts/resources остаётся orchestration protocol. Contract active не доказывает комплектность унаследованных artifacts.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "1666–1705; 4871–5077",
+          "observation": "Есть init/gate/cancel/recover, но нет create-successor/wave-finalize/inherit-artifacts API."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/design/02-run-ledger-and-artifacts.md",
+          "lines": "section successor/checkpoint context",
+          "observation": "Продолжение должно ссылаться на checkpoint и проверять missing artifacts."
+        },
+        {
+          "kind": "frozen_evidence",
+          "path": "evidence/state/predecessor/rev-122-cancel-terminal.json",
+          "selector": "/lifecycle",
+          "observation": "Предшественник CANCELLED."
+        },
+        {
+          "kind": "frozen_evidence",
+          "path": "evidence/state/successor/rev-058-ledger.json",
+          "selector": "/contracts; /lifecycle",
+          "observation": "Есть inherited producer PREDECESSOR-T01-R14; внешний evaluation-resource blocker остаётся активным."
+        }
+      ],
+      "affected_functions": [
+        "cmd_init",
+        "cmd_cancel",
+        "cmd_gate",
+        "successor manifest schema",
+        "contract readiness"
+      ],
+      "failure_modes": [
+        "Новый run может повторить старые семантические bindings либо не иметь файлов, на которые ссылается унаследованный contract.",
+        "Wave завершена по тексту next_action, но не по aggregate findings/leases/effects/integration closure.",
+        "User checkpoint и successor authority references нельзя проверить как единую цепь exact subject/scope."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-10-F1",
+          "description": "Добавить небольшой typed successor manifest: predecessor run/revision/hash, candidate/tree, accepted scope decision, inherited artifact digests, explicit exclusions/unknowns. Predecessor terminal history не изменять."
+        },
+        {
+          "id": "AH-10-F2",
+          "description": "Перед activating inherited contracts проверять реальную доступность authorized resources и соответствие criteria/artifact hashes. Missing resources = explicit BLOCKED, не fabricated active."
+        },
+        {
+          "id": "AH-10-F3",
+          "description": "Wave boundary определить как aggregate predicate по перечисленным tickets, review obligations, current candidate, leases/effects и next eligible work; не создавать новый scheduler rewrite."
+        },
+        {
+          "id": "AH-10-F4",
+          "description": "Разрешить user checkpoints только из persisted policy/authority-sensitive decisions; semi и full не обходят critical/oracle/cost/irreversible authority."
+        },
+        {
+          "id": "AH-10-F5",
+          "description": "Qualification на predecessor CANCELLED→successor: старый ledger byte-identical, новый owner/scope/namespace, no shared-writer lease theft."
+        }
+      ],
+      "regression_scenarios": [
+        "Q20",
+        "Q21",
+        "Q35",
+        "Q37",
+        "Q39",
+        "Q40"
+      ],
+      "backward_compatibility_risk": "Исторические successor runs без explicit parent manifest могут быть classified legacy; связь восстанавливается только по устойчивым hashes/refs, неоднозначное inheritance не активируется.",
+      "existing_run_recovery": "Не создавать ещё один successor автоматически ради rev58 binding bug. Сначала targeted state migration; если потребуется material scope change — отдельное owner решение и проверка наследования.",
+      "runtime_dependency": "В основном skill. Фактические файлы/dependencies и допустимая isolated copy требуют filesystem/runtime observations.",
+      "depends_on": [
+        "AH-06",
+        "AH-08"
+      ]
+    },
+    {
+      "id": "AH-11",
+      "severity": "P1",
+      "title": "Регистрация попытки не фиксирует наблюдаемый native spawn/wait/stop как durable protocol",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "Helper сознательно не запускает модели. При этом dispatch оставляет PREPARED, schema допускает DISPATCHED, но отдельного перехода с наблюдаемым native handle нет; timeout/stop между регистрацией и возвращением в основном остаётся инструкцией оркестратору.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "1953–2045; 2176–2208; 5004–5037",
+          "observation": "Registration/termination есть, spawn/handle observation transition отсутствует; same-byte dispatch replay сохраняет prepared success."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/SKILL.md",
+          "lines": "18; 70–80",
+          "observation": "Helper bookkeeping-only; bounded waits и reconciliation обязательны для orchestrator."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/design/02-run-ledger-and-artifacts.md",
+          "lines": "section Takeover, checkout reuse and recovery",
+          "observation": "Epoch не убивает внешние writers; нужны stop/reuse proofs."
+        }
+      ],
+      "affected_functions": [
+        "cmd_dispatch",
+        "cmd_terminate_attempt",
+        "cmd_recover",
+        "attempt schema",
+        "orchestrator runtime adapter/instructions"
+      ],
+      "failure_modes": [
+        "Crash после native spawn до handle persistence оставляет неизвестную liveness.",
+        "Повтор dispatch response можно ошибочно трактовать как разрешение снова spawn.",
+        "Timeout/потеря UI handle не доказывает stop; safe lease reuse не выводится только из ledger.",
+        "Return malformed не может превращаться в user routine checkpoint без конкретного authority cause."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-11-F1",
+          "description": "Сохранить bookkeeping-only helper, но добавить durable observations: spawn-request identity, observed handle/session when available, observed start/progress/stop, inbox fingerprint, runtime build and coverage limits."
+        },
+        {
+          "id": "AH-11-F2",
+          "description": "Replay dispatch возвращает exact existing disposition и запрет повторного spawn; unknown actual spawn не retry-ится автоматически."
+        },
+        {
+          "id": "AH-11-F3",
+          "description": "Связать lost/interrupted/reuse с AH-03 proof-carrying finalization; missing runtime observation → explicit quarantine с выполнимым условием снятия."
+        },
+        {
+          "id": "AH-11-F4",
+          "description": "Провести runtime qualification: worker/reviewer interruption, descendant tools, wait liveness, malformed inbox, crash before/after spawn. Не объявлять unit-test mocks доказательством поведения Codex."
+        }
+      ],
+      "regression_scenarios": [
+        "Q14",
+        "Q15",
+        "Q16",
+        "Q22",
+        "Q23",
+        "Q26",
+        "Q36",
+        "Q37"
+      ],
+      "backward_compatibility_risk": "Legacy attempt без handle остаётся unknown, не not-started. Migration не выдумывает start/stop timestamps или native capabilities.",
+      "existing_run_recovery": "Для Worker05 в пакете есть accepted return/continuation proof, но live absence of background writers всё равно надо подтвердить на реальной машине перед reuse. Это не выполнено данным audit.",
+      "runtime_dependency": "Смешанная: durable adapter/contracts внутри skill; создание/остановка native процессов, скрытая память, лимиты и runtime wait вне полного контроля skill.",
+      "depends_on": [
+        "AH-03",
+        "AH-06"
+      ]
+    },
+    {
+      "id": "AH-12",
+      "severity": "P1",
+      "title": "Qualification не доказывает closure текущей state machine и пакет неполон для воспроизведения release claims",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "Model tests проверяют достижимость ручного JSON-графа, не реализации CLI и guards. Много tests начинают с вручную seed-нутого legal state и заканчивают до следующего проблемного transition. Часть release qualification и fixtures отсутствует в приложенном source packet.",
+      "evidence": [
+        {
+          "kind": "source_document",
+          "path": "source/tests/test_state_machine_model.py",
+          "lines": "1–67",
+          "observation": "Reachability analysis по lifecycle-model.json без вызовов ledger transitions."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/tests/test_continuation_candidates.py",
+          "lines": "154–238",
+          "observation": "Positive continuation scenario доходит до repair dispatch, не возвращает repair и не интегрирует."
+        },
+        {
+          "kind": "executed_tests",
+          "artifact": "baseline-tests.log",
+          "observation": "unittest discover: 80 entries, 71 pass, 2 failures+6 errors from unavailable packet dependencies, 1 opt-in skip."
+        }
+      ],
+      "affected_functions": [
+        "tests/*",
+        "experiments/v104_lifecycle_qualification.py (отсутствует в packet)",
+        "experiments/v1_40_ticket_qualification.py (отсутствует в packet)",
+        "schemas/contracts.schema.json",
+        "release/install manifest"
+      ],
+      "failure_modes": [
+        "Green helper/regression tests не предотвращают цепочку соседних lifecycle holes.",
+        "Нельзя независимо подтвердить заявленную полную qualification и runtime/source parity по неполному packet.",
+        "Schema 1.0 принимает несовместимые semantic states без schema-versioned migration contract."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-12-F1",
+          "description": "Сделать runnable full-source test package с fixtures и pinned hashes; missing package dependencies отделить от assertion failure кода."
+        },
+        {
+          "id": "AH-12-F2",
+          "description": "Превратить matrix Q01–Q40 в CLI end-to-end suite с реальным disposable Git, проверкой state tuple после каждого шага и исполнением advertised next command. Legacy corrupt fixtures разрешены только отдельным migration tests."
+        },
+        {
+          "id": "AH-12-F3",
+          "description": "Привязать transition table/reducer к generated tests и assertions; проверять достижимость safe recovery для любого accepted nonterminal post-state при явно смоделированных external blockers."
+        },
+        {
+          "id": "AH-12-F4",
+          "description": "Добавить crash/fault injection до/после каждого durable write и same-byte/conflicting replay каждого mutator."
+        },
+        {
+          "id": "AH-12-F5",
+          "description": "Ввести semantic schema version, legacy read-only diagnostics, explicit migration registry/provenance/rollback-to-snapshot plan и dry-run на supplied frozen revisions."
+        },
+        {
+          "id": "AH-12-F6",
+          "description": "Run complete CI + runtime qualification и install/source parity до общей v1.1.0 release; не считать тестовый JSON-граф доказательством implementation closure."
+        }
+      ],
+      "regression_scenarios": [
+        "Q01–Q40",
+        "P01–P32 as negative/positive regression seeds"
+      ],
+      "backward_compatibility_risk": "Новая schema может заблокировать legacy runs; сначала read-only classify, затем owner-approved append-only migration. Нельзя silently auto-upgrade неизвестные states.",
+      "existing_run_recovery": "Использовать rev58 и retained predecessor/successor snapshots как immutable regression fixtures; original archives не модифицировать и не fabricating missing rev32/37/47/52.",
+      "runtime_dependency": "Полная CLI qualification внутри repo при комплектных fixtures; реальный Codex qualification отдельно, не заменяется Python.",
+      "depends_on": [
+        "AH-01",
+        "AH-02",
+        "AH-03",
+        "AH-04",
+        "AH-05",
+        "AH-06",
+        "AH-07",
+        "AH-08",
+        "AH-09",
+        "AH-10",
+        "AH-11"
+      ]
+    },
+    {
+      "id": "AH-13",
+      "severity": "P2",
+      "title": "Операционные метрики и представления не отделяют регистрацию от фактического исполнения",
+      "status": "OPEN_IN_SUPPLIED_V1_0_11",
+      "root_cause": "Счётчики и presentation слои ориентированы на model/helper intent: dispatch увеличивает spawn_calls при регистрации, хотя native spawn вне helper. Проектный target малого числа helper calls не является фактическим протоколом v1.0.11.",
+      "evidence": [
+        {
+          "kind": "source",
+          "path": "source/tools/ledger.py",
+          "lines": "1953–2045; 1726–1791",
+          "observation": "Учёт регистрации, usage и views не является runtime observation."
+        },
+        {
+          "kind": "source_document",
+          "path": "source/design/02-run-ledger-and-artifacts.md",
+          "lines": "section Atomic publication and intent-level API",
+          "observation": "≤4 calls — design/economic target, не frozen CLI guarantee."
+        }
+      ],
+      "affected_functions": [
+        "usage accounting",
+        "cmd_status",
+        "cmd_render_view",
+        "dashboard projection"
+      ],
+      "failure_modes": [
+        "На дашборде registration count может выглядеть как фактические native spawns.",
+        "Большой history может затруднять чтение active blockers и recovery obligations, даже после исправления underlying model."
+      ],
+      "required_fixes": [
+        {
+          "id": "AH-13-F1",
+          "description": "Разделить prepared_attempts, observed_spawns, observed_stops и unknown_spawn; показывать источник метрики."
+        },
+        {
+          "id": "AH-13-F2",
+          "description": "После P0 correctness отобразить current candidate quality, active findings/debts, historical count и exact executable next action в status/dashboard."
+        },
+        {
+          "id": "AH-13-F3",
+          "description": "Оптимизацию числа calls и индексацию history делать после qualification; не сокращать проверки ради экономии токенов."
+        }
+      ],
+      "regression_scenarios": [
+        "Q14",
+        "Q21",
+        "Q23",
+        "Q37"
+      ],
+      "backward_compatibility_risk": "Старые spawn_calls не переинтерпретировать как observed runtime events; обозначить legacy estimate.",
+      "existing_run_recovery": "Для rev58 достаточно читать raw ledger+derived audit projection; реорганизация UI не prerequisite recovery.",
+      "runtime_dependency": "Внутри presentation/accounting; наблюдаемые runtime metrics доступны только при поддержке адаптера.",
+      "depends_on": [
+        "AH-01",
+        "AH-06",
+        "AH-11"
+      ]
+    }
+  ],
+  "known_incidents": [
+    {
+      "id": "A",
+      "title": "Contract binding lifecycle",
+      "root_cause_evidence": "Подтверждён для predecessor: rev119→120 показывает поздний блок; self-produced/proposed relation видна в snapshot. Новые design_bundle теперь имеют early guard.",
+      "v1_0_11_status": "Частично. Новый publish/gate guard есть; rev58 всё ещё содержит 9 self-input current tickets с active contracts и проходит общий validator. Не доказано, какой старый entry point их первоначально допустил.",
+      "residual_severity": "P0",
+      "related_findings": "AH-08",
+      "required_neighbor_tests": "Legacy load→ready/dispatch; active self-input; specification-input vs deliverable-output; successor inheritance."
+    },
+    {
+      "id": "B",
+      "title": "Worker dispatch / await",
+      "root_cause_evidence": "Инструкции явно исправлены: wait внутренний, bounded intervals и stop reconciliation. В packet нет полного native spawn/wait trace, поэтому фактическое поведение живого runtime независимо не подтверждено.",
+      "v1_0_11_status": "Instruction-level fix есть; гарантия выполнения и корректного restart отсутствует. Helper не держит agent loop и не подтверждает native handle.",
+      "residual_severity": "P1",
+      "related_findings": "AH-06, AH-11",
+      "required_neighbor_tests": "Quota/context cutoff; 3 no-progress waits; READY before spawn; unknown handle; child tools после interrupt; stale next_action."
+    },
+    {
+      "id": "C",
+      "title": "create → repair modify",
+      "root_cause_evidence": "Подтверждён packet/return Worker02, reconciliation audit и create-only исходной lease; код содержит guarded expansion.",
+      "v1_0_11_status": "Узкий путь исправлен, но контракт не един: general modify bypasses source/base/deny; source review допускается не всеми следующими командами.",
+      "residual_severity": "P0",
+      "related_findings": "AH-02, AH-03",
+      "required_neighbor_tests": "Create→modify→preserve hop; ordinary modify stale base; source review→BLOCK preserve; allow/deny overlap."
+    },
+    {
+      "id": "D",
+      "title": "Quarantined attempt recovery",
+      "root_cause_evidence": "Rev33 и worker02 reconciliation receipt подтверждают реальный guarded legacy reconciliation.",
+      "v1_0_11_status": "Исправлен ровно legacy returned DONE create→modify случай. Остальные quarantine intentionally block, но общего proof-carrying выхода в том же ticket нет.",
+      "residual_severity": "P0",
+      "related_findings": "AH-03",
+      "required_neighbor_tests": "LOST/INTERRUPTED quarantine с новым stop proof; non-DONE partial writes; reconciliation replay после lease release/integration."
+    },
+    {
+      "id": "E",
+      "title": "Transitive repair provenance",
+      "root_cause_evidence": "Worker03 packet/return, auth и candidate lineage в retained snapshots подтверждают последующий modify. Точного standalone rev37 и старого кода нет.",
+      "v1_0_11_status": "Транзитивный path validator существует. Но admission не универсален, preserve hops/source normalization и general candidate проверяются разными контрактами.",
+      "residual_severity": "P0",
+      "related_findings": "AH-02, AH-03",
+      "required_neighbor_tests": "Промежуточный repair не трогал ранее created path; несколько preserve hops; fork candidate; old finding на новом modify candidate; publication после stale source."
+    },
+    {
+      "id": "F",
+      "title": "BLOCKED no-change attempt",
+      "root_cause_evidence": "Worker04 return files=[] и rev48 closure receipt прямо подтверждают release lease и восстановление Worker03.",
+      "v1_0_11_status": "Узкий repair→BLOCKED→previous DONE исправлен. Initial BLOCK/HANDOFF, FAILED и previous CONTINUATION не покрыты.",
+      "residual_severity": "P0",
+      "related_findings": "AH-03",
+      "required_neighbor_tests": "Continuation→repair→no-change BLOCK; first attempt без candidate; replay closure после следующего dispatch."
+    },
+    {
+      "id": "G",
+      "title": "Undispatchable repair authorization",
+      "root_cause_evidence": "Rev49 defective auth05 и rev50 source-bound auth06 позволяют независимо проверить missing source и supersession.",
+      "v1_0_11_status": "Исправлена конкретная missing-source ветка. P12 даёт новую accepted auth с unchanged signature, которую dispatch гарантированно отвергает.",
+      "residual_severity": "P0",
+      "related_findings": "AH-02",
+      "required_neighbor_tests": "Unchanged retry; full packet zone заранее неизвестна; modify-zone invalid source/base; unused auth cancel/revoke/rebind."
+    },
+    {
+      "id": "H",
+      "title": "BLOCKED/HANDOFF с полезным непустым write-set",
+      "root_cause_evidence": "Worker05 return, rev53→54 и continuation receipt подтверждают корректное сохранение exact owned changes с retained blocker.",
+      "v1_0_11_status": "Сам preserve переход строгий и полезный. Lifecycle вокруг него не замкнут: P21/P22; нет общего завершения/снятия external debt.",
+      "residual_severity": "P0",
+      "related_findings": "AH-03, AH-05",
+      "required_neighbor_tests": "Continuation→no-change repair; source review; repeated continuation; repair DONE при неразрешённом external blocker; crash между effect/receipt/linkage."
+    },
+    {
+      "id": "I",
+      "title": "Review finding binding",
+      "root_cause_evidence": "Три current findings review05 имеют только criteria/contracts/requirements refs; attempt subject=T02-R17. Ingest проходит, authorize отвергает. P01 воспроизводит root cause.",
+      "v1_0_11_status": "Не исправлен. Сам subject известен, но canonicalization добавляет его только при некоторых формах reported refs.",
+      "residual_severity": "P0",
+      "related_findings": "AH-01",
+      "required_neighbor_tests": "Все refs глобальные; refs packet-local; conflicting/foreign ticket; empty refs; rebind exact old return без re-ingest."
+    },
+    {
+      "id": "J",
+      "title": "Stale next_action",
+      "root_cause_evidence": "Rev57→58: review05 PREPARED→RETURNED/BLOCK, reviewer lease released, но action остаётся await_blocked_candidate_review. В generic probe остаётся await_review_return.",
+      "v1_0_11_status": "Не исправлен. Это не только dashboard: persisted continuation предлагает ожидать уже принятый результат.",
+      "residual_severity": "P0",
+      "related_findings": "AH-01, AH-06",
+      "required_neighbor_tests": "PASS, BLOCK, UNVERIFIABLE; manual BLOCK; integrate; adjudication; duplicate return после restart."
+    },
+    {
+      "id": "K",
+      "title": "Historical vs actionable findings",
+      "root_cause_evidence": "В ledger 21 findings: 10 T02 code-review = 3 current+7 historical; остальные 11 — design. Все 10 code records без invalidated_by; 17 blocking issues.",
+      "v1_0_11_status": "Глубже отсутствия view: currentness/invalidations/issue mirroring неоднозначны. Existing migration касается design publications, не code-candidate lifecycle.",
+      "residual_severity": "P0",
+      "related_findings": "AH-01",
+      "required_neighbor_tests": "Старый unresolved finding после нового candidate; перенос verification debt; broad fresh review vs targeted resolution; mirrored issue без binding."
+    },
+    {
+      "id": "L",
+      "title": "Один finding → одна authorization",
+      "root_cause_evidence": "CLI/schema/active_repair_authorization поддерживают singular finding_ref; aggregate review_verdict issue может быть одной ссылкой, но не даёт individual closure всех findings.",
+      "v1_0_11_status": "Групповой audited repair как first-class переход отсутствует. Требовать 3 worker cycles при одном связанном изменении из файлов не следует.",
+      "residual_severity": "P0",
+      "related_findings": "AH-01, AH-09",
+      "required_neighbor_tests": "3 findings одного candidate→one scope→one worker→three verified outcomes; conflict scopes; partial resolution; G5 repair wave."
+    }
+  ],
+  "reconstructed_transitions": [
+    {
+      "command": "init",
+      "preconditions": "Execution root существует; нет same namespace; сканируется другой nonterminal run в control root.",
+      "durable_mutations": "revision=0; owner/epoch=0; settings; repository; lifecycle=PREFLIGHT/ACTIVE.",
+      "lease_behavior": "Нет attempts/leases.",
+      "candidate_linkage": "Нет.",
+      "finding_behavior": "Нет.",
+      "next_action": "preflight",
+      "terminality": "Run nonterminal.",
+      "recovery_path": "Повтор init отклоняется; читать status/recover. Не автоматическое successor inheritance.",
+      "source": "1666–1705"
+    },
+    {
+      "command": "publish-intent",
+      "preconditions": "PREFLIGHT/INTENT; no current intent; ACTIVE/BLOCKED/RECOVERING; CAS.",
+      "durable_mutations": "Canonical initial document, intent hash, revision+1, phase INTENT, runtime usage.",
+      "lease_behavior": "Не меняет existing leases.",
+      "candidate_linkage": "Не создаёт.",
+      "finding_behavior": "Existing issue_refs сохраняются.",
+      "next_action": "g1_build / resolve_blockers_before_g1 / finish_recovery_then_g1",
+      "terminality": "Nonterminal.",
+      "recovery_path": "Same-byte orphan document допустим до публикации; повтор уже состоявшегося initial binding запрещён.",
+      "source": "4014–4116"
+    },
+    {
+      "command": "adopt-requirements / publish-requirements",
+      "preconditions": "Exact intent doc/hash/epoch, authorized manifest; nonterminal legacy structural bootstrap.",
+      "durable_mutations": "Requirements/criteria + hash-addressed publication/provenance; same bytes idempotent.",
+      "lease_behavior": "Новых нет.",
+      "candidate_linkage": "Не меняет.",
+      "finding_behavior": "Не resolves code findings.",
+      "next_action": "Продолжение текущего phase; это не bypass G1/G2.",
+      "terminality": "Nonterminal migration.",
+      "recovery_path": "Conflicts BLOCK; новую историю не угадывает.",
+      "source": "4117–4213"
+    },
+    {
+      "command": "publish-design-bundle / publish-design",
+      "preconditions": "DESIGN; complete immutable bundle; current intent; early self-input guard; stopped publication leases; republish лишь design-repair eligibility.",
+      "durable_mutations": "Documents/contracts/tickets/routes/current+historical publication, rev; old consumers invalidated on replacement.",
+      "lease_behavior": "Requires no incompatible active leases.",
+      "candidate_linkage": "Не создаёт; old evidence может инвалидироваться.",
+      "finding_behavior": "Design lineage invalidation, не general code finding projection.",
+      "next_action": "Current-design review preparation.",
+      "terminality": "Nonterminal.",
+      "recovery_path": "После EXECUTE простой backward gate не обеспечивает допустимый republish; material revision path неполон.",
+      "source": "790–903; 4231–4325; 4668–4807"
+    },
+    {
+      "command": "prepare-design-review → ingest-return(review)",
+      "preconditions": "Current publication fingerprint/criteria/epoch/registration revision; identity/role.",
+      "durable_mutations": "Separate PREPARED review attempt; return stores immutable bytes, review_result, refs, review history.",
+      "lease_behavior": "Reviewer active→released при accepted return.",
+      "candidate_linkage": "Subject=design publication, не Git candidate.",
+      "finding_behavior": "Canonicalizes refs; historical migration отдельно.",
+      "next_action": "await_design_review_return до результата; затем G2/G3 через gate; review ingest action может быть stale.",
+      "terminality": "Attempt RETURNED terminal, run nonterminal.",
+      "recovery_path": "Malformed/stale stays un-ingested; terminate/reissue; design BLOCK может вести к republish+fresh reviews.",
+      "source": "2708–2789; 1831–1952"
+    },
+    {
+      "command": "gate G2/G3; PLAN→EXECUTE",
+      "preconditions": "Current G2 coverage PASS/G3 plan PASS, matching publication; current issues absent; tickets PLANNED/READY.",
+      "durable_mutations": "phase/control/reason/next_action; snapshot.",
+      "lease_behavior": "Entry checks, leases не выпускает.",
+      "candidate_linkage": "Нет нового.",
+      "finding_behavior": "Global blocking issues guard.",
+      "next_action": "Caller-supplied action, не derived enum.",
+      "terminality": "Nonterminal.",
+      "recovery_path": "BLOCKED plan repair→DESIGN; каждый new fingerprint требует fresh G2/G3.",
+      "source": "4871–4968"
+    },
+    {
+      "command": "ready-ticket",
+      "preconditions": "ACTIVE EXECUTE; ticket current PLANNED; dependencies INTEGRATED; criteria/contracts active.",
+      "durable_mutations": "Ticket READY; revision.",
+      "lease_behavior": "Не выдаёт lease; global occupancy не полностью проверяет.",
+      "candidate_linkage": "current_attempt не candidate-entity.",
+      "finding_behavior": "Не меняет.",
+      "next_action": "Dispatch readiness; actual dispatch отдельный.",
+      "terminality": "Nonterminal.",
+      "recovery_path": "Contract/criterion BLOCK требует scope decision; общий validator не ловит legacy self-input.",
+      "source": "2046–2071"
+    },
+    {
+      "command": "dispatch",
+      "preconditions": "Ticket READY; worker identity/epoch, serial checks, dependencies; optional route validation; effective lease; repair authorization/signature. Run control не проверяется единообразно.",
+      "durable_mutations": "Attempt PREPARED; packet/hash, base, repair auth/provenance, ticket RUNNING/current_attempt=new.",
+      "lease_behavior": "Active worker lease. PREPARED не доказывает native spawn.",
+      "candidate_linkage": "Old candidate лишь на прежнем attempt; pointer переезжает на нового без candidate.",
+      "finding_behavior": "Authorization consumed производно по attempt; finding не resolved.",
+      "next_action": "await_worker_return",
+      "terminality": "Attempt/run nonterminal.",
+      "recovery_path": "Exact bytes replay no new revision, но response не различает разрешение spawn; lost→terminate/reconcile.",
+      "source": "1953–2045"
+    },
+    {
+      "command": "validate-return; validate; audit-write-set",
+      "preconditions": "Read-only schema/state-bound checks или actual filesystem audit; это разные уровни.",
+      "durable_mutations": "Authoritative ledger не меняется.",
+      "lease_behavior": "Не выдаёт/release.",
+      "candidate_linkage": "Не создаёт.",
+      "finding_behavior": "Не создаёт.",
+      "next_action": "Не меняет.",
+      "terminality": "Нет transition.",
+      "recovery_path": "Reject incomplete/stale/malformed; одного validate недостаточно для later commands.",
+      "source": "1479–1626; 1792–1830; 2983–3146; 3717–3727"
+    },
+    {
+      "command": "ingest-return(worker DONE)",
+      "preconditions": "Exact inbox/run/attempt/hash/epoch, criteria/check semantics, declared write-set; ticket_id check отсутствует.",
+      "durable_mutations": "Attempt RETURNED, immutable return_ref; ticket обычно остаётся RUNNING.",
+      "lease_behavior": "Worker lease остаётся active reservation; declared outside-zone →quarantine.",
+      "candidate_linkage": "Candidate ещё нет.",
+      "finding_behavior": "Worker issues appended, если представлены; DONE blocking issue отвергается.",
+      "next_action": "audit_worker_return_and_prepare_candidate",
+      "terminality": "Attempt execution terminal; ticket/run nonterminal.",
+      "recovery_path": "Actual audit/effect/candidate; если quarantined — только узкая legacy reconcile либо stop/cancel path.",
+      "source": "1831–1952"
+    },
+    {
+      "command": "ingest-return(worker BLOCKED/FAILED/HANDOFF)",
+      "preconditions": "Matching return; typed issue для BLOCKED/FAILED; handoff payload для HANDOFF.",
+      "durable_mutations": "Attempt RETURNED; ticket BLOCKED; run BLOCKED; issues.",
+      "lease_behavior": "Обычно active; outside-zone quarantine.",
+      "candidate_linkage": "Candidate не создаётся.",
+      "finding_behavior": "Blocker сохраняется; HANDOFF не равен DONE.",
+      "next_action": "triage_or_repair",
+      "terminality": "Attempt returned, run nonterminal.",
+      "recovery_path": "files=[] repair+prior DONE →close; nonempty authorized external blocker→preserve; иные комбинации часто тупик.",
+      "source": "904–962; 1831–1952"
+    },
+    {
+      "command": "terminate-attempt",
+      "preconditions": "PREPARED/DISPATCHED only; evidence; release требует PASS+writer_stopped.",
+      "durable_mutations": "LOST/INTERRUPTED; typed termination issue; ticket/run BLOCKED.",
+      "lease_behavior": "released с stop proof иначе quarantined.",
+      "candidate_linkage": "Existing pointer может остаться lost attempt без candidate.",
+      "finding_behavior": "Новый blocking orchestration issue.",
+      "next_action": "recover_attempt",
+      "terminality": "Attempt terminal; run nonterminal.",
+      "recovery_path": "Generic returned-attempt closure отсутствует; quarantined lost не принимает legacy reconcile.",
+      "source": "2176–2208"
+    },
+    {
+      "command": "prepare-effect",
+      "preconditions": "CAS; новый либо exact matching op ID; unrestricted typed kind string.",
+      "durable_mutations": "Operation prepared,target,expected_before,intended_after,authority; snapshot.",
+      "lease_behavior": "Не меняет.",
+      "candidate_linkage": "Не меняет.",
+      "finding_behavior": "Не меняет.",
+      "next_action": "apply_prepared_effect",
+      "terminality": "Nonterminal.",
+      "recovery_path": "Crash requires reconcile; replay abandoned/uncertain misleadingly returns prepared.",
+      "source": "2574–2594"
+    },
+    {
+      "command": "candidate",
+      "preconditions": "Returned worker DONE; active lease; prepared candidate_commit op; minimal receipt PASS+SHA.",
+      "durable_mutations": "Candidate sha/tree на attempt; ticket CANDIDATE; op applied/receipt_ref.",
+      "lease_behavior": "Worker active reservation сохранена.",
+      "candidate_linkage": "current candidate не отдельный record; full Git proof weaker than preserve.",
+      "finding_behavior": "Не closes findings.",
+      "next_action": "review_change",
+      "terminality": "Nonterminal.",
+      "recovery_path": "Applied effect without linkage cannot use candidate; forged/minimal receipt accepted.",
+      "source": "2209–2260"
+    },
+    {
+      "command": "preserve-blocked-candidate",
+      "preconditions": "Current BLOCKED returned worker; active lease; nonempty exact audited write-set; owner auth; focused checks pass; all failures external/out-of-scope; strict base/tree/provenance.",
+      "durable_mutations": "Continuation receipt/auth applied/candidate sha/tree/operation applied; original return unchanged.",
+      "lease_behavior": "Active reservation сохраняется.",
+      "candidate_linkage": "CONTINUATION stored on worker; ticket/run remain BLOCKED.",
+      "finding_behavior": "External blocker сохранён.",
+      "next_action": "review_or_repair_continuation_candidate",
+      "terminality": "Nonterminal; не интегрируемый DONE.",
+      "recovery_path": "Review/authorized repair; repeated preserve supported narrowly; subsequent no-change repair closure broken.",
+      "source": "2261–2573"
+    },
+    {
+      "command": "prepare-review → ingest-return(review)",
+      "preconditions": "Candidate frozen/current, packet subject, criteria/axes semantics; continuation allowed; prepare epoch gap; authoritative barrier необязателен в ingest.",
+      "durable_mutations": "Separate review PREPARED then RETURNED; reviews/findings/issues; ticket REVIEW or continuation BLOCKED.",
+      "lease_behavior": "Reviewer active→released; worker reservation сохранена.",
+      "candidate_linkage": "Review pinned SHA; ticket.current_attempt остаётся worker.",
+      "finding_behavior": "PASS/BLOCK/UNVERIFIABLE; current binding missing possible.",
+      "next_action": "await_review_return / await_blocked_candidate_review; после обычного ingest часто stale.",
+      "terminality": "Review attempt terminal; ticket nonterminal.",
+      "recovery_path": "BLOCK→authorize; malformed→correct payload/stop/reissue; integrity failure must not be ingested.",
+      "source": "1434–1530; 1831–1952; 2655–2707"
+    },
+    {
+      "command": "authorize-repair",
+      "preconditions": "REVIEW/BLOCKED/REPAIR or narrow READY rebind; accepted blocking ticket-bound record; single contract; provenance only in special cases.",
+      "durable_mutations": "Decision authorized; finding.repair_contract_ref; ticket READY; optional old auth invalidation.",
+      "lease_behavior": "Same-ticket released if not in-flight/quarantined, без общего stop evidence requirement.",
+      "candidate_linkage": "current_attempt остаётся previous worker.",
+      "finding_behavior": "Не resolves; only one finding selected.",
+      "next_action": "dispatch_repair / dispatch_repair_with_blocker_retained",
+      "terminality": "Nonterminal.",
+      "recovery_path": "Missing source legacy rebind поддержан; unchanged/other incompatible READY auth — не general revoke/replan.",
+      "source": "981–1428; 2072–2175"
+    },
+    {
+      "command": "close-blocked-attempt",
+      "preconditions": "Current returned repair BLOCKED/files=[]; active lease; no candidate/effect; exact clean previous base; prior returned released DONE candidate.",
+      "durable_mutations": "Closure receipt/decision; current_attempt restored previous worker; ticket/run BLOCKED.",
+      "lease_behavior": "Blocked attempt lease released.",
+      "candidate_linkage": "Только previous DONE, не CONTINUATION.",
+      "finding_behavior": "Scope issue остаётся; new auth needed.",
+      "next_action": "authorize_repair",
+      "terminality": "Attempt safely disposed, ticket nonterminal.",
+      "recovery_path": "No generalization for implement/HANDOFF/FAILED/previous continuation; replay after progress may fail.",
+      "source": "3147–3346"
+    },
+    {
+      "command": "reconcile-quarantined-attempt",
+      "preconditions": "Exact returned repair DONE, quarantined legacy create→modify mismatch; owner actor/finding/prior/base/audit, current pointer.",
+      "durable_mutations": "Receipt+decision, reconciled lease/provenance, invalidated exact write-set issue.",
+      "lease_behavior": "quarantined→active reservation.",
+      "candidate_linkage": "Candidate ещё отдельным candidate command.",
+      "finding_behavior": "Только доказанный legacy mismatch reconciled.",
+      "next_action": "prepare_candidate_effect",
+      "terminality": "Nonterminal.",
+      "recovery_path": "Other quarantine rejected; no bypass uncertain liveness. Replay после дальнейшего release не stable.",
+      "source": "3347–3716"
+    },
+    {
+      "command": "reconcile-effect",
+      "preconditions": "Только operation prepared; result applied/uncertain/unchanged; optional receipt fields.",
+      "durable_mutations": "Operation applied / uncertain / abandoned; limited observed Git checks.",
+      "lease_behavior": "Не даёт general target reuse guard.",
+      "candidate_linkage": "Не публикует candidate linkage.",
+      "finding_behavior": "uncertain sets BLOCKED.",
+      "next_action": "resume_after_reconciled_effect / reconcile_uncertain_effect / decide_effect_retry",
+      "terminality": "Nonterminal или completed effect.",
+      "recovery_path": "uncertain cannot re-enter; applied candidate cannot candidate(); abandoned same ID not rearmed.",
+      "source": "2595–2654"
+    },
+    {
+      "command": "adjudicate",
+      "preconditions": "Typed reason/evidence; conflicting review refs либо disagreement issue.",
+      "durable_mutations": "Decision; issue disposition/decision_ref; control.",
+      "lease_behavior": "Не закрывает subject writer/reviewer.",
+      "candidate_linkage": "Candidate unchanged assumed, not full currentness projection.",
+      "finding_behavior": "PASS removes disagreement from lifecycle.issue_refs, но impact blocking остаётся.",
+      "next_action": "continue_after_adjudication / repair_or_user_decision",
+      "terminality": "Nonterminal.",
+      "recovery_path": "Следующий gate может опять блокироваться тем же issue.",
+      "source": "2790–2841"
+    },
+    {
+      "command": "integrate",
+      "preconditions": "Nonmanual review PREPARED/RETURNED; supplied PASS; selected candidate matches linked worker; minimal integrity receipt; continuation direct excluded.",
+      "durable_mutations": "Ticket INTEGRATED; selected review record/return_ref; issues/finding invalidation частична.",
+      "lease_behavior": "Selected reviewer + linked worker released, другие review leases не aggregate guarded.",
+      "candidate_linkage": "Current worker SHA retained as integrated, no actual Git landing action inside helper.",
+      "finding_behavior": "Можно overwrite accepted BLOCK; broad issue invalidation vs single finding.",
+      "next_action": "Может оставаться stale; явно не recomputed в normal completion.",
+      "terminality": "Ticket terminal-for-current-scope, run nonterminal.",
+      "recovery_path": "Current multiple axes/blockers не uniformly checked; new candidate repair review needed; amendment makes stale.",
+      "source": "2842–2939"
+    },
+    {
+      "command": "prepare-handoff",
+      "preconditions": "Review/acceptance packet+full projection, frozen candidate, current intent; bundle/export disjoint.",
+      "durable_mutations": "Export manifest, packet/projection/checklist; existing attempt mode→user_assisted/PREPARED.",
+      "lease_behavior": "Lease не получает отдельный proof of writer stop.",
+      "candidate_linkage": "Pinned fingerprint сохранён.",
+      "finding_behavior": "Не создаёт.",
+      "next_action": "import_manual_review; BLOCKED/manual_review_pending",
+      "terminality": "Nonterminal real user checkpoint.",
+      "recovery_path": "New manual return; packet review-kind can become unimportable as acceptance; no exact idempotency.",
+      "source": "3787–3895"
+    },
+    {
+      "command": "import-manual",
+      "preconditions": "User-assisted review, intent/packet/env/context/manifest/ledger baseline; acceptance packet only; current attempt state/owner epoch guard incomplete.",
+      "durable_mutations": "Acceptance record+evidence; returned/released reviewer; PASS→ACCEPT ACTIVE, maybe ticket INTEGRATED.",
+      "lease_behavior": "Worker lease при per-ticket use остаётся active.",
+      "candidate_linkage": "Candidate argument equals packet; no unified final candidate generation obligation.",
+      "finding_behavior": "Payload BLOCK findings не appended в durable findings/issues; outcome_refs empty.",
+      "next_action": "PASS g6_final_record; BLOCK старый import_manual_review.",
+      "terminality": "Review terminal; run nonterminal.",
+      "recovery_path": "Manual BLOCK не даёт штатных repair targets; critical-axis vs final G5 purpose смешаны.",
+      "source": "3896–4013"
+    },
+    {
+      "command": "gate G4/G6",
+      "preconditions": "G4 current tickets INTEGRATED/no global blockers/no leases/effects; G6 ACCEPT+latest current-intent G5 PASS+closures.",
+      "durable_mutations": "Phase/control; snapshot.",
+      "lease_behavior": "Must be closed; gate не закрывает их.",
+      "candidate_linkage": "G6 lacks own mandatory current candidate generation comparison.",
+      "finding_behavior": "Global blocking issue predicate, не lifecycle.issue_refs only.",
+      "next_action": "Caller-supplied; G6 terminal action.",
+      "terminality": "G6→ACCEPTED terminal, G4 nonterminal.",
+      "recovery_path": "Stale issue projection creates gate deadlock; accepted run must not reopen.",
+      "source": "4871–4968"
+    },
+    {
+      "command": "amend",
+      "preconditions": "Authority text, current intent, duplicate checks внутри transaction; canonical write происходит раньше fence.",
+      "durable_mutations": "New intent/invalidation closure; tickets STALE; attempts invalidated; phase INTENT ACTIVE.",
+      "lease_behavior": "PREPARED/DISPATCHED quarantined, но не остановлены процессно.",
+      "candidate_linkage": "Old candidates historical/stale.",
+      "finding_behavior": "All affected records invalidated, broad closure.",
+      "next_action": "g1_recheck with quiesce as textual precondition.",
+      "terminality": "Должен быть nonterminal; common guard отсутствует.",
+      "recovery_path": "Same canonical version stale call may corrupt bytes before rejection; нужна storage/transition hardening.",
+      "source": "4808–4870"
+    },
+    {
+      "command": "gate QUIESCING/PAUSED; cancel request/finalize",
+      "preconditions": "Pause требует QUIESCING+no leases/effects; cancel finalize PASS writers_stopped/reconciled and no prepared/uncertain effects.",
+      "durable_mutations": "QUIESCING then PAUSED/CANCELLED; pending attempts interrupted, unfinished tickets cancelled.",
+      "lease_behavior": "Finalize releases active/quarantined; evidence not retained as immutable ref.",
+      "candidate_linkage": "Частичные изменения не reset/revert; candidates history сохраняется.",
+      "finding_behavior": "History сохраняется; no product rollback.",
+      "next_action": "stop_reconcile_then_cancel / terminal_cancelled",
+      "terminality": "CANCELLED terminal, PAUSED nonterminal.",
+      "recovery_path": "Dispatch всё ещё может после request; no implicit destructive cleanup; successor explicit.",
+      "source": "4871–5003"
+    },
+    {
+      "command": "recover",
+      "preconditions": "Current либо verified prev/snapshot; owner token, optional takeover/attestation.",
+      "durable_mutations": "RECOVERING/reconcile_actual_state; epoch++ при takeover; new revision.",
+      "lease_behavior": "Takeover quarantines in-flight only; returned active reservation needs separate audit.",
+      "candidate_linkage": "Pointers from selected snapshot, actual Git не автоматически reconciled.",
+      "finding_behavior": "Не делает general resolution.",
+      "next_action": "reconcile_actual_state",
+      "terminality": "Current code reopens even CANCELLED (defect).",
+      "recovery_path": "Далее узкие reconciliation commands; malformed/unknown schema diagnose read-only.",
+      "source": "5004–5037"
+    },
+    {
+      "command": "migrate-review-currentness",
+      "preconditions": "Nonterminal; fresh current design coverage+plan PASS; exact publication lineage.",
+      "durable_mutations": "Audited migration/provenance and targeted invalidations.",
+      "lease_behavior": "Не может auto-release product writers.",
+      "candidate_linkage": "Не является migration code candidate lineage.",
+      "finding_behavior": "Historical design chains only; ambiguous remain blocking.",
+      "next_action": "Current design continuation.",
+      "terminality": "Nonterminal migration.",
+      "recovery_path": "Не использовать для 7 historical T02 code findings без расширенного protocol.",
+      "source": "4373–4654"
+    },
+    {
+      "command": "status / brief / render-view / diagnose; publish-usage",
+      "preconditions": "Read projections; usage publishing имеет отдельный CAS event.",
+      "durable_mutations": "Views outside authority; usage counters/traces only.",
+      "lease_behavior": "Не меняет authorization лизов.",
+      "candidate_linkage": "Не authoritative candidate transition.",
+      "finding_behavior": "Не resolves.",
+      "next_action": "Проецирует stored next_action, в v1.0.11 возможен stale.",
+      "terminality": "No lifecycle transition.",
+      "recovery_path": "Refresh view не исправляет ledger consistency; allowed terminal telemetry надо явно whitelist.",
+      "source": "1706–1830"
+    }
+  ],
+  "qualification_matrix": [
+    {
+      "id": "Q01",
+      "scenario": "Happy path без repair",
+      "end_to_end_path": "BOOT→ready→dispatch→DONE→audit→effect→candidate→review PASS→integrate",
+      "checkpoint": {
+        "ticket_status": "INTEGRATED",
+        "run_control": "ACTIVE",
+        "current_attempt": "null; last=A1 RETURNED",
+        "current_candidate": "C1 DONE/INTEGRATED",
+        "leases": "Все released; no writers",
+        "active_findings": "∅",
+        "historical_findings": "∅",
+        "authorization_state": "Нет repair auth",
+        "next_action": "schedule_next_or_g4",
+        "next_command": "ready-ticket либо gate G4"
+      },
+      "completion_assertion": "Продолжить G4→qualified G5 PASS→G6 ACCEPTED; unchanged hashes, zero active leases/effects/blockers."
+    },
+    {
+      "id": "Q02",
+      "scenario": "Один repair",
+      "end_to_end_path": "BOOT→C1→review F1→authorize→A2 DONE→C2→targeted+required PASS→integrate",
+      "checkpoint": {
+        "ticket_status": "INTEGRATED",
+        "run_control": "ACTIVE",
+        "current_attempt": "null; last=A2",
+        "current_candidate": "C2 DONE/INTEGRATED",
+        "leases": "Все released",
+        "active_findings": "∅",
+        "historical_findings": "F1 resolved с independent proof",
+        "authorization_state": "AUTH1 consumed by A2",
+        "next_action": "schedule_next_or_g4",
+        "next_command": "ready-ticket/gate"
+      },
+      "completion_assertion": "History C1/BLOCK неизменна; exactly one consumed auth and one independently closed F1."
+    },
+    {
+      "id": "Q03",
+      "scenario": "Несколько последовательных repairs",
+      "end_to_end_path": "BOOT→C1 F1→A2/C2 F2→A3/C3 F3→A4/C4 PASS→integrate",
+      "checkpoint": {
+        "ticket_status": "INTEGRATED",
+        "run_control": "ACTIVE",
+        "current_attempt": "null; last=A4",
+        "current_candidate": "C4 DONE/INTEGRATED",
+        "leases": "Все released",
+        "active_findings": "∅",
+        "historical_findings": "F1…F3 independently resolved/superseded with obligations discharged",
+        "authorization_state": "AUTH1…3 consumed once",
+        "next_action": "schedule_next_or_g4",
+        "next_command": "ready-ticket/gate"
+      },
+      "completion_assertion": "Пройти create→modify цепь целиком; никаких ручных pointer edits и stale bindings."
+    },
+    {
+      "id": "Q04",
+      "scenario": "Один repair закрывает несколько findings",
+      "end_to_end_path": "BOOT→C1→same-round F1,F2,F3→group AUTH→one A2→C2→per-finding outcomes",
+      "checkpoint": {
+        "ticket_status": "REVIEW",
+        "run_control": "ACTIVE",
+        "current_attempt": "null; last=A2",
+        "current_candidate": "C2 DONE",
+        "leases": "Worker reservation; reviewer stopped/released",
+        "active_findings": "F1..3 verification obligations до подтверждения; затем ∅",
+        "historical_findings": "Original three findings сохранены",
+        "authorization_state": "One AUTH findings=[F1,F2,F3], consumed by A2",
+        "next_action": "integrate_when_all_obligations_pass",
+        "next_command": "integrate"
+      },
+      "completion_assertion": "Один worker cycle, три отдельные closure proofs; частичный PASS не закрывает остальных; закончить INTEGRATED."
+    },
+    {
+      "id": "Q05",
+      "scenario": "No-change BLOCK",
+      "end_to_end_path": "BOOT→C1→repair A2 BLOCK files=[]→stop+clean audit→finalize restore",
+      "checkpoint": {
+        "ticket_status": "BLOCKED",
+        "run_control": "BLOCKED",
+        "current_attempt": "null; last=A2 BLOCKED",
+        "current_candidate": "C1 retained",
+        "leases": "A2 released; no live writers",
+        "active_findings": "Исходный F1/scope blocker остаётся active",
+        "historical_findings": "Attempt A2 immutable; old findings retained",
+        "authorization_state": "Old consumed; new authorization absent",
+        "next_action": "replan_repair_scope",
+        "next_command": "authorize-repair after cause/scope decision"
+      },
+      "completion_assertion": "Новая auth→A3 DONE→C2 PASS→INTEGRATED; проверить также initial implement без C1."
+    },
+    {
+      "id": "Q06",
+      "scenario": "BLOCK с непустым валидным write-set",
+      "end_to_end_path": "BOOT→A1 BLOCK external E, focused PASS→strict audit→preserve",
+      "checkpoint": {
+        "ticket_status": "BLOCKED",
+        "run_control": "BLOCKED",
+        "current_attempt": "null; last=A1 BLOCKED",
+        "current_candidate": "C1 CONTINUATION",
+        "leases": "Reservation only; writer stopped",
+        "active_findings": "External E active",
+        "historical_findings": "Original BLOCK unchanged",
+        "authorization_state": "CONT auth applied, no repair auth",
+        "next_action": "review_or_authorize_continuation_repair",
+        "next_command": "prepare-review / authorize-repair"
+      },
+      "completion_assertion": "После valid repair и E resolution получить DONE C2→fresh required reviews→INTEGRATED; direct integrate C1 rejects."
+    },
+    {
+      "id": "Q07",
+      "scenario": "HANDOFF",
+      "end_to_end_path": "BOOT→A1 HANDOFF; variants files=[] and owned nonempty→finalize",
+      "checkpoint": {
+        "ticket_status": "BLOCKED",
+        "run_control": "BLOCKED",
+        "current_attempt": "null; last=A1 HANDOFF",
+        "current_candidate": "Prior C0 or new C1 CONTINUATION per audited disposition",
+        "leases": "Stopped/released or safe reservation; never unknown released",
+        "active_findings": "Remaining-work/external obligation active",
+        "historical_findings": "HANDOFF immutable",
+        "authorization_state": "Continuation auth only for valid preserve",
+        "next_action": "resume_authorized_work",
+        "next_command": "authorize-repair/retry after qualified base"
+      },
+      "completion_assertion": "Fresh A2 finishes work→DONE→review→integrate; HANDOFF itself not success."
+    },
+    {
+      "id": "Q08",
+      "scenario": "Внешний/out-of-scope blocker",
+      "end_to_end_path": "BOOT→worker BLOCK E→preserve; separate authorized environment/resource resolution",
+      "checkpoint": {
+        "ticket_status": "BLOCKED",
+        "run_control": "BLOCKED",
+        "current_attempt": "null",
+        "current_candidate": "C1 CONTINUATION",
+        "leases": "No writer; reservation tracked",
+        "active_findings": "E remains until exact resolution evidence",
+        "historical_findings": "No fake criterion resolution",
+        "authorization_state": "Separate environment authority, not silently broader ticket auth",
+        "next_action": "resolve_external_blocker",
+        "next_command": "TARGET: resolve-blocker with evidence"
+      },
+      "completion_assertion": "Required suite rerun on correct candidate; failed E never excluded only for convenience; repair/DONE/review/integrate."
+    },
+    {
+      "id": "Q09",
+      "scenario": "Quarantine + reconciliation",
+      "end_to_end_path": "BOOT→declared/actual lease mismatch→quarantine→stop proof→typed reconcile",
+      "checkpoint": {
+        "ticket_status": "BLOCKED or CANDIDATE",
+        "run_control": "RECOVERING until all reuse proofs PASS",
+        "current_attempt": "null; last quarantined attempt retained",
+        "current_candidate": "No candidate until proof; then audited C1",
+        "leases": "quarantined→reservation/released only with proof",
+        "active_findings": "Violation active until exact scope/provenance adjudication",
+        "historical_findings": "Original violation retained",
+        "authorization_state": "Reconciliation authorized, no scope widening",
+        "next_action": "finalize_reconciled_attempt",
+        "next_command": "TARGET: finalize/reconcile attempt"
+      },
+      "completion_assertion": "Legacy create repair and generic stopped lost variants complete to review/integrate; failed proof stays explicit quarantine."
+    },
+    {
+      "id": "Q10",
+      "scenario": "Stale/forked provenance",
+      "end_to_end_path": "BOOT→C1→F1; try foreign source or wrong base or unrelated create lineage",
+      "checkpoint": {
+        "ticket_status": "Unchanged previous state",
+        "run_control": "Unchanged",
+        "current_attempt": "Unchanged",
+        "current_candidate": "C1 unchanged",
+        "leases": "No new lease",
+        "active_findings": "F1 remains",
+        "historical_findings": "Unchanged",
+        "authorization_state": "Invalid auth/packet not published",
+        "next_action": "rebuild_candidate_bound_plan",
+        "next_command": "authorize-repair with exact current source"
+      },
+      "completion_assertion": "Reject before READY/dispatch; correct packet then full repair→integrate; verify no orphan active auth."
+    },
+    {
+      "id": "Q11",
+      "scenario": "Finding без ticket binding",
+      "end_to_end_path": "BOOT→C1→registered single-ticket review return refs=[global criterion]",
+      "checkpoint": {
+        "ticket_status": "REVIEW/BLOCKED per verdict",
+        "run_control": "BLOCKED on accepted BLOCK",
+        "current_attempt": "null",
+        "current_candidate": "C1",
+        "leases": "Reviewer released only after accepted strict ingest",
+        "active_findings": "Canonical F1 bound to ticket/candidate; raw refs unchanged",
+        "historical_findings": "∅",
+        "authorization_state": "Ready for valid auth, not stranded",
+        "next_action": "triage_current_findings",
+        "next_command": "authorize-repair"
+      },
+      "completion_assertion": "Either canonicalize exact registered subject safely or reject before ingest with exact missing-field remedy; corrected path must reach INTEGRATED."
+    },
+    {
+      "id": "Q12",
+      "scenario": "Finding rebind recovery",
+      "end_to_end_path": "Legacy frozen current review findings lack ticket; read-only classify→owner event→replay",
+      "checkpoint": {
+        "ticket_status": "BLOCKED",
+        "run_control": "BLOCKED",
+        "current_attempt": "null; last returned worker",
+        "current_candidate": "Exact unchanged legacy candidate",
+        "leases": "No release without stop proof",
+        "active_findings": "Exact re-bound current set",
+        "historical_findings": "Original return+reported refs immutable",
+        "authorization_state": "New auth possible after binding event",
+        "next_action": "authorize_current_findings",
+        "next_command": "authorize-repair"
+      },
+      "completion_assertion": "Replay event no-op; conflicting ticket/candidate/hash rejected; next repair/review/integrate succeeds."
+    },
+    {
+      "id": "Q13",
+      "scenario": "Historical vs active findings",
+      "end_to_end_path": "BOOT→C1 F1/F2→C2 F3; create current projection and carry-forward obligations",
+      "checkpoint": {
+        "ticket_status": "REVIEW",
+        "run_control": "BLOCKED",
+        "current_attempt": "null; last current worker",
+        "current_candidate": "C2",
+        "leases": "No live writers",
+        "active_findings": "F3 current; unresolved F1/F2 verification debt, not silent resolved",
+        "historical_findings": "F1/F2 old-subject history",
+        "authorization_state": "New auth references current resolved mapping, not arbitrary old finding",
+        "next_action": "resolve_current_findings_and_debt",
+        "next_command": "authorize-repair / targeted re-review"
+      },
+      "completion_assertion": "Close all debts only with proof; integration rejects unresolved historical concern affecting current candidate."
+    },
+    {
+      "id": "Q14",
+      "scenario": "Duplicate worker return / review ingest",
+      "end_to_end_path": "BOOT→dispatch twice→same return twice→same review twice→conflicting replay",
+      "checkpoint": {
+        "ticket_status": "State equals first valid publication",
+        "run_control": "Unchanged",
+        "current_attempt": "One registered attempt, no respawn",
+        "current_candidate": "One candidate",
+        "leases": "No duplicate lease/release",
+        "active_findings": "No duplicate findings",
+        "historical_findings": "One historical record per content/event",
+        "authorization_state": "Consumption count=1",
+        "next_action": "Original valid next_action",
+        "next_command": "Proceed to candidate/integrate; replay has no side effect"
+      },
+      "completion_assertion": "Wrong duplicate rejected uniformly by ingest and integrate; retry after later revisions returns immutable prior result, not new authority."
+    },
+    {
+      "id": "Q15",
+      "scenario": "Lost worker / timeout",
+      "end_to_end_path": "BOOT→PREPARED/native spawn uncertain→timeout→LOST→stop/reuse audit",
+      "checkpoint": {
+        "ticket_status": "BLOCKED",
+        "run_control": "BLOCKED/RECOVERING",
+        "current_attempt": "null; last=A1 LOST",
+        "current_candidate": "Prior C0 or qualified partial snapshot, never guessed DONE",
+        "leases": "quarantined until liveness proven; then explicit disposition",
+        "active_findings": "Termination/liveness issue active until reconciled",
+        "historical_findings": "Partial return/files retained",
+        "authorization_state": "Fresh retry/repair only after reconciliation",
+        "next_action": "reconcile_attempt_liveness",
+        "next_command": "TARGET: finalize-lost-attempt"
+      },
+      "completion_assertion": "No-change and partial-created-file variants proceed to fresh worker and integrate; unknown writers permit explicit cancel/new isolated scope, not reuse."
+    },
+    {
+      "id": "Q16",
+      "scenario": "Interrupted reviewer",
+      "end_to_end_path": "BOOT→C1→review interrupted/mutated export→stop→new review on pristine same C1",
+      "checkpoint": {
+        "ticket_status": "REVIEW",
+        "run_control": "BLOCKED until new reviewer registered",
+        "current_attempt": "null; old RV INTERRUPTED",
+        "current_candidate": "C1 unchanged",
+        "leases": "Old reviewer released with proof; new one active during review",
+        "active_findings": "Old interruption operational obligation; un-ingested findings not active",
+        "historical_findings": "Invalid old output kept nonauthoritative",
+        "authorization_state": "No repair based on un-ingested return",
+        "next_action": "prepare_replacement_review",
+        "next_command": "prepare-review new attempt"
+      },
+      "completion_assertion": "New review→proper finding repair or PASS integration; old interrupted return cannot enter authoritative ingest/manual import."
+    },
+    {
+      "id": "Q17",
+      "scenario": "Continuation candidate → repair",
+      "end_to_end_path": "BOOT→C1 CONT→review F1→grouped auth→repair dispatch",
+      "checkpoint": {
+        "ticket_status": "RUNNING",
+        "run_control": "BLOCKED if E still active",
+        "current_attempt": "A2 PREPARED/observed running",
+        "current_candidate": "C1 CONTINUATION remains explicitly linked",
+        "leases": "Only A2 writer lease active; prior writer stopped",
+        "active_findings": "F1 under repair; E retained",
+        "historical_findings": "Original BLOCK/candidate history",
+        "authorization_state": "AUTH consumed by A2 with exact C1/source",
+        "next_action": "await_worker_return",
+        "next_command": "internal wait/ingest"
+      },
+      "completion_assertion": "Complete A2 return, not stop at dispatch: nochange→restore C1, partial→C2 CONT, DONE allowed only with required proofs; final integration after debt closure."
+    },
+    {
+      "id": "Q18",
+      "scenario": "Continuation → DONE → review",
+      "end_to_end_path": "BOOT→C1 CONT→E resolution→repair A2 DONE→C2→all required PASS",
+      "checkpoint": {
+        "ticket_status": "INTEGRATED",
+        "run_control": "ACTIVE",
+        "current_attempt": "null; last=A2",
+        "current_candidate": "C2 DONE/INTEGRATED",
+        "leases": "All released",
+        "active_findings": "∅",
+        "historical_findings": "C1 original BLOCK stays; E resolved with evidence",
+        "authorization_state": "Repair auth consumed; continuation auth remains history",
+        "next_action": "schedule_next_or_g4",
+        "next_command": "ready-ticket/gate"
+      },
+      "completion_assertion": "Direct integrate CONT rejected; DONE label alone cannot erase unresolved E from prior lineage."
+    },
+    {
+      "id": "Q19",
+      "scenario": "Critical review barrier",
+      "end_to_end_path": "BOOT critical ticket→DONE C1→routine PASS; missing/failed critical axis→blocked",
+      "checkpoint": {
+        "ticket_status": "REVIEW",
+        "run_control": "BLOCKED while required axis pending/failed",
+        "current_attempt": "null",
+        "current_candidate": "C1",
+        "leases": "Worker reservation; independent reviewer grants qualified",
+        "active_findings": "Missing axis/contamination obligation remains",
+        "historical_findings": "Routine PASS retained, not sufficient",
+        "authorization_state": "No implicit user-assisted bypass",
+        "next_action": "complete_required_critical_axis",
+        "next_command": "prepare-handoff purpose=critical_axis"
+      },
+      "completion_assertion": "Qualified fresh critical PASS closes axis; integrate ticket releases reservation; does not jump directly to final ACCEPT."
+    },
+    {
+      "id": "Q20",
+      "scenario": "Successor run",
+      "end_to_end_path": "BOOT predecessor→quiesce→cancel→owner-approved successor manifest→new BOOT",
+      "checkpoint": {
+        "ticket_status": "Old unfinished tickets CANCELLED; new PLANNED/READY",
+        "run_control": "Old CANCELLED; new ACTIVE/BLOCKED per inheritance",
+        "current_attempt": "New attempt namespace only",
+        "current_candidate": "Verified inherited candidate/base, not inherited DONE verdict blindly",
+        "leases": "Old released or isolated under explicit scope; new ownership explicit",
+        "active_findings": "Inherited unresolved concerns explicit",
+        "historical_findings": "Predecessor history byte-identical",
+        "authorization_state": "Parent scope decision and import manifest bound",
+        "next_action": "qualify_inherited_artifacts_then_execute",
+        "next_command": "TARGET: publish-successor / normal bootstrap"
+      },
+      "completion_assertion": "Proceed one new ticket to INTEGRATED; missing resource or bad parent hash blocks before READY; old run never reopened."
+    },
+    {
+      "id": "Q21",
+      "scenario": "Wave transition",
+      "end_to_end_path": "BOOT→wave tickets repair/review/integrate→aggregate wave-close",
+      "checkpoint": {
+        "ticket_status": "Wave members INTEGRATED",
+        "run_control": "ACTIVE only if required debts closed",
+        "current_attempt": "null",
+        "current_candidate": "Common frozen wave candidate",
+        "leases": "No live/reserved required writers or pending effects",
+        "active_findings": "∅ for wave obligations",
+        "historical_findings": "All prior findings retained with outcomes",
+        "authorization_state": "All used auth consumed; stale unused revoked",
+        "next_action": "next_wave_or_g4",
+        "next_command": "TARGET: finalize-wave / ready-ticket"
+      },
+      "completion_assertion": "Next wave dependencies see only reviewed current results; mid-wave cancellation/pending axis prevents closure."
+    },
+    {
+      "id": "Q22",
+      "scenario": "Crash/restart между durable steps",
+      "end_to_end_path": "BOOT through entire lifecycle; inject fault at every write boundary and replay",
+      "checkpoint": {
+        "ticket_status": "Last committed valid ticket state or reconciled successor state",
+        "run_control": "RECOVERING until exact effects resolved",
+        "current_attempt": "Known registered attempt; unknown spawn not duplicated",
+        "current_candidate": "Exact proven existing candidate; no guessed link",
+        "leases": "No premature release/reuse",
+        "active_findings": "No dropped/duplicate findings",
+        "historical_findings": "Immutable objects preserved",
+        "authorization_state": "Exactly-once logical consumption despite retries",
+        "next_action": "reconcile_exact_boundary",
+        "next_command": "recover + typed reconcile/finalize"
+      },
+      "completion_assertion": "For each fault point recover to INTEGRATED/ACCEPTED or explicit externally blocked/cancelled without data loss; not only JSON validity."
+    },
+    {
+      "id": "Q23",
+      "scenario": "Idempotent recovery",
+      "end_to_end_path": "BOOT→each recovery once→other valid progress→same recovery replay",
+      "checkpoint": {
+        "ticket_status": "Current advanced state unchanged",
+        "run_control": "Unchanged",
+        "current_attempt": "No rollback of current attempt",
+        "current_candidate": "No rollback to older candidate",
+        "leases": "No reopen of released lease",
+        "active_findings": "No resurrection/invalidation duplication",
+        "historical_findings": "Original recovery event retained once",
+        "authorization_state": "No reconsumption",
+        "next_action": "Current next_action unchanged",
+        "next_command": "Continue current eligible action"
+      },
+      "completion_assertion": "Replay of terminate/preserve/closure/reconcile/manual-import/adjudicate does not require old mutable post-state forever; conflicting args rejected."
+    },
+    {
+      "id": "Q24",
+      "scenario": "Integration после многих repairs",
+      "end_to_end_path": "BOOT→create A1→modify A2→preserve-path A3→modify A4→final C4 all reviews",
+      "checkpoint": {
+        "ticket_status": "INTEGRATED",
+        "run_control": "ACTIVE",
+        "current_attempt": "null; last=A4",
+        "current_candidate": "C4 DONE/INTEGRATED",
+        "leases": "All released",
+        "active_findings": "∅",
+        "historical_findings": "Each finding provenance/resolution retained",
+        "authorization_state": "Each auth once, source chain complete",
+        "next_action": "schedule_next_or_g4",
+        "next_command": "ready-ticket/gate"
+      },
+      "completion_assertion": "No blanket invalidation, no stale/fork edge, no remaining same-ticket reservation; complete G4/G5."
+    },
+    {
+      "id": "Q25",
+      "scenario": "Authorize accepted ⇒ next dispatch admissible",
+      "end_to_end_path": "BOOT→F1→repeat unchanged repair or bad scope/source attempt at authorization",
+      "checkpoint": {
+        "ticket_status": "Previous REVIEW/BLOCKED, not new READY",
+        "run_control": "Unchanged",
+        "current_attempt": "Unchanged",
+        "current_candidate": "Current C1",
+        "leases": "No new active lease",
+        "active_findings": "F1 still active",
+        "historical_findings": "Unchanged",
+        "authorization_state": "No doomed authorization published",
+        "next_action": "repair_preflight_error",
+        "next_command": "Correct AttemptPlan then authorize"
+      },
+      "completion_assertion": "After valid plan, immediate dispatch succeeds unless separately recorded external drift; authorization replan is audited."
+    },
+    {
+      "id": "Q26",
+      "scenario": "Cancel/quiesce/recover fences",
+      "end_to_end_path": "BOOT→READY→cancel request→try dispatch; finalize CANCELLED→try recover/amend",
+      "checkpoint": {
+        "ticket_status": "Before finalize unchanged; then CANCELLED",
+        "run_control": "QUIESCING then CANCELLED, never reopens",
+        "current_attempt": "No new attempt after quiesce",
+        "current_candidate": "History only",
+        "leases": "Stopped and explicitly released for terminal",
+        "active_findings": "Historical blockers preserved as history",
+        "historical_findings": "Unchanged",
+        "authorization_state": "Pending auth revoked/suspended per cancellation",
+        "next_action": "stop_reconcile_then_cancel / terminal",
+        "next_command": "cancel finalize / new explicit successor"
+      },
+      "completion_assertion": "Every prohibited mutator fails before any document/ledger/product write; no duplicate spawn."
+    },
+    {
+      "id": "Q27",
+      "scenario": "Allow/deny/identity/risk mismatches",
+      "end_to_end_path": "BOOT→packet allow∩deny, wrong ticket/epoch, criteria/risk downgrade, undefined route",
+      "checkpoint": {
+        "ticket_status": "Unchanged before registration/ingest",
+        "run_control": "Unchanged",
+        "current_attempt": "No wrong-identity active attempt",
+        "current_candidate": "Unchanged",
+        "leases": "No invalid lease",
+        "active_findings": "No wrongly attributed finding/return",
+        "historical_findings": "Invalid payload retained only diagnostic",
+        "authorization_state": "No false consumption",
+        "next_action": "correct_packet_or_return",
+        "next_command": "dispatch/ingest only after exact correction"
+      },
+      "completion_assertion": "Exercise all mismatches through public CLI then complete valid ticket; not helper-only schema check."
+    },
+    {
+      "id": "Q28",
+      "scenario": "Preserve hops и source normalization",
+      "end_to_end_path": "BOOT→create C1→repair using exact finding review source→BLOCK preserve C2→nochange close→new repair",
+      "checkpoint": {
+        "ticket_status": "BLOCKED at closure checkpoint",
+        "run_control": "BLOCKED until E resolution",
+        "current_attempt": "null; last blocked attempt",
+        "current_candidate": "C2 CONTINUATION retained",
+        "leases": "No abandoned active writer",
+        "active_findings": "Current findings/E retained",
+        "historical_findings": "All source hops immutable",
+        "authorization_state": "Source review normalized to correct worker/candidate once",
+        "next_action": "authorize_candidate_bound_repair",
+        "next_command": "authorize-repair"
+      },
+      "completion_assertion": "No command later rejects its own accepted normalized source; continue to DONE C3/review/integrate."
+    },
+    {
+      "id": "Q29",
+      "scenario": "Несколько reviews одного candidate",
+      "end_to_end_path": "BOOT→C1→RV-A PASS+RV-B BLOCK or UNVERIFIABLE; try integrate A",
+      "checkpoint": {
+        "ticket_status": "REVIEW",
+        "run_control": "BLOCKED",
+        "current_attempt": "null",
+        "current_candidate": "C1",
+        "leases": "Review leases stopped; worker reservation",
+        "active_findings": "Blocking RV-B obligations active",
+        "historical_findings": "Both immutable verdicts",
+        "authorization_state": "Repair auth covers accepted blocking set",
+        "next_action": "adjudicate_or_repair",
+        "next_command": "adjudicate / authorize-repair"
+      },
+      "completion_assertion": "No cherry-picking PASS. Legit adjudication updates issue+finding projections consistently, then fresh relevant review and integration."
+    },
+    {
+      "id": "Q30",
+      "scenario": "Stale review/finding после замены candidate",
+      "end_to_end_path": "BOOT→C1 review F1→repair C2→attempt stale ingestion/authorization using C1 evidence",
+      "checkpoint": {
+        "ticket_status": "Unchanged C2 state",
+        "run_control": "Unchanged",
+        "current_attempt": "Current attempt unaffected",
+        "current_candidate": "C2",
+        "leases": "No new stale lease",
+        "active_findings": "Current findings only; old concern may be verification debt",
+        "historical_findings": "C1 review remains historical",
+        "authorization_state": "Stale authority rejected or explicit revalidation required",
+        "next_action": "revalidate_current_subject",
+        "next_command": "New review or correct candidate-bound authorize"
+      },
+      "completion_assertion": "Complete C2/C3 integration only after proof on current subject; matching ticket alone insufficient."
+    },
+    {
+      "id": "Q31",
+      "scenario": "PASS с failed/not_run/unverifiable checks",
+      "end_to_end_path": "BOOT→current candidate→review/manual PASS with contradictory checks",
+      "checkpoint": {
+        "ticket_status": "Pre-ingest state unchanged",
+        "run_control": "No false ACTIVE/ACCEPTED",
+        "current_attempt": "Reviewer remains awaiting corrected evidence or safely interrupted",
+        "current_candidate": "Unchanged",
+        "leases": "No release based on invalid verdict",
+        "active_findings": "No false resolution",
+        "historical_findings": "Invalid return diagnostic only",
+        "authorization_state": "No integration authority",
+        "next_action": "correct_review_evidence_or_block",
+        "next_command": "Corrected return/new independent review"
+      },
+      "completion_assertion": "Negative test for all three outcomes and required axes; corrected real PASS reaches integration/acceptance."
+    },
+    {
+      "id": "Q32",
+      "scenario": "Attempt-level BLOCK cannot be overwritten via integrate",
+      "end_to_end_path": "BOOT→ingest review BLOCK bytes X→submit PASS bytes Y to every ingress",
+      "checkpoint": {
+        "ticket_status": "REVIEW/BLOCKED unchanged",
+        "run_control": "BLOCKED",
+        "current_attempt": "Review remains returned X",
+        "current_candidate": "C1",
+        "leases": "Existing correct disposition unchanged",
+        "active_findings": "Original F active",
+        "historical_findings": "X hash/ref/review_result unchanged",
+        "authorization_state": "Only repair/adjudication allowed",
+        "next_action": "triage_current_findings",
+        "next_command": "authorize-repair"
+      },
+      "completion_assertion": "Same-byte X replay harmless; Y uniformly rejected; valid new review must have new registered attempt and subject/evidence."
+    },
+    {
+      "id": "Q33",
+      "scenario": "Manual BLOCK materializes repairable findings",
+      "end_to_end_path": "BOOT→integrated wave→final G5 manual BLOCK with F1..Fn",
+      "checkpoint": {
+        "ticket_status": "Affected repair targets created/reopened by authorized protocol",
+        "run_control": "BLOCKED",
+        "current_attempt": "null; manual review RETURNED",
+        "current_candidate": "Frozen reviewed C1",
+        "leases": "Reviewer released with exact receipt",
+        "active_findings": "F1..Fn canonical, independently actionable",
+        "historical_findings": "Raw G5 BLOCK retained",
+        "authorization_state": "Grouped repair-wave auth possible",
+        "next_action": "triage_g5_findings",
+        "next_command": "authorize repair-wave"
+      },
+      "completion_assertion": "Repair→targeted closes→common C2→fresh G5 PASS→G6; no stale import_manual_review loop."
+    },
+    {
+      "id": "Q34",
+      "scenario": "Candidate/effect receipt integrity",
+      "end_to_end_path": "BOOT→DONE→fake SHA/wrong target/base/authority/dirty tree; or real commit then applied receipt",
+      "checkpoint": {
+        "ticket_status": "No candidate on failed proof; C1 once on valid recovery",
+        "run_control": "BLOCKED/RECOVERING until exact proof",
+        "current_attempt": "Returned producer retained",
+        "current_candidate": "Only real audited C1",
+        "leases": "Reservation safe; no unknown writer reuse",
+        "active_findings": "Mismatch issue until reconciled",
+        "historical_findings": "Invalid receipt not authority",
+        "authorization_state": "Effect authority exact",
+        "next_action": "reconcile_or_finalize_candidate",
+        "next_command": "TARGET: finalize-effect"
+      },
+      "completion_assertion": "Prepared/applied domain state agrees; applied-without-linkage repaired without new commit; uncertain→resolved supported."
+    },
+    {
+      "id": "Q35",
+      "scenario": "Amendment/canonical publication atomicity",
+      "end_to_end_path": "BOOT→current docs→stale-token/same-path/conflicting amendment; live worker variant",
+      "checkpoint": {
+        "ticket_status": "Unchanged for rejected command; STALE only for accepted amendment",
+        "run_control": "Quiesce before material rewrite; ACTIVE only after safe recovery",
+        "current_attempt": "Affected writers stopped/fenced, not merely relabeled",
+        "current_candidate": "Old candidate stale/historical",
+        "leases": "No overwrite while writer unknown",
+        "active_findings": "Impact closure explicit",
+        "historical_findings": "Every prior document/hash unchanged",
+        "authorization_state": "Exact owner scope authority",
+        "next_action": "recheck_affected_gates",
+        "next_command": "amend→G1/G2/G3 via valid replacement path"
+      },
+      "completion_assertion": "Failed operation changes neither canonical referenced bytes nor ledger; valid amendment returns to executable current tickets."
+    },
+    {
+      "id": "Q36",
+      "scenario": "Manual interrupted/stale epoch/mismatched purpose",
+      "end_to_end_path": "BOOT→critical/G5 handoff→interrupt/takeover or wrong review packet purpose→import",
+      "checkpoint": {
+        "ticket_status": "No false INTEGRATED/ACCEPT",
+        "run_control": "BLOCKED/RECOVERING",
+        "current_attempt": "Old attempt INTERRUPTED/history",
+        "current_candidate": "Unchanged exact candidate",
+        "leases": "No reuse before proof",
+        "active_findings": "Explicit interruption/purpose gap",
+        "historical_findings": "Old payload historical",
+        "authorization_state": "New purpose-bound packet/attempt required",
+        "next_action": "prepare_current_manual_review",
+        "next_command": "prepare-handoff new attempt"
+      },
+      "completion_assertion": "Old packet cannot be reinterpreted silently; fresh correctly typed review proceeds through appropriate ticket/G5 gate."
+    },
+    {
+      "id": "Q37",
+      "scenario": "Semi-mode checkpoints и native waits",
+      "end_to_end_path": "BOOT semi→routine ticket→internal waits→authority-sensitive or manual checkpoint",
+      "checkpoint": {
+        "ticket_status": "Routine advances without per-ticket approval; checkpoint preserves exact state",
+        "run_control": "ACTIVE for routine; BLOCKED for actual authority need",
+        "current_attempt": "Registered exact attempt or null at real checkpoint",
+        "current_candidate": "Frozen as appropriate",
+        "leases": "No new writer while checkpoint affects ownership",
+        "active_findings": "Only genuine authority/liveness blocker",
+        "historical_findings": "Waits not fake history of user decisions",
+        "authorization_state": "Existing authority reused only within scope",
+        "next_action": "internal_await OR await_owner_decision",
+        "next_command": "Native wait/reconcile OR explicit approved transition"
+      },
+      "completion_assertion": "No routine user stop from await; response to checkpoint bound to exact subject, epoch and scope. Repeat same suite with full, no safety downgrade."
+    },
+    {
+      "id": "Q38",
+      "scenario": "Evidence object/export tampering",
+      "end_to_end_path": "BOOT→immutable object/export→change bytes or omit inventory entry→review/recovery read",
+      "checkpoint": {
+        "ticket_status": "No authoritative change on failed proof",
+        "run_control": "BLOCKED with integrity cause",
+        "current_attempt": "No false returned/accepted state",
+        "current_candidate": "Unchanged verified last candidate",
+        "leases": "Quarantine affected access, not false release",
+        "active_findings": "Integrity obligation active",
+        "historical_findings": "Corrupt bytes preserved diagnostic; good original hash never remapped",
+        "authorization_state": "No auth from unverifiable history",
+        "next_action": "restore_verified_evidence",
+        "next_command": "Typed integrity reconciliation"
+      },
+      "completion_assertion": "Same hash path with changed bytes fails; exact complete inventory required; restore trusted copy then full review/integrate."
+    },
+    {
+      "id": "Q39",
+      "scenario": "Contract output activation + inherited resource completeness",
+      "end_to_end_path": "BOOT producer/consumer graph incl proposed output and predecessor external artifact",
+      "checkpoint": {
+        "ticket_status": "Producer executable without self-input; consumer not READY until proof",
+        "run_control": "ACTIVE independent work or BLOCKED relevant consumer",
+        "current_attempt": "No consumer attempt on missing input",
+        "current_candidate": "Verified producer/inherited candidate",
+        "leases": "No invalid consumer lease",
+        "active_findings": "Missing proof/resource blocker explicit",
+        "historical_findings": "Original binding versions retained",
+        "authorization_state": "No silent proposed→active",
+        "next_action": "activate_verified_output_or_resolve_resource",
+        "next_command": "TARGET: publish-contract-proof then ready-ticket"
+      },
+      "completion_assertion": "Consumer runs only after verified artifact/version availability; legacy self-input migration tested then complete consumer integration."
+    },
+    {
+      "id": "Q40",
+      "scenario": "G5 repair wave and fresh common candidate",
+      "end_to_end_path": "BOOT→all tickets integrated C1→G5 BLOCK F1,F2→two dependent repairs→targeted reviews→common C3",
+      "checkpoint": {
+        "ticket_status": "All replacement/repair targets INTEGRATED",
+        "run_control": "VERIFY until fresh full G5; then ACCEPT/ACTIVE",
+        "current_attempt": "null",
+        "current_candidate": "C3 common current candidate",
+        "leases": "No unresolved leases/effects",
+        "active_findings": "∅ only after all per-finding proof and fresh G5",
+        "historical_findings": "G5 C1 BLOCK remains historical",
+        "authorization_state": "Group wave auth, individual consumed attempts",
+        "next_action": "fresh_g5_then_g6",
+        "next_command": "prepare-handoff final_g5→import→gate G6"
+      },
+      "completion_assertion": "Old G5 PASS/BLOCK never reused on C3; G6 enforces exact current candidate fingerprint, full criteria and requested human policy."
+    }
+  ],
+  "rev58_recovery_plan": {
+    "status": "PLAN_ONLY_NOT_EXECUTED",
+    "run_id": "2026-09-17-idea-scout-v2-successor",
+    "frozen_revision": 58,
+    "frozen_ledger_sha256": "dbfe634b0ea9bb94cc91f14f249d38b5947b74f0c285c9a80d131f74d582a894",
+    "ticket_id": "T02-R17",
+    "risk": "critical",
+    "original_control": "BLOCKED",
+    "original_phase": "EXECUTE",
+    "original_current_attempt": "T02-R17-WORKER-05",
+    "candidate": {
+      "sha": "ef8da4ff49cc7f8014d90f463acf8319ad7c1335",
+      "tree": "eb86d12ccb6f75f5337c18d0480f5ae16c131721",
+      "base": "9aa5501870352b87538355d14bb68dbde544c3ed",
+      "quality": "CONTINUATION",
+      "producer_attempt": "T02-R17-WORKER-05",
+      "continuation_receipt": "objects/8391797669bfcfe374950008c9dc3a343724ad4cf687b405ed870586c7d3c0d0"
+    },
+    "review": {
+      "attempt": "T02-R17-REVIEW-CODE-05",
+      "packet_hash": "e8b28341a5e2202e22c0281de105780bc92b9d5079f7104df9475bdf26001a00",
+      "return_hash": "e977b0f75bde0456a1a644fb82ad683f31ae10926b804b5798b8912ddc5dcd1c",
+      "verdict": "BLOCK",
+      "state": "RETURNED",
+      "lease": "released"
+    },
+    "current_findings": [
+      "finding-e977b0f75bde-1",
+      "finding-e977b0f75bde-2",
+      "finding-e977b0f75bde-3"
+    ],
+    "mirrored_issues": [
+      "issue-6052c0b24e4aa5ea",
+      "issue-1fec003177035f88",
+      "issue-97733f767ad71380"
+    ],
+    "historical_code_findings": [
+      "finding-f989a2c3e524-1",
+      "finding-bcbdeeded833-1",
+      "finding-bcbdeeded833-2",
+      "finding-bcbdeeded833-3",
+      "finding-bcbdeeded833-4",
+      "finding-bcbdeeded833-5",
+      "finding-22bf0f5a4fde-1"
+    ],
+    "external_blocker": "issue-62c0073109c9529a",
+    "supersedable_operational_issues": [
+      "attempt-T02-R17-REVIEW-CODE-04-interrupted",
+      "issue-b5315db91291e13b"
+    ],
+    "before_dispatch_target": {
+      "schema": "Proposed versioned v1.1 state contract, not current v1.0.11 CLI schema.",
+      "phase": "EXECUTE",
+      "control": "BLOCKED while external blocker retained",
+      "ticket_status": "READY_FOR_AUTHORIZED_REPAIR (READY plus explicit authorization in compatible representation)",
+      "current_worker_attempt": null,
+      "last_worker_attempt": "T02-R17-WORKER-05",
+      "current_candidate_sha": "ef8da4ff49cc7f8014d90f463acf8319ad7c1335",
+      "current_candidate_quality": "CONTINUATION",
+      "old_worker_lease": "released only after actual stop and clean-candidate audit",
+      "current_review_lease": "released",
+      "active_findings": "Exactly three current candidate-bound review05 findings; unresolved old concerns separately retained as verification obligations, not silently resolved.",
+      "external_blockers": [
+        "issue-62c0073109c9529a"
+      ],
+      "authorization": "One new, unused, grouped, scope/candidate/epoch-bound repair authorization with individual proof obligations.",
+      "operations": "No prepared/uncertain effect; original preservation op remains applied, not repeated.",
+      "next_action": "dispatch_authorized_repair_with_retained_blocker (proposed executable action)",
+      "next_command": "dispatch exact preflighted packet once, then native spawn and internal wait."
+    },
+    "unknown_before_live_preflight": [
+      "New authorization ID/revision/packet hash; must be generated from actual approved data.",
+      "Exact next repair allowlist; existing 3-file Worker05 scope is not automatically sufficient for all 3 new findings.",
+      "Live HEAD/index/worktree/common-dir, process liveness, current runtime parity, complete canonical document/object integrity.",
+      "Whether every historical finding is semantically fixed; broad later review does not by absence alone prove closure.",
+      "Owner-approved interpretation/migration of 9 self-produced input bindings."
+    ],
+    "must_not": [
+      "Do not edit original review-return JSON or ledger manually.",
+      "Do not turn BLOCKED/HANDOFF into DONE.",
+      "Do not repeat existing continuation commit or preservation.",
+      "Do not auto-widen scope into evaluation-v2 resources or weaken the offline suite oracle.",
+      "Do not run multiple duplicate workers or reopen the predecessor CANCELLED run.",
+      "Do not use design-only migrate-review-currentness to blindly invalidate all code findings."
+    ],
+    "ordered_steps": [
+      {
+        "step": 1,
+        "action": "Freeze and compare live state to rev58; preserve a verified backup and current owner/epoch.",
+        "guard": "If live state advanced, re-evaluate; never apply revision58 assumptions blindly."
+      },
+      {
+        "step": 2,
+        "action": "Prove writer stop and audit exact candidate HEAD/tree/base, workspaces, referenced object/canonical hashes.",
+        "guard": "No auto-release, no repeated preservation commit, no current recover-as-reset."
+      },
+      {
+        "step": 3,
+        "action": "Deploy qualified hardening; dry-run semantic-state migration and owner-approved input/output binding correction.",
+        "guard": "Classify all nine current self-input tickets; no guessed canonical semantics. Material change requires affected gates/revalidation."
+      },
+      {
+        "step": 4,
+        "action": "Append exact review05 subject-binding reconciliation for three current findings and three mirrored issues.",
+        "guard": "Match registered ticket/candidate/packet/accepted return hashes; keep raw reported refs and BLOCK unchanged; exact replay idempotent."
+      },
+      {
+        "step": 5,
+        "action": "Build current/history/debt projection; classify seven historical code findings and operational issues.",
+        "guard": "History is not automatic resolution; design findings separate; external issue-62c0073109c9529a remains until proof."
+      },
+      {
+        "step": 6,
+        "action": "Approve one new candidate-bound grouped repair authorization for all three current findings, with individual proof obligations.",
+        "guard": "Do not reuse auth05/auth06; derive exact allowlist/checks/route/epoch from approved plan and actual product source."
+      },
+      {
+        "step": 7,
+        "action": "After physical stop and audit release old Worker05 reservation; retain explicit continuation identity.",
+        "guard": "No unknown active/quarantined writer or pending/uncertain operation; old effect remains applied."
+      },
+      {
+        "step": 8,
+        "action": "Require shared admission to establish before_dispatch_target; dispatch packet once and observe native spawn/internal wait.",
+        "guard": "BLOCKED external condition permits only this named limited repair; no general dispatch bypass."
+      },
+      {
+        "step": 9,
+        "action": "Strictly ingest return and actual write audit; finalize according to DONE/BLOCKED/HANDOFF/no-change disposition.",
+        "guard": "Unresolved required offline failure forbids DONE. Preserve valid owned changes or restore continuation without rewriting verdict."
+      },
+      {
+        "step": 10,
+        "action": "Resolve external resources/oracle through separate proper authority; rerun complete required checks on current candidate.",
+        "guard": "Do not silently widen lease or remove failed checks. Product fixes and historical closure need actual evidence."
+      },
+      {
+        "step": 11,
+        "action": "Publish ordinary DONE candidate, collect fresh per-finding and all critical required reviews, integrate, then verify T03/wave readiness.",
+        "guard": "No direct integration of continuation; no ticket-level manual PASS jumping to final acceptance; history retained."
+      }
+    ]
+  },
+  "independent_observations": [
+    {
+      "id": "P01_missing_ticket_binding",
+      "result": "OBSERVED",
+      "summary_ru": "Global-only affected_refs приняты; repair отвергается как not bound; await остаётся.",
+      "related_findings": [
+        "AH-01"
+      ],
+      "observed_details": {
+        "accepted_review": true,
+        "authorization_rejected": "{\"ok\": false, \"error\": \"repair authorization finding/issue is not bound to this ticket\"}\n",
+        "next_action": "await_review_return"
+      },
+      "trace_in_repro_zip": "run/P01_missing_ticket_binding/trace.json"
+    },
+    {
+      "id": "P02_uncertain_dead_end",
+      "result": "OBSERVED",
+      "summary_ru": "uncertain operation нельзя снова reconcile.",
+      "related_findings": [
+        "AH-05"
+      ],
+      "observed_details": {
+        "uncertain_is_unresolvable": "{\"ok\": false, \"error\": \"only a prepared operation can be reconciled\"}\n"
+      },
+      "trace_in_repro_zip": "run/P02_uncertain_dead_end/trace.json"
+    },
+    {
+      "id": "P03_reconciled_candidate_dead_end",
+      "result": "OBSERVED",
+      "summary_ru": "Реальный commit + reconciled applied operation не позволяют опубликовать candidate.",
+      "related_findings": [
+        "AH-05"
+      ],
+      "observed_details": {
+        "actual_commit": "339694b0287b618547f6fd199af6ed3088f2ef8a",
+        "candidate_link_missing": true,
+        "rejected": "{\"ok\": false, \"error\": \"candidate operation is not in prepared state\"}\n"
+      },
+      "trace_in_repro_zip": "run/P03_reconciled_candidate_dead_end/trace.json"
+    },
+    {
+      "id": "P04_dispatch_while_quiescing",
+      "result": "OBSERVED",
+      "summary_ru": "Dispatch после cancel request создаёт RUNNING ticket в QUIESCING run.",
+      "related_findings": [
+        "AH-06"
+      ],
+      "observed_details": {
+        "worker_prepared_after_cancel_request": true
+      },
+      "trace_in_repro_zip": "run/P04_dispatch_while_quiescing/trace.json"
+    },
+    {
+      "id": "P05_terminal_recover",
+      "result": "OBSERVED",
+      "summary_ru": "recover открывает CANCELLED run как RECOVERING.",
+      "related_findings": [
+        "AH-06"
+      ],
+      "observed_details": {
+        "terminal_cancelled_run_reopened": true
+      },
+      "trace_in_repro_zip": "run/P05_terminal_recover/trace.json"
+    },
+    {
+      "id": "P06_conflicting_review_integrate",
+      "result": "OBSERVED",
+      "summary_ru": "integrate принимает conflicting PASS после accepted BLOCK и оставляет review_result=BLOCK.",
+      "related_findings": [
+        "AH-04"
+      ],
+      "observed_details": {
+        "ingest_rejects_conflicting_duplicate_but_integrate_accepts": true,
+        "review_result": "BLOCK",
+        "ticket": "INTEGRATED"
+      },
+      "trace_in_repro_zip": "run/P06_conflicting_review_integrate/trace.json"
+    },
+    {
+      "id": "P07_failed_check_PASS",
+      "result": "OBSERVED",
+      "summary_ru": "Review PASS с failed check интегрируется.",
+      "related_findings": [
+        "AH-04"
+      ],
+      "observed_details": {
+        "PASS_with_failed_independent_check_integrates": true
+      },
+      "trace_in_repro_zip": "run/P07_failed_check_PASS/trace.json"
+    },
+    {
+      "id": "P08_critical_policy_bypass",
+      "result": "OBSERVED",
+      "summary_ru": "Critical ticket интегрируется с одним correctness axis без qualified policy.",
+      "related_findings": [
+        "AH-04"
+      ],
+      "observed_details": {
+        "critical_ticket_integrates_with_single_correctness_axis_no_qualified_route": true
+      },
+      "trace_in_repro_zip": "run/P08_critical_policy_bypass/trace.json"
+    },
+    {
+      "id": "P09_allow_deny_overlap",
+      "result": "OBSERVED",
+      "summary_ru": "Allow/deny overlap принимается в active lease.",
+      "related_findings": [
+        "AH-02"
+      ],
+      "observed_details": {
+        "packet_allow_deny_overlap_yields_active_lease": true
+      },
+      "trace_in_repro_zip": "run/P09_allow_deny_overlap/trace.json"
+    },
+    {
+      "id": "P10_worker_wrong_ticket",
+      "result": "OBSERVED",
+      "summary_ru": "Worker return с чужим ticket_id ingested.",
+      "related_findings": [
+        "AH-02"
+      ],
+      "observed_details": {
+        "foreign_ticket_id_worker_return_ingested": true
+      },
+      "trace_in_repro_zip": "run/P10_worker_wrong_ticket/trace.json"
+    },
+    {
+      "id": "P11_stale_modify_base",
+      "result": "OBSERVED",
+      "summary_ru": "Modify repair принимает несуществующий source/base.",
+      "related_findings": [
+        "AH-02"
+      ],
+      "observed_details": {
+        "actual_candidate": "65b07117331ce3a98067b39e2b547d384916f5b1",
+        "modify_zone_accepts_foreign_source_and_nonexistent_base": true
+      },
+      "trace_in_repro_zip": "run/P11_stale_modify_base/trace.json"
+    },
+    {
+      "id": "P12_undispatchable_unchanged_auth",
+      "result": "OBSERVED",
+      "summary_ru": "Authorize принимает unchanged repair, следующий dispatch отвергает.",
+      "related_findings": [
+        "AH-02"
+      ],
+      "observed_details": {
+        "authorization_accepts_guaranteed_undispatchable_unchanged_contract": true,
+        "dispatch_error": "{\"ok\": false, \"error\": \"unchanged repair retry rejected: no causally meaningful change\"}\n"
+      },
+      "trace_in_repro_zip": "run/P12_undispatchable_unchanged_auth/trace.json"
+    },
+    {
+      "id": "P13_lost_partial_create",
+      "result": "OBSERVED",
+      "summary_ru": "LOST create с partial file не продолжить обычным modify repair.",
+      "related_findings": [
+        "AH-03"
+      ],
+      "observed_details": {
+        "lost_create_has_partial_file_no_candidate_and_undispatchable_modify_repair": "{\"ok\": false, \"error\": \"repair lease expansion base SHA is stale or forked from the current ticket candidate\"}\n"
+      },
+      "trace_in_repro_zip": "run/P13_lost_partial_create/trace.json"
+    },
+    {
+      "id": "P14_unaudited_fake_candidate",
+      "result": "OBSERVED",
+      "summary_ru": "General candidate принимает fake SHA/minimal receipt без реального Git commit.",
+      "related_findings": [
+        "AH-05"
+      ],
+      "observed_details": {
+        "candidate_published_without_real_commit_audit_or_effect_target_binding": true
+      },
+      "trace_in_repro_zip": "run/P14_unaudited_fake_candidate/trace.json"
+    },
+    {
+      "id": "P15_empty_HANDOFF_closure",
+      "result": "OBSERVED",
+      "summary_ru": "Initial empty HANDOFF не закрывается close-blocked-attempt.",
+      "related_findings": [
+        "AH-03"
+      ],
+      "observed_details": {
+        "empty_initial_HANDOFF_not_supported_by_closure": "{\"ok\": false, \"error\": \"blocked attempt closure applies only to a returned worker repair attempt\"}\n"
+      },
+      "trace_in_repro_zip": "run/P15_empty_HANDOFF_closure/trace.json"
+    },
+    {
+      "id": "P16_parallel_review_BLOCK_bypass",
+      "result": "OBSERVED",
+      "summary_ru": "Один PASS интегрируется при другом current BLOCK.",
+      "related_findings": [
+        "AH-04"
+      ],
+      "observed_details": {
+        "blockers_remain": 2,
+        "integration_with_another_current_blocking_review": true
+      },
+      "trace_in_repro_zip": "run/P16_parallel_review_BLOCK_bypass/trace.json"
+    },
+    {
+      "id": "P17_review_ingest_without_barrier",
+      "result": "OBSERVED",
+      "summary_ru": "Authoritative review ingest не требует integrity receipt.",
+      "related_findings": [
+        "AH-04"
+      ],
+      "observed_details": {
+        "review_ingest_needs_no_integrity_receipt_parameter": true
+      },
+      "trace_in_repro_zip": "run/P17_review_ingest_without_barrier/trace.json"
+    },
+    {
+      "id": "P18_initial_nochange_BLOCK",
+      "result": "OBSERVED",
+      "summary_ru": "Initial empty BLOCK не закрывается close-blocked-attempt.",
+      "related_findings": [
+        "AH-03"
+      ],
+      "observed_details": {
+        "first_implementation_nochange_BLOCK_has_no_close_path": "{\"ok\": false, \"error\": \"blocked attempt closure applies only to a returned worker repair attempt\"}\n"
+      },
+      "trace_in_repro_zip": "run/P18_initial_nochange_BLOCK/trace.json"
+    },
+    {
+      "id": "P19_review_epoch_registration",
+      "result": "OBSERVED",
+      "summary_ru": "Prepare-review сохраняет epoch=0 при packet epoch=99.",
+      "related_findings": [
+        "AH-02",
+        "AH-06"
+      ],
+      "observed_details": {
+        "registered_attempt_epoch": 0,
+        "review_packet_epoch": 99
+      },
+      "trace_in_repro_zip": "run/P19_review_epoch_registration/trace.json"
+    },
+    {
+      "id": "P20_duplicate_happy_control",
+      "result": "OBSERVED",
+      "summary_ru": "Положительный контроль: exact duplicate dispatch и worker ingest не меняют revision.",
+      "related_findings": [],
+      "observed_details": {
+        "same_byte_dispatch_and_worker_ingest_are_revision_preserving": true
+      },
+      "trace_in_repro_zip": "run/P20_duplicate_happy_control/trace.json"
+    },
+    {
+      "id": "P21_continuation_nochange",
+      "result": "OBSERVED",
+      "summary_ru": "No-change repair после continuation не закрывается: previous return обязан быть DONE.",
+      "related_findings": [
+        "AH-03"
+      ],
+      "observed_details": {
+        "continuation_then_empty_BLOCK_cannot_restore_candidate": "{\"ok\": false, \"error\": \"the last same-ticket candidate lacks an exact validated DONE return\"}\n"
+      },
+      "trace_in_repro_zip": "run/P21_continuation_nochange/trace.json"
+    },
+    {
+      "id": "P22_review_source_preserve",
+      "result": "OBSERVED",
+      "summary_ru": "Source review допустим для dispatch, но отвергается при subsequent preserve.",
+      "related_findings": [
+        "AH-02",
+        "AH-03"
+      ],
+      "observed_details": {
+        "actual_commit": "2650153567359b93b1ebc13c3e18ff880ba0b94c",
+        "dispatch_accepts_review_source_but_preserve_rejects": "{\"ok\": false, \"error\": \"continuation repair source is missing, foreign, stale, or quarantined\"}\n"
+      },
+      "trace_in_repro_zip": "run/P22_review_source_preserve/trace.json"
+    },
+    {
+      "id": "P23_hash_addressed_read",
+      "result": "OBSERVED",
+      "summary_ru": "stored_payload читает tampered bytes под неизменным SHA filename.",
+      "related_findings": [
+        "AH-07"
+      ],
+      "observed_details": {
+        "hash_addressed_read_does_not_verify_object_bytes": true,
+        "object_ref": "objects/327225c39df85c8b167157be15ba90432dd84f11db4388c7e1300f753db7938f"
+      },
+      "trace_in_repro_zip": "run/P23_hash_addressed_read/trace.json"
+    },
+    {
+      "id": "P24_historical_finding_reuse",
+      "result": "OBSERVED",
+      "summary_ru": "Finding старого candidate снова авторизует modify repair текущего candidate.",
+      "related_findings": [
+        "AH-01",
+        "AH-02"
+      ],
+      "observed_details": {
+        "old_candidate_finding_authorizes_current_candidate_modify_repair": true,
+        "old_finding": "finding-b5e8f854cc32-1"
+      },
+      "trace_in_repro_zip": "run/P24_historical_finding_reuse/trace.json"
+    },
+    {
+      "id": "P25_duplicate_prepare_review",
+      "result": "OBSERVED",
+      "summary_ru": "Same-byte prepare-review retry не idempotent.",
+      "related_findings": [
+        "AH-06",
+        "AH-12"
+      ],
+      "observed_details": {
+        "same_byte_prepare_review_retry_is_not_idempotent": "{\"ok\": false, \"error\": \"review attempt ID already exists\"}\n"
+      },
+      "trace_in_repro_zip": "run/P25_duplicate_prepare_review/trace.json"
+    },
+    {
+      "id": "P26_abandoned_effect_retry",
+      "result": "OBSERVED",
+      "summary_ru": "prepare-effect возвращает prepared success для op, всё ещё abandoned.",
+      "related_findings": [
+        "AH-05"
+      ],
+      "observed_details": {
+        "retry_prepare_returns_prepared_true_but_operation_remains_abandoned": true
+      },
+      "trace_in_repro_zip": "run/P26_abandoned_effect_retry/trace.json"
+    },
+    {
+      "id": "P27_failed_amend_mutates_document",
+      "result": "OBSERVED",
+      "summary_ru": "Отклонённый stale-owner amend перезаписывает canonical document до fence.",
+      "related_findings": [
+        "AH-07"
+      ],
+      "observed_details": {
+        "error": "{\"ok\": false, \"error\": \"owner token mismatch; stale orchestrator is fenced\"}\n",
+        "ledger_revision_unchanged": 3,
+        "rejected_stale_owner_amend_overwrites_canonical_document_before_fence": true
+      },
+      "trace_in_repro_zip": "run/P27_failed_amend_mutates_document/trace.json"
+    },
+    {
+      "id": "P28_adjudication_blocker_projection",
+      "result": "OBSERVED",
+      "summary_ru": "PASS adjudication оставляет disagreement issue blocking без invalidation.",
+      "related_findings": [
+        "AH-01"
+      ],
+      "observed_details": {
+        "PASS_adjudication_leaves_uninvalidated_blocking_disagreement_issue": "disagreement-6a414ad851b0"
+      },
+      "trace_in_repro_zip": "run/P28_adjudication_blocker_projection/trace.json"
+    },
+    {
+      "id": "P29_manual_BLOCK_findings",
+      "result": "OBSERVED",
+      "summary_ru": "Manual BLOCK принят без durable findings/issues, action всё ещё import_manual_review.",
+      "related_findings": [
+        "AH-09"
+      ],
+      "observed_details": {
+        "manual_BLOCK_with_finding_records_no_durable_finding_or_issue": true,
+        "next_action": "import_manual_review"
+      },
+      "trace_in_repro_zip": "run/P29_manual_BLOCK_findings/trace.json"
+    },
+    {
+      "id": "P30_manual_failed_PASS",
+      "result": "OBSERVED",
+      "summary_ru": "Manual PASS с failed check и неполным inventory принят; ticket INTEGRATED, worker lease active, phase ACCEPT.",
+      "related_findings": [
+        "AH-09"
+      ],
+      "observed_details": {
+        "manual_PASS_with_failed_check_and_no_export_inventory_is_accepted": true,
+        "phase": "ACCEPT",
+        "ticket": "INTEGRATED",
+        "worker_lease": "active"
+      },
+      "trace_in_repro_zip": "run/P30_manual_failed_PASS/trace.json"
+    },
+    {
+      "id": "P31_manual_interrupted_import",
+      "result": "OBSERVED",
+      "summary_ru": "Manual return от INTERRUPTED review принимается как authoritative.",
+      "related_findings": [
+        "AH-06",
+        "AH-09"
+      ],
+      "observed_details": {
+        "manual_return_imported_from_INTERRUPTED_attempt": true
+      },
+      "trace_in_repro_zip": "run/P31_manual_interrupted_import/trace.json"
+    },
+    {
+      "id": "P32_manual_packet_mismatch",
+      "result": "OBSERVED",
+      "summary_ru": "Review-kind handoff подготовлен, но import требует acceptance-kind packet.",
+      "related_findings": [
+        "AH-09"
+      ],
+      "observed_details": {
+        "prepare_handoff_accepts_review_kind_but_import_rejects_it": "{\"ok\": false, \"error\": \"$.acceptance_packet.kind: expected constant 'acceptance'\"}\n"
+      },
+      "trace_in_repro_zip": "run/P32_manual_packet_mismatch/trace.json"
+    }
+  ],
+  "implementation_order": [
+    "AH-07",
+    "AH-08",
+    "AH-06",
+    "AH-01",
+    "AH-02",
+    "AH-05",
+    "AH-03",
+    "AH-09",
+    "AH-04",
+    "AH-10",
+    "AH-11",
+    "AH-12",
+    "AH-13"
+  ],
+  "release_gates": {
+    "before_any_T02_dispatch": [
+      "All P0 paths implemented and independently reviewed.",
+      "Core P0 negative regressions, durable fault/replay tests and frozen-rev58 migration rehearsal pass.",
+      "Exact live integrity/liveness and owner-approved contract semantics checked; no raw evidence rewrite."
+    ],
+    "recommended_general_v1_1_release": [
+      "All P0 and P1 findings closed with linked evidence.",
+      "Q01-Q40 implemented as full executable scenarios; supplied test package complete.",
+      "Native runtime capability qualification and installation/source parity checked separately.",
+      "No weakening of scope, oracle, quarantine, independent-review or immutable-evidence barriers."
+    ],
+    "deferable": [
+      "P2 presentation/accounting optimization after authoritative projection correctness."
+    ]
+  }
+}
