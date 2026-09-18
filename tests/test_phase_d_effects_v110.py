@@ -47,11 +47,17 @@ class PhaseDEffectTests(unittest.TestCase):
         base_sha = git(repo, "rev-parse", "HEAD")
         tree_sha = git(repo, "rev-parse", "HEAD^{tree}")
         run("init", "--control-root", str(control), "--repo-root", str(repo), "--run-id", run_id, "--owner-token", OWNER)
+        paths = ledger.paths(control, run_id)
+        state, previous = ledger.load_state(paths)
+        state["repository"].update({"checkout": str(repo), "branch": git(repo, "branch", "--show-current"), "initial_head": base_sha})
+        state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+        ledger.validate_ledger(state)
+        ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
         return {
             "root": root,
             "control": control,
             "repo": repo,
-            "paths": ledger.paths(control, run_id),
+            "paths": paths,
             "run_id": run_id,
             "base_sha": base_sha,
             "base_tree_sha": tree_sha,
@@ -275,6 +281,21 @@ class PhaseDEffectTests(unittest.TestCase):
                 "--packet", str(packet_path), "--review-kind", review_kind, "--reviewer-identity", "reviewer@example.invalid", "--reviewer-role", "independent-design-reviewer")
             state, _ = ledger.load_state(case["paths"])
             attempt = ledger.attempt_by_id(state, attempt_id)
+            for event, event_id, descendants in (("start", f"OBS-{attempt_id}-START", "not_applicable"), ("stop", f"OBS-{attempt_id}-STOP", "included")):
+                observation = {
+                    "kind": "runtime_observation", "event_id": event_id, "event": event,
+                    "run_id": RUN_ID, "attempt_id": attempt_id, "epoch": attempt["epoch"],
+                    "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+                    "runtime_instance_id": f"runtime-{attempt_id}", "observed_at": "2026-09-18T12:00:00Z",
+                    "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+                    "coverage": {"scope": "test process tree", "descendant_writers": descendants},
+                }
+                observation_path = root / f"{event_id}.json"
+                write_json(observation_path, observation)
+                run("observe-runtime", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
+                    "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--event", event,
+                    "--event-id", event_id, "--event-file", str(observation_path))
+                state, _ = ledger.load_state(case["paths"])
             returned = {
                 "identity": {"run_id": RUN_ID, "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0,
                              "source_revision": attempt["packet_source_revision"], "registration_revision": attempt["packet_registration_revision"],
@@ -310,6 +331,17 @@ class PhaseDEffectTests(unittest.TestCase):
             "verification": [{"check_id": "effect-focused", "required": True, "scenario": "effect adoption regression"}],
             "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}], "return_target": {"path": "return.json"},
         }
+        state, _ = ledger.load_state(case["paths"])
+        intent_binding = ledger.current_intent_binding(state)
+        publication = state["design_publication"]
+        packet["identity"].update({
+            "intent_revision": intent_binding["revision"], "intent_document_ref": intent_binding["document_ref"],
+            "intent_document_hash": intent_binding["document_hash"], "design_publication_ref": publication["id"],
+            "design_publication_hash": publication["publication_hash"],
+            "design_publication_revision": publication["published_revision"], "contract_refs": ["K-effect"],
+        })
+        packet.update({"intent_revision": intent_binding["revision"], "intent_document_ref": intent_binding["document_ref"],
+                       "intent_document_hash": intent_binding["document_hash"]})
         packet_path = root / "worker-packet.json"
         write_json(packet_path, packet)
         state, _ = ledger.load_state(case["paths"])
@@ -318,8 +350,23 @@ class PhaseDEffectTests(unittest.TestCase):
             "--lease-id", "L-effect", "--route-id", "ROUTE-effect", "--packet", str(packet_path))
         state, _ = ledger.load_state(case["paths"])
         attempt = ledger.attempt_by_id(state, ATTEMPT_ID)
+        for event, event_id, descendants in (("start", "OBS-worker-START", "not_applicable"), ("stop", "OBS-worker-STOP", "included")):
+            observation = {
+                "kind": "runtime_observation", "event_id": event_id, "event": event,
+                "run_id": RUN_ID, "attempt_id": ATTEMPT_ID, "epoch": attempt["epoch"],
+                "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+                "runtime_instance_id": "runtime-effect-worker", "observed_at": "2026-09-18T12:00:00Z",
+                "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+                "coverage": {"scope": "test process tree", "descendant_writers": descendants},
+            }
+            observation_path = root / f"{event_id}.json"
+            write_json(observation_path, observation)
+            run("observe-runtime", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
+                "--revision", str(state["revision"]), "--attempt-id", ATTEMPT_ID, "--event", event,
+                "--event-id", event_id, "--event-file", str(observation_path))
+            state, _ = ledger.load_state(case["paths"])
         returned = {
-            "identity": {"run_id": RUN_ID, "ticket_id": TICKET_ID, "attempt_id": ATTEMPT_ID, "packet_hash": attempt["packet_hash"], "epoch": 0},
+            "identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]},
             "status": "DONE", "result": "candidate work and required focused checks are complete",
             "files": [{"path": "app.txt", "operation": "modify"}],
             "checks": [{"check_id": "effect-focused", "outcome": "pass", "actual": "candidate behavior verified", "evidence_ref": "EV-effect-worker"}],

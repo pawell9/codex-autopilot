@@ -118,7 +118,7 @@ RUN_SETTING_LABELS = {
     "depth": {"normal": "обычная", "deep": "глубокая"},
 }
 USAGE_FIELDS = (
-    "helper_calls", "model_turns", "orchestrator_turns", "spawn_calls", "wait_calls", "git_calls",
+    "helper_calls", "model_turns", "orchestrator_turns", "attempt_registrations", "spawn_calls", "wait_calls", "git_calls",
     "internal_publications", "packet_bytes", "return_bytes", "brief_bytes", "wall_time_ms",
     "approvals", "user_interventions", "manual_handoffs", "manual_setup", "manual_wait",
 )
@@ -1433,8 +1433,32 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
     for attempt in state.get("attempts", []):
         if attempt["epoch"] > state["owner"]["epoch"] + 1:
             fail(f"attempt epoch is ahead of owner epoch: {attempt['id']}")
-        if state.get("runtime_provenance") and attempt.get("kind") == "review" and attempt.get("state") == "RETURNED" and attempt.get("lease", {}).get("state") == "active":
-            fail(f"returned reviewer attempt retains an active lease: {attempt['id']}")
+        runtime = attempt.get("runtime")
+        if isinstance(runtime, dict):
+            expected_spawn_id = stable_spawn_request_id(
+                state.get("run_id", ""), attempt["id"], attempt["epoch"], attempt.get("packet_hash", ""),
+            )
+            refs = set(runtime.get("observation_refs", []))
+            if runtime.get("spawn_request_id") != expected_spawn_id:
+                fail(f"runtime spawn request ID is not stable for attempt {attempt['id']}")
+            if any(ref and ref not in refs for ref in (
+                runtime.get("start_ref"), runtime.get("stop_ref"), runtime.get("not_started_ref"),
+                runtime.get("return_observation_ref"),
+            )) or not set(runtime.get("heartbeat_refs", [])).issubset(refs):
+                fail(f"runtime observation pointers are inconsistent for attempt {attempt['id']}")
+            liveness = runtime.get("liveness")
+            if liveness == "running" and (not runtime.get("start_ref") or not runtime.get("runtime_instance_id")):
+                fail(f"running runtime attempt lacks its exact start/instance binding: {attempt['id']}")
+            if liveness == "stopped" and (not runtime.get("stop_ref") or not runtime.get("runtime_instance_id")):
+                fail(f"stopped runtime attempt lacks its exact stop/instance binding: {attempt['id']}")
+            if liveness == "not_started" and (not runtime.get("not_started_ref") or runtime.get("runtime_instance_id") is not None):
+                fail(f"not_started runtime attempt has an invalid instance binding: {attempt['id']}")
+        if (
+            state.get("runtime_provenance") and attempt.get("kind") == "review"
+            and attempt.get("state") == "RETURNED" and attempt.get("lease", {}).get("state") == "active"
+            and (not isinstance(attempt.get("runtime"), dict) or runtime_liveness(attempt) in ("stopped", "not_started"))
+        ):
+            fail(f"returned legacy reviewer attempt or stopped runtime reviewer retains an active lease: {attempt['id']}")
     attempts_by_id = {item["id"]: item for item in state.get("attempts", [])}
     candidates_by_id = {item["id"]: item for item in state.get("candidates", [])}
     operations_by_id = {item["id"]: item for item in state.get("operations", [])}
@@ -2045,6 +2069,62 @@ def attempt_by_id(state: dict[str, Any], attempt_id: str) -> dict[str, Any]:
         if attempt["id"] == attempt_id:
             return attempt
     fail(f"unknown attempt: {attempt_id}")
+
+
+def stable_spawn_request_id(run_id: str, attempt_id: str, epoch: int, packet_hash: str) -> str:
+    identity = {"run_id": run_id, "attempt_id": attempt_id, "epoch": epoch, "packet_hash": packet_hash}
+    return f"spawn-{sha256_bytes(canonical_bytes(identity))[:24]}"
+
+
+def initialize_attempt_runtime(run_id: str, attempt: dict[str, Any]) -> None:
+    attempt["runtime"] = {
+        "spawn_request_id": stable_spawn_request_id(run_id, attempt["id"], attempt["epoch"], attempt["packet_hash"]),
+        "liveness": "unknown", "runtime_instance_id": None, "start_ref": None, "stop_ref": None,
+        "not_started_ref": None, "return_observation_ref": None, "heartbeat_refs": [], "observation_refs": [],
+    }
+
+
+def runtime_liveness(attempt: dict[str, Any]) -> str:
+    runtime = attempt.get("runtime")
+    return runtime.get("liveness", "unknown") if isinstance(runtime, dict) else "unknown"
+
+
+def runtime_stop_proven(p: dict[str, Path], attempt: dict[str, Any]) -> bool:
+    """Validate an exact typed stop/not-started receipt; legacy attempts stay unknown."""
+    runtime = attempt.get("runtime")
+    if not isinstance(runtime, dict):
+        return True
+    if runtime.get("liveness") == "not_started":
+        ref = runtime.get("not_started_ref")
+        expected_event = "not_started"
+    elif runtime.get("liveness") == "stopped":
+        ref = runtime.get("stop_ref")
+        expected_event = "stop"
+    else:
+        return False
+    if not isinstance(ref, str):
+        return False
+    if ref not in runtime.get("observation_refs", []):
+        return False
+    observation = stored_payload(p, ref, "runtime stop observation")
+    root = schema()
+    validate(observation, root["$defs"]["runtime_observation"], root, "$.runtime_observation")
+    return bool(
+        observation.get("kind") == "runtime_observation"
+        and observation.get("event") == expected_event
+        and observation.get("run_id") == p["run"].name
+        and observation.get("attempt_id") == attempt.get("id")
+        and observation.get("epoch") == attempt.get("epoch")
+        and observation.get("packet_hash") == attempt.get("packet_hash")
+        and observation.get("spawn_request_id") == runtime.get("spawn_request_id")
+        and observation.get("runtime_instance_id") == runtime.get("runtime_instance_id")
+        and (expected_event != "stop" or observation.get("coverage", {}).get("descendant_writers") == "included")
+    )
+
+
+def require_runtime_stopped(p: dict[str, Path], attempt: dict[str, Any], action: str) -> None:
+    if isinstance(attempt.get("runtime"), dict) and not runtime_stop_proven(p, attempt):
+        fail(f"{action} requires an exact runtime stop/not_started observation; liveness={runtime_liveness(attempt)}")
 
 
 def packet_identity(packet: dict[str, Any]) -> dict[str, Any]:
@@ -5103,7 +5183,7 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         usage = copy.deepcopy(state.get("usage", default_usage()))
         binding = {"revision": state.get("intent", {}).get("current_revision"), "document_ref": state.get("intent", {}).get("document_ref"), "document_hash": state.get("intent", {}).get("document_hash")}
         settings = resolved_run_settings(state)
-        brief = {"run_id": state["run_id"], "revision": state["revision"], "phase": lifecycle["phase"], "control": lifecycle["control"], "reason": lifecycle.get("reason"), "next_action": control_projection["next_action"], "allowed_events": control_projection["allowed_events"], "run_settings": settings, "preset_display": run_settings_display(settings), "issues": [i["id"] for i in state.get("issues", []) if i.get("impact") == "blocking" and not i.get("invalidated_by")], "findings": [f["id"] for f in state.get("findings", [])], "finding_status": [{"id": f["id"], "impact": f.get("impact"), "status": next((item["status"] for item in findings_projection["items"] if item["finding_ref"] == f["id"]), "unbound"), "current": next((item["current_applicability"] for item in findings_projection["items"] if item["finding_ref"] == f["id"]), False)} for f in state.get("findings", [])], "finding_projection": findings_projection, "candidates": state.get("candidates", []), "reviews": [{"id": r.get("id"), "subject": r.get("subject_fingerprint"), "verdict": r.get("verdict"), "review_kind": r.get("review_kind"), "reviewer_identity": r.get("reviewer_identity"), "reviewer_role": r.get("reviewer_role"), "current": not bool(r.get("invalidated_by")), "finding_refs": r.get("finding_refs", [])} for r in state.get("reviews", [])], "design_publication": state.get("design_publication"), "design_publication_history": state.get("design_publication_history", []), "requirements_publications": state.get("requirements_publications", []), "design_review_attempts": [{"id": a.get("id"), "kind": a.get("mode"), "state": a.get("state"), "result": a.get("review_result"), "reviewer_identity": a.get("reviewer_identity"), "reviewer_role": a.get("reviewer_role")} for a in state.get("attempts", []) if a.get("mode") in ("coverage", "plan")], "adjudications": [d.get("id") for d in state.get("decisions", []) if d.get("type") == "reviewer_adjudication"], "intent": binding, "version_provenance": state.get("runtime_provenance", {"creation_skill_version": state.get("skill_version"), "current_schema_version": state.get("schema_version"), "last_mutating_skill_version": state.get("skill_version"), "compatibility_floor": COMPATIBILITY_FLOOR, "applied_migrations": []}), "consumer_invalidation_count": len(state.get("invalidations", [])), "usage": usage, "evidence_count": len(state.get("evidence", [])), "ledger_bytes": len(raw), "ledger_hash": sha256_bytes(raw)}
+        brief = {"run_id": state["run_id"], "revision": state["revision"], "phase": lifecycle["phase"], "control": lifecycle["control"], "reason": lifecycle.get("reason"), "next_action": control_projection["next_action"], "allowed_events": control_projection["allowed_events"], "run_settings": settings, "preset_display": run_settings_display(settings), "issues": [i["id"] for i in state.get("issues", []) if i.get("impact") == "blocking" and not i.get("invalidated_by")], "findings": [f["id"] for f in state.get("findings", [])], "finding_status": [{"id": f["id"], "impact": f.get("impact"), "status": next((item["status"] for item in findings_projection["items"] if item["finding_ref"] == f["id"]), "unbound"), "current": next((item["current_applicability"] for item in findings_projection["items"] if item["finding_ref"] == f["id"]), False)} for f in state.get("findings", [])], "finding_projection": findings_projection, "candidates": state.get("candidates", []), "runtime_attempts": [{"id": a.get("id"), "liveness": runtime_liveness(a), "runtime_instance_id": (a.get("runtime") or {}).get("runtime_instance_id"), "reservation": a.get("lease", {}).get("state"), "protocol_recorded": isinstance(a.get("runtime"), dict)} for a in state.get("attempts", [])], "reviews": [{"id": r.get("id"), "subject": r.get("subject_fingerprint"), "verdict": r.get("verdict"), "review_kind": r.get("review_kind"), "reviewer_identity": r.get("reviewer_identity"), "reviewer_role": r.get("reviewer_role"), "current": not bool(r.get("invalidated_by")), "finding_refs": r.get("finding_refs", [])} for r in state.get("reviews", [])], "design_publication": state.get("design_publication"), "design_publication_history": state.get("design_publication_history", []), "requirements_publications": state.get("requirements_publications", []), "design_review_attempts": [{"id": a.get("id"), "kind": a.get("mode"), "state": a.get("state"), "result": a.get("review_result"), "reviewer_identity": a.get("reviewer_identity"), "reviewer_role": a.get("reviewer_role")} for a in state.get("attempts", []) if a.get("mode") in ("coverage", "plan")], "adjudications": [d.get("id") for d in state.get("decisions", []) if d.get("type") == "reviewer_adjudication"], "intent": binding, "version_provenance": state.get("runtime_provenance", {"creation_skill_version": state.get("skill_version"), "current_schema_version": state.get("schema_version"), "last_mutating_skill_version": state.get("skill_version"), "compatibility_floor": COMPATIBILITY_FLOOR, "applied_migrations": []}), "consumer_invalidation_count": len(state.get("invalidations", [])), "usage": usage, "evidence_count": len(state.get("evidence", [])), "ledger_bytes": len(raw), "ledger_hash": sha256_bytes(raw)}
         brief["usage"]["counters"]["brief_bytes"] = len(canonical_bytes(brief))
         return brief
     settings = resolved_run_settings(state)
@@ -5119,7 +5199,7 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         "next_action": control_projection["next_action"], "allowed_events": control_projection["allowed_events"],
         "run_settings": settings, "preset_display": run_settings_display(settings),
         "ticket_counts": {s: sum(1 for t in state.get("tickets", []) if t.get("state") == s) for s in ("PLANNED", "READY", "RUNNING", "CANDIDATE", "REVIEW", "INTEGRATED", "BLOCKED", "STALE")},
-        "attempts": len(state.get("attempts", [])), "blockers": current_blockers,
+        "attempts": len(state.get("attempts", [])), "runtime_attempts": [{"id": a.get("id"), "liveness": runtime_liveness(a), "runtime_instance_id": (a.get("runtime") or {}).get("runtime_instance_id"), "reservation": a.get("lease", {}).get("state"), "protocol_recorded": isinstance(a.get("runtime"), dict)} for a in state.get("attempts", [])], "blockers": current_blockers,
         "finding_counts": {"current": legacy_current_findings, "historical": len(state.get("findings", [])) - legacy_current_findings, "total": len(state.get("findings", []))},
         "finding_status_counts": status_counts,
         "finding_projection": findings_projection, "candidates": state.get("candidates", []),
@@ -5577,6 +5657,13 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
             fail("conflicting duplicate return for a terminal attempt")
         if attempt.get("state") in ("LOST", "INTERRUPTED"):
             fail("return conflicts with a terminal lost/interrupted attempt")
+        runtime = attempt.get("runtime")
+        if isinstance(runtime, dict) and runtime_liveness(attempt) == "not_started":
+            fail("return ingestion conflicts with an exact not_started runtime observation")
+        if isinstance(runtime, dict) and runtime.get("return_observation_ref"):
+            observed_return = stored_payload(p, runtime["return_observation_ref"], "runtime return observation")
+            if observed_return.get("return_hash") != proposed_digest:
+                fail("ingested return bytes do not match the exact runtime return_observed receipt")
         if state["revision"] != args.revision:
             fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
         payload, digest, return_raw = ingest_payload(p, state, args.attempt_id, Path(args.return_file), attempt.get("packet_hash"), args.kind)
@@ -5585,6 +5672,7 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         review_purpose = normalize_review_purpose(packet.get("purpose"), packet_kind="review") if args.kind == "review" else None
         phase_e_review = bool(args.kind == "review" and packet.get("purpose") is not None and attempt.get("mode") == "change")
         if phase_e_review:
+            require_runtime_stopped(p, attempt, "Phase E review qualification")
             if attempt.get("review_purpose") not in (None, review_purpose):
                 fail("review return purpose does not match the registered attempt")
             if integrity is None or integrity_raw is None:
@@ -5603,8 +5691,11 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         target["return_source_revision"] = identity.get("source_revision", target.get("packet_source_revision"))
         if args.kind == "review":
             target["review_result"] = payload.get("verdict")
-            # Reviewer returns terminate reviewer write authority atomically.
-            if target.get("lease", {}).get("state") == "active":
+            # A return is not a stop observation. Runtime-protocol reservations
+            # remain checked out until exact stop/reconciliation is recorded.
+            if target.get("lease", {}).get("state") == "active" and (
+                not isinstance(target.get("runtime"), dict) or runtime_stop_proven(p, target)
+            ):
                 target["lease"]["state"] = "released"
         target["finding_refs"] = append_review_findings(next_state, payload, args.attempt_id, digest, packet=packet if args.kind == "review" else None, subject_ref=target.get("subject_ref"))
         if args.kind == "worker":
@@ -5764,7 +5855,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 attempt_id=args.attempt_id, packet_hash=packet_hash,
                 route_id=args.route_id, route=route, attempt=existing_attempt,
             )
-            return {"prepared": True, "idempotent": True, "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": observed["revision"]}
+            return {"prepared": True, "idempotent": True, "spawn_disposition": "existing_request_do_not_spawn_again", "spawn_request_id": (existing_attempt.get("runtime") or {}).get("spawn_request_id"), "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": observed["revision"]}
         fail("attempt ID already exists with conflicting dispatch")
     def change(state: dict[str, Any]) -> None:
         admit_event(state, "worker.dispatch")
@@ -5832,6 +5923,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         object_store(p, packet_raw)
         lease = {"id": args.lease_id, "state": "active", "zone": lease_zone}
         attempt_record = {"id": args.attempt_id, "kind": packet.get("kind", "worker"), "mode": packet.get("mode", "implement"), "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": lease, "route_ref": args.route_id, "checkout": packet.get("workspace", {}).get("root"), "base_sha": packet.get("workspace", {}).get("expected_base"), "candidate_sha": None, "candidate_tree_sha": None, "return_ref": None, "finding_refs": []}
+        initialize_attempt_runtime(args.run_id, attempt_record)
         attempt_record["execution_binding"] = execution_binding
         attempt_record["execution_binding_hash"] = sha256_bytes(canonical_bytes(execution_binding))
         if binding:
@@ -5850,7 +5942,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         if repair_lease_provenance:
             attempt_record["repair_lease_provenance"] = repair_lease_provenance
         state.setdefault("attempts", []).append(attempt_record)
-        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": len(packet_raw), "spawn_calls": 1})
+        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": len(packet_raw), "attempt_registrations": 1})
         ticket["state"] = "RUNNING"
         ticket["current_attempt"] = args.attempt_id
         if state.get("candidate_model_version") == "1.1":
@@ -5866,7 +5958,8 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 fail("dispatch route differs from the current published route")
         state["lifecycle"]["next_action"] = {"kind": "await_worker_return", "subject_refs": [args.attempt_id], "preconditions": ["internal orchestration wait; not a user checkpoint", "native child started", "bounded no-progress waits", "return matches packet"], "read_refs": ["contracts/worker.md", "phases/execute.md", "phases/recover.md"]}
     result = transaction(p, args.owner_token, args.revision, change)
-    return {"prepared": True, "idempotent": False, "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": result["revision"]}
+    registered = attempt_by_id(result, args.attempt_id)
+    return {"prepared": True, "idempotent": False, "spawn_disposition": "register_only_use_spawn_request_id_once", "spawn_request_id": registered["runtime"]["spawn_request_id"], "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": result["revision"]}
 
 
 def cmd_ready_ticket(args: argparse.Namespace) -> dict[str, Any]:
@@ -6036,6 +6129,7 @@ def cmd_authorize_repair(args: argparse.Namespace) -> dict[str, Any]:
             if attempt.get("subject_ref") == args.ticket_id and attempt.get("lease", {}).get("state") == "quarantined":
                 fail("repair authorization requires quarantine reconciliation")
             if attempt.get("subject_ref") == args.ticket_id and attempt.get("lease", {}).get("state") == "active":
+                require_runtime_stopped(p, attempt, "repair lease release/reuse")
                 attempt["lease"]["state"] = "released"
         repair_plan_ref = f"objects/{object_store(p, canonical_bytes(repair_plan))}"
         attempt_plan_ref = f"objects/{object_store(p, canonical_bytes(attempt_plan))}" if attempt_plan is not None else None
@@ -6116,8 +6210,14 @@ def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
     evidence = read_json(evidence_path, "attempt termination evidence")
     evidence_raw = evidence_path.read_bytes()
     evidence_digest = sha256_bytes(evidence_raw)
-    if args.lease_state == "released" and (evidence.get("status") != "PASS" or evidence.get("writer_stopped") is not True):
-        fail("lease release requires PASS writer_stopped evidence")
+    if args.lease_state == "released":
+        typed_runtime_stop = bool(
+            evidence.get("kind") == "runtime_observation"
+            and evidence.get("event") in ("stop", "not_started")
+            and (evidence.get("event") != "stop" or evidence.get("coverage", {}).get("descendant_writers") == "included")
+        )
+        if not typed_runtime_stop and (evidence.get("status") != "PASS" or evidence.get("writer_stopped") is not True):
+            fail("lease release requires an exact runtime stop/not_started receipt or PASS writer_stopped evidence")
 
     def change(state: dict[str, Any]) -> None:
         admit_event(state, "attempt.reconcile")
@@ -6126,6 +6226,12 @@ def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
             fail("only an in-flight attempt may be terminated")
         if attempt.get("epoch") != state["owner"]["epoch"] and args.lease_state == "released":
             fail("stale-epoch attempt may only be quarantined until takeover reconciliation")
+        if args.lease_state == "released" and isinstance(attempt.get("runtime"), dict):
+            require_runtime_stopped(p, attempt, "runtime reservation release")
+            runtime = attempt["runtime"]
+            exact_stop_ref = runtime.get("stop_ref") if runtime_liveness(attempt) == "stopped" else runtime.get("not_started_ref")
+            if exact_stop_ref != f"objects/{evidence_digest}":
+                fail("runtime reservation release evidence must be the exact registered stop/not_started receipt")
         object_store(p, evidence_raw)
         evidence_ref = f"objects/{evidence_digest}"
         attempt["state"] = args.state
@@ -6149,6 +6255,141 @@ def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
     return {"terminated": True, "attempt_id": args.attempt_id, "state": args.state, "lease_state": args.lease_state, "evidence_ref": f"objects/{evidence_digest}", "revision": result["revision"]}
 
 
+def cmd_observe_runtime(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    receipt_path = Path(args.event_file).expanduser().resolve()
+    regular_non_symlink(receipt_path)
+    raw = receipt_path.read_bytes()
+    if len(raw) > 64 * 1024:
+        fail("runtime observation exceeds the 64 KiB contract bound")
+    try:
+        receipt = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        fail(f"runtime observation is not valid JSON: {exc}")
+    root = schema()
+    validate(receipt, root["$defs"]["runtime_observation"], root, "$.runtime_observation")
+    digest = sha256_bytes(raw)
+    ref = f"objects/{digest}"
+
+    # Exact byte replay remains a no-op even after unrelated downstream progress.
+    with Lock(p["lock"]):
+        observed, _ = load_state(p)
+        if observed.get("owner", {}).get("token") != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        attempt = attempt_by_id(observed, args.attempt_id)
+        runtime = attempt.get("runtime")
+        if not isinstance(runtime, dict):
+            fail("attempt has no runtime protocol record; legacy liveness remains unknown")
+        if receipt.get("event_id") != args.event_id or receipt.get("event") != args.event:
+            fail("runtime observation event ID/type does not match command arguments")
+        expected = {
+            "run_id": args.run_id, "attempt_id": args.attempt_id, "epoch": attempt.get("epoch"),
+            "packet_hash": attempt.get("packet_hash"), "spawn_request_id": runtime.get("spawn_request_id"),
+        }
+        for field, value in expected.items():
+            if receipt.get(field) != value:
+                fail(f"runtime observation {field} does not exactly match registered attempt")
+        if ref in runtime.get("observation_refs", []):
+            disposition = "already_observed; do_not_spawn_again" if receipt["event"] == "start" else "already_observed"
+            return {"observed": True, "idempotent": True, "disposition": disposition, "attempt_id": args.attempt_id, "event": args.event, "observation_ref": ref, "liveness": runtime_liveness(attempt), "revision": observed["revision"]}
+        if any(
+            stored_payload(p, prior_ref, "runtime observation").get("event_id") == receipt["event_id"]
+            for prior_ref in runtime.get("observation_refs", [])
+        ):
+            fail("runtime observation event_id is already bound to different immutable bytes")
+        if observed.get("revision") != args.revision:
+            fail(f"revision mismatch: expected {args.revision}, current {observed['revision']}")
+
+    def change(state: dict[str, Any]) -> None:
+        admit_event(state, "attempt.reconcile")
+        attempt = attempt_by_id(state, args.attempt_id)
+        runtime = attempt.get("runtime")
+        if not isinstance(runtime, dict):
+            fail("attempt has no runtime protocol record; legacy liveness remains unknown")
+        for field, value in expected.items():
+            if receipt.get(field) != value:
+                fail(f"runtime observation {field} does not exactly match registered attempt")
+        if receipt.get("event_id") != args.event_id or receipt.get("event") != args.event:
+            fail("runtime observation event ID/type does not match command arguments")
+        liveness = runtime_liveness(attempt)
+        event = receipt["event"]
+        if event == "start":
+            if attempt.get("state") not in ("PREPARED", "DISPATCHED"):
+                fail("start observation is only valid for a prepared/dispatched attempt")
+            if liveness != "unknown" or runtime.get("runtime_instance_id") or runtime.get("start_ref") or runtime.get("not_started_ref") or runtime.get("return_observation_ref"):
+                fail("start observation is valid only once for an unknown, unstarted spawn request")
+            if not receipt.get("runtime_instance_id"):
+                fail("start observation requires a runtime instance ID")
+            runtime["runtime_instance_id"] = receipt["runtime_instance_id"]
+            runtime["liveness"] = "running"
+            runtime["start_ref"] = ref
+            add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"spawn_calls": 1})
+        elif event == "heartbeat":
+            if liveness != "running" or receipt.get("runtime_instance_id") != runtime.get("runtime_instance_id"):
+                fail("heartbeat must be bound to the exact currently running runtime instance")
+        elif event == "return_observed":
+            if liveness == "not_started":
+                fail("return observation conflicts with a proven not_started request")
+            if runtime.get("return_observation_ref"):
+                fail("attempt already has a return observation; conflicting observations are immutable")
+            if not receipt.get("runtime_instance_id"):
+                fail("return_observed requires the exact runtime instance ID")
+            if runtime.get("runtime_instance_id") and receipt.get("runtime_instance_id") != runtime.get("runtime_instance_id"):
+                fail("return observation does not match the registered runtime instance")
+            if not receipt.get("return_hash"):
+                fail("return_observed requires the immutable return payload hash")
+            if attempt.get("return_ref") and attempt.get("return_ref") != f"objects/{receipt['return_hash']}":
+                fail("return_observed hash conflicts with the already ingested return bytes")
+            runtime["runtime_instance_id"] = receipt["runtime_instance_id"]
+        elif event == "stop":
+            if liveness == "running":
+                if receipt.get("runtime_instance_id") != runtime.get("runtime_instance_id"):
+                    fail("stop observation must be bound to the exact running runtime instance")
+            elif liveness == "unknown" and not runtime.get("runtime_instance_id"):
+                if not receipt.get("runtime_instance_id"):
+                    fail("late stop observation requires the exact runtime instance ID")
+                runtime["runtime_instance_id"] = receipt["runtime_instance_id"]
+            elif liveness == "unknown" and receipt.get("runtime_instance_id") == runtime.get("runtime_instance_id"):
+                pass
+            elif liveness == "unknown" and runtime.get("runtime_instance_id"):
+                fail("late stop observation must match the exact runtime instance already observed for this spawn request")
+            else:
+                fail("stop observation is valid only for a running or unresolved runtime request")
+            if receipt.get("coverage", {}).get("descendant_writers") != "included":
+                fail("stop observation must cover descendant writers")
+        elif event == "not_started":
+            if attempt.get("state") not in ("PREPARED", "DISPATCHED"):
+                fail("not_started observation is only valid for a prepared/dispatched attempt")
+            if liveness != "unknown" or runtime.get("start_ref") or runtime.get("return_observation_ref"):
+                fail("not_started is valid only when no start or runtime return was observed")
+            if receipt.get("runtime_instance_id") is not None:
+                fail("not_started observation must not name a runtime instance")
+        else:
+            fail(f"unsupported runtime observation event: {event}")
+        object_store(p, raw)
+        runtime.setdefault("observation_refs", []).append(ref)
+        if event == "heartbeat":
+            runtime.setdefault("heartbeat_refs", []).append(ref)
+        elif event == "return_observed":
+            runtime["return_observation_ref"] = ref
+        elif event == "stop":
+            runtime["liveness"] = "stopped"
+            runtime["stop_ref"] = ref
+            if attempt.get("kind") == "review" and attempt.get("state") == "RETURNED":
+                attempt.setdefault("lease", {})["state"] = "released"
+        elif event == "not_started":
+            runtime["liveness"] = "not_started"
+            runtime["not_started_ref"] = ref
+
+    result = transaction(p, args.owner_token, args.revision, change, "runtime-observed")
+    return {
+        "observed": True, "idempotent": False,
+        "disposition": "spawn_observed_once; do_not_repeat_spawn" if args.event == "start" else "recorded_no_liveness_inference",
+        "attempt_id": args.attempt_id, "event": args.event, "observation_ref": ref,
+        "liveness": runtime_liveness(attempt_by_id(result, args.attempt_id)), "revision": result["revision"],
+    }
+
+
 def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     observed, _ = load_mutation_state(p, args.owner_token)
@@ -6168,6 +6409,7 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
             fail("candidate requires a validated RETURNED worker attempt")
         if observed_attempt.get("kind") != "worker":
             fail("candidate requires a worker attempt")
+        require_runtime_stopped(p, observed_attempt, "candidate qualification")
         if observed_attempt.get("lease", {}).get("state") != "active":
             fail("candidate requires an active, non-quarantined worker lease")
         observed_return = stored_payload(p, observed_attempt.get("return_ref"), "worker return")
@@ -6228,6 +6470,7 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
             fail("candidate requires a validated RETURNED worker attempt")
         if attempt.get("kind") != "worker":
             fail("candidate requires a worker attempt")
+        require_runtime_stopped(p, attempt, "candidate qualification")
         if attempt.get("lease", {}).get("state") != "active":
             fail("candidate requires an active, non-quarantined worker lease")
         worker_return = stored_payload(p, attempt.get("return_ref"), "worker return")
@@ -6496,6 +6739,7 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
             fail("continuation preservation requires a current-epoch worker attempt")
         if attempt.get("kind") != "worker" or attempt.get("state") != "RETURNED":
             fail("continuation preservation requires a validated RETURNED worker attempt")
+        require_runtime_stopped(p, attempt, "continuation candidate qualification")
         if attempt.get("lease", {}).get("state") != "active":
             fail("continuation preservation requires the worker's active, non-quarantined lease")
         if attempt.get("candidate_sha") is not None or attempt.get("candidate_tree_sha") is not None:
@@ -6918,6 +7162,14 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
         fail("review packet identity does not match review attempt")
     packet_raw = packet_path.read_bytes()
     packet_hash = sha256_bytes(packet_raw)
+    observed, _ = load_mutation_state(p, args.owner_token)
+    if observed.get("owner", {}).get("token") != args.owner_token:
+        fail("owner token mismatch; stale orchestrator is fenced")
+    prior_attempt = next((item for item in observed.get("attempts", []) if item.get("id") == args.review_attempt_id), None)
+    if prior_attempt is not None:
+        if prior_attempt.get("packet_hash") == packet_hash and prior_attempt.get("subject_ref") == args.ticket_id and prior_attempt.get("mode") == "change":
+            return {"prepared": True, "idempotent": True, "spawn_disposition": "existing_request_do_not_spawn_again", "spawn_request_id": (prior_attempt.get("runtime") or {}).get("spawn_request_id"), "attempt_id": args.review_attempt_id, "packet_hash": packet_hash, "purpose": purpose, "revision": observed["revision"]}
+        fail("review attempt ID already exists with conflicting registration")
     def change(state: dict[str, Any]) -> None:
         admit_event(state, "review.dispatch")
         ticket = next((t for t in state.get("tickets", []) if t.get("id") == args.ticket_id), None)
@@ -6951,10 +7203,11 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
             fail("review attempt ID already exists")
         object_store(p, packet_raw)
         attempt_record = {"id": args.review_attempt_id, "kind": "review", "mode": "change", "review_purpose": purpose, "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": {"id": args.lease_id, "state": "active", "zone": []}, "route_ref": None, "checkout": None, "base_sha": worker.get("candidate_sha"), "candidate_sha": worker.get("candidate_sha"), "candidate_tree_sha": worker.get("candidate_tree_sha"), "return_ref": None, "finding_refs": [], "subject_fingerprint": worker.get("candidate_sha"), "packet_registration_revision": registration_revision, "packet_source_revision": identity.get("source_revision", registration_revision), "subject_revision": identity.get("subject_revision", state["revision"]), "attempt_created_revision": state["revision"] + 1, "return_source_revision": None}
+        initialize_attempt_runtime(args.run_id, attempt_record)
         if binding:
             attempt_record.update({"intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"]})
         state.setdefault("attempts", []).append(attempt_record)
-        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": packet_path.stat().st_size, "spawn_calls": 1})
+        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": packet_path.stat().st_size, "attempt_registrations": 1})
         if is_blocked_continuation:
             state["lifecycle"]["control"] = "BLOCKED"
             state["lifecycle"]["next_action"] = {"kind": "await_blocked_candidate_review", "subject_refs": [args.review_attempt_id, worker["id"]], "preconditions": ["review does not change the BLOCKED ticket verdict", "reviewed candidate remains continuation-only"], "read_refs": ["contracts/reviewer.md", "phases/execute.md"]}
@@ -6962,7 +7215,8 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
             ticket["state"] = "REVIEW"
             state["lifecycle"]["next_action"] = {"kind": "await_review_return", "subject_refs": [args.review_attempt_id], "preconditions": ["reviewer stopped", "integrity baseline unchanged", "strict packet/subject match"], "read_refs": ["contracts/reviewer.md", "phases/execute.md"]}
     result = transaction(p, args.owner_token, args.revision, change)
-    return {"prepared": True, "attempt_id": args.review_attempt_id, "packet_hash": packet_hash, "purpose": purpose, "revision": result["revision"]}
+    registered = attempt_by_id(result, args.review_attempt_id)
+    return {"prepared": True, "spawn_disposition": "register_only_use_spawn_request_id_once", "spawn_request_id": registered["runtime"]["spawn_request_id"], "attempt_id": args.review_attempt_id, "packet_hash": packet_hash, "purpose": purpose, "revision": result["revision"]}
 
 
 def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
@@ -7015,7 +7269,7 @@ def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
         existing_attempt = next((item for item in state.get("attempts", []) if item.get("id") == args.review_attempt_id), None)
         if existing_attempt:
             if existing_attempt.get("packet_hash") == packet_hash and existing_attempt.get("mode") == args.review_kind and existing_attempt.get("subject_ref") == publication.get("id") and existing_attempt.get("reviewer_identity") == reviewer_identity and existing_attempt.get("reviewer_role") == reviewer_role:
-                raise IdempotentResult({"prepared": True, "idempotent": True, "attempt_id": args.review_attempt_id, "review_kind": args.review_kind, "packet_hash": packet_hash, "revision": state["revision"]})
+                raise IdempotentResult({"prepared": True, "idempotent": True, "spawn_disposition": "existing_request_do_not_spawn_again", "spawn_request_id": (existing_attempt.get("runtime") or {}).get("spawn_request_id"), "attempt_id": args.review_attempt_id, "review_kind": args.review_kind, "packet_hash": packet_hash, "revision": state["revision"]})
             fail("review attempt ID already exists with conflicting registration")
         object_store(p, packet_raw)
         target_refs = [*publication["document_refs"], *publication["contract_refs"], *publication["ticket_refs"], *publication["route_refs"]]
@@ -7033,8 +7287,9 @@ def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
             "subject_revision": publication["published_revision"], "attempt_created_revision": state["revision"] + 1, "return_source_revision": None, "review_result": None,
             "intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"],
         }
+        initialize_attempt_runtime(args.run_id, attempt_record)
         state.setdefault("attempts", []).append(attempt_record)
-        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": packet_path.stat().st_size, "spawn_calls": 1})
+        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": packet_path.stat().st_size, "attempt_registrations": 1})
         state["lifecycle"]["next_action"] = {"kind": "await_design_review_return", "subject_refs": [args.review_attempt_id, publication["id"]], "preconditions": ["reviewer identity/role registered", "reviewer stopped", "exact bundle fingerprint and revision"], "read_refs": ["contracts/reviewer.md", "phases/design.md", "references/ledger.md"]}
 
     observed, _ = load_mutation_state(p, args.owner_token)
@@ -7042,12 +7297,13 @@ def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
         fail("owner token mismatch; stale orchestrator is fenced")
     observed_attempt = next((item for item in observed.get("attempts", []) if item.get("id") == args.review_attempt_id), None)
     if observed_attempt and observed_attempt.get("packet_hash") == packet_hash and observed_attempt.get("mode") == args.review_kind and observed_attempt.get("reviewer_identity") == reviewer_identity and observed_attempt.get("reviewer_role") == reviewer_role:
-        return {"prepared": True, "idempotent": True, "attempt_id": args.review_attempt_id, "review_kind": args.review_kind, "packet_hash": packet_hash, "revision": observed["revision"]}
+        return {"prepared": True, "idempotent": True, "spawn_disposition": "existing_request_do_not_spawn_again", "spawn_request_id": (observed_attempt.get("runtime") or {}).get("spawn_request_id"), "attempt_id": args.review_attempt_id, "review_kind": args.review_kind, "packet_hash": packet_hash, "revision": observed["revision"]}
     try:
         result = transaction(p, args.owner_token, args.revision, change)
     except IdempotentResult as prior:
         return prior.result
-    return {"prepared": True, "attempt_id": args.review_attempt_id, "review_kind": args.review_kind, "packet_hash": packet_hash, "revision": result["revision"]}
+    registered = attempt_by_id(result, args.review_attempt_id)
+    return {"prepared": True, "spawn_disposition": "register_only_use_spawn_request_id_once", "spawn_request_id": registered["runtime"]["spawn_request_id"], "attempt_id": args.review_attempt_id, "review_kind": args.review_kind, "packet_hash": packet_hash, "revision": result["revision"]}
 
 
 def cmd_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
@@ -7128,6 +7384,12 @@ def cmd_integrate_qualification(args: argparse.Namespace) -> dict[str, Any]:
         worker = current_candidate_producer(state, ticket)
         if candidate is None or worker is None or candidate.get("quality") != "DONE":
             fail("qualified integration requires the explicit current DONE candidate and producer")
+        require_runtime_stopped(p, worker, "qualified candidate integration")
+        for review_id in qualification.get("accepted_review_refs", []):
+            review = next((item for item in state.get("reviews", []) if item.get("id") == review_id), None)
+            review_attempt = attempt_by_id(state, review.get("attempt_ref")) if review and review.get("attempt_ref") else None
+            if review_attempt is not None:
+                require_runtime_stopped(p, review_attempt, "qualified review integration")
         if qualification.get("subject_fingerprint") != candidate.get("sha"):
             fail("review qualification is stale for the current candidate")
         if qualification.get("required_purposes") != required_review_purposes(ticket, "ticket_review"):
@@ -7195,11 +7457,14 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
         attempt = attempt_by_id(state, args.attempt_id)
+        require_runtime_stopped(p, attempt, "review integration")
         if attempt.get("kind") != "review" or attempt.get("mode") == "user_assisted":
             fail("integration requires a separate immutable reviewer attempt")
         linked_ticket = next((item for item in state.get("tickets", []) if item.get("id") == attempt.get("subject_ref")), None)
         linked_candidate = current_candidate_record(state, linked_ticket) if linked_ticket else None
         linked_worker = current_candidate_producer(state, linked_ticket) if linked_ticket else None
+        if linked_worker is not None:
+            require_runtime_stopped(p, linked_worker, "candidate integration")
         if state.get("candidate_model_version") == "1.1" and linked_ticket and (linked_candidate is None or linked_worker is None):
             fail("integration requires the explicit current candidate and its producer attempt")
         if linked_candidate and linked_candidate.get("quality") == "CONTINUATION":
@@ -7238,6 +7503,7 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
             return {"integrated": True, "idempotent": True, "reconciled": True, "revision": next_state["revision"]}
         if attempt.get("state") not in ("PREPARED", "RETURNED"):
             fail("review attempt is not active")
+        require_runtime_stopped(p, attempt, "review integration")
         packet = stored_payload(p, attempt.get("packet_ref"), "review packet")
         if packet.get("purpose") is not None:
             fail("Phase E review returns must be accepted by ingest-return and integrated by qualification-ref")
@@ -7663,6 +7929,7 @@ def cmd_close_blocked_attempt(args: argparse.Namespace) -> dict[str, Any]:
             fail("blocked attempt closure requires the exact current BLOCKED ticket attempt")
         if attempt.get("kind") != "worker" or attempt.get("mode") != "repair" or attempt.get("state") != "RETURNED":
             fail("blocked attempt closure applies only to a returned worker repair attempt")
+        require_runtime_stopped(p, attempt, "blocked attempt closure/release")
         if attempt.get("lease", {}).get("state") != "active":
             fail("blocked attempt closure requires the attempt's active lease")
         if attempt.get("candidate_sha") is not None or attempt.get("candidate_tree_sha") is not None:
@@ -7916,16 +8183,18 @@ def cmd_finalize_attempt(args: argparse.Namespace) -> dict[str, Any]:
             if return_payload.get("status") not in ("BLOCKED", "HANDOFF", "FAILED"):
                 fail("attempt finalization handles only durable BLOCKED, HANDOFF, or FAILED returns")
             declared_files = return_payload.get("files", [])
-            evidence_known = attempt.get("lease", {}).get("state") == "active"
+            evidence_known = attempt.get("lease", {}).get("state") == "active" and runtime_stop_proven(p, attempt)
         elif attempt.get("state") in ("LOST", "INTERRUPTED"):
             termination_ref = attempt.get("termination_evidence_ref")
             if termination_ref:
                 termination = stored_payload(p, termination_ref, "attempt termination evidence")
             evidence_known = bool(
-                termination
-                and termination.get("status") == "PASS"
-                and termination.get("writer_stopped") is True
-                and attempt.get("lease", {}).get("state") == "released"
+                attempt.get("lease", {}).get("state") == "released"
+                and runtime_stop_proven(p, attempt)
+                and (
+                    runtime_stop_proven(p, attempt) if isinstance(attempt.get("runtime"), dict)
+                    else termination and termination.get("status") == "PASS" and termination.get("writer_stopped") is True
+                )
             )
         else:
             fail("attempt finalization requires a RETURNED, LOST, or INTERRUPTED worker attempt")
@@ -8258,6 +8527,7 @@ def cmd_reconcile_finalized_attempt(args: argparse.Namespace) -> dict[str, Any]:
             or attempt.get("subject_ref") != ticket_id
         ):
             fail("reconciliation requires the exact current attempt of the same ticket")
+        require_runtime_stopped(p, attempt, "finalized quarantine release/reuse")
         if attempt.get("lease", {}).get("state") != "quarantined":
             fail("reconciliation requires a finalized quarantined lease")
         finalization_ref = attempt.get("finalization_ref")
@@ -8525,6 +8795,7 @@ def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any
         ticket = next((item for item in state.get("tickets", []) if item.get("id") == ticket_id), None)
         if ticket is None or attempt.get("subject_ref") != ticket_id or ticket.get("current_attempt") != attempt_id:
             fail("reconciliation requires the exact current attempt of the same ticket")
+        require_runtime_stopped(p, attempt, "quarantined repair lease release/reuse")
         if attempt.get("kind") != "worker" or attempt.get("mode") != "repair" or attempt.get("state") != "RETURNED":
             fail("reconciliation requires a returned worker repair attempt")
         if attempt.get("lease", {}).get("state") != "quarantined":
@@ -10058,6 +10329,22 @@ def design_review_pass(state: dict[str, Any], review_kind: str) -> bool:
     )
 
 
+def require_design_review_stopped(p: dict[str, Path], state: dict[str, Any], review_kind: str) -> None:
+    publication = current_design_publication(state)
+    for review in state.get("reviews", []):
+        if (
+            review.get("review_kind") == review_kind
+            and review.get("verdict") == "PASS"
+            and review.get("subject_fingerprint") == publication.get("publication_hash")
+            and review.get("intent_revision") == publication.get("intent_revision")
+            and review.get("target_revision") == publication.get("published_revision")
+            and not review.get("invalidated_by")
+        ):
+            attempt_id = review.get("attempt_ref")
+            if attempt_id:
+                require_runtime_stopped(p, attempt_by_id(state, attempt_id), f"{review_kind} review qualification")
+
+
 def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     bundle_path = Path(args.bundle).expanduser().resolve()
@@ -10319,6 +10606,7 @@ def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
     def change(state: dict[str, Any]) -> None:
         phase = args.phase or state["lifecycle"]["phase"]
         control = args.control or state["lifecycle"]["control"]
@@ -10401,10 +10689,13 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
                 state, current_design_tickets, f"{gate_id} design publication",
                 require_availability=True, allow_planned_producers=True,
             )
+            require_design_review_stopped(p, state, "coverage")
             if not design_review_pass(state, "coverage"):
                 fail("G2 cannot pass without a PASS coverage review of the current published design bundle")
-            if g3_claim and not design_review_pass(state, "plan"):
-                fail("G3 cannot pass without a PASS plan review of the current published design bundle")
+            if g3_claim:
+                require_design_review_stopped(p, state, "plan")
+                if not design_review_pass(state, "plan"):
+                    fail("G3 cannot pass without a PASS plan review of the current published design bundle")
             if blockers:
                 fail("a current blocking issue prevents G2/G3 advancement")
         if (
@@ -10447,6 +10738,8 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
                 state, current_design_tickets, "execution entry",
                 require_availability=True, allow_planned_producers=True,
             )
+            require_design_review_stopped(p, state, "coverage")
+            require_design_review_stopped(p, state, "plan")
             if not design_review_pass(state, "coverage") or not design_review_pass(state, "plan"):
                 fail("execution requires current G2 coverage PASS and G3 plan PASS")
             if any(ticket.get("id") in publication.get("ticket_refs", []) and ticket.get("state") not in ("PLANNED", "READY") for ticket in state.get("tickets", [])):
@@ -10501,7 +10794,7 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
         state["lifecycle"]["control"] = control
         state["lifecycle"]["reason"] = args.reason
         state["lifecycle"]["next_action"] = {"kind": args.next_action, "subject_refs": [x for x in args.subject_refs.split(",") if x], "preconditions": [x for x in args.preconditions.split("|") if x], "read_refs": [x for x in args.read_refs.split(",") if x]}
-    result = transaction(paths(args.control_root, args.run_id), args.owner_token, args.revision, change, "gate")
+    result = transaction(p, args.owner_token, args.revision, change, "gate")
     return {"published": True, "revision": result["revision"], "phase": result["lifecycle"]["phase"], "control": result["lifecycle"]["control"]}
 
 
@@ -10528,6 +10821,8 @@ def cmd_cancel(args: argparse.Namespace) -> dict[str, Any]:
         if any(effect_is_unresolved(op) for op in state.get("operations", [])):
             fail("cancellation requires all unresolved effects finalized or abandoned")
         for attempt in state.get("attempts", []):
+            if attempt.get("lease", {}).get("state") in ("active", "quarantined"):
+                require_runtime_stopped(p, attempt, "run cancellation lease release")
             if attempt.get("state") in ("PREPARED", "DISPATCHED"):
                 attempt["state"] = "INTERRUPTED"
             if attempt.get("lease", {}).get("state") in ("active", "quarantined"):
@@ -10594,6 +10889,7 @@ def build_parser() -> argparse.ArgumentParser:
     valid = sub.add_parser("validate"); valid.add_argument("--file", required=True); valid.add_argument("--kind", default="ledger")
     state_valid = sub.add_parser("validate-return"); state_valid.add_argument("--control-root", required=True); state_valid.add_argument("--run-id", required=True); state_valid.add_argument("--attempt-id", required=True); state_valid.add_argument("--return-file", required=True); state_valid.add_argument("--kind", choices=["worker", "review", "acceptance"], required=True)
     ingest = sub.add_parser("ingest-return"); ingest.add_argument("--control-root", required=True); ingest.add_argument("--run-id", required=True); ingest.add_argument("--owner-token", required=True); ingest.add_argument("--revision", type=int, required=True); ingest.add_argument("--attempt-id", required=True); ingest.add_argument("--return-file", required=True); ingest.add_argument("--kind", default="worker"); ingest.add_argument("--integrity-receipt")
+    observe_runtime = sub.add_parser("observe-runtime", help="record an immutable, attempt-bound native runtime observation"); observe_runtime.add_argument("--control-root", required=True); observe_runtime.add_argument("--run-id", required=True); observe_runtime.add_argument("--owner-token", required=True); observe_runtime.add_argument("--revision", type=int, required=True); observe_runtime.add_argument("--attempt-id", required=True); observe_runtime.add_argument("--event", choices=["start", "heartbeat", "return_observed", "stop", "not_started"], required=True); observe_runtime.add_argument("--event-id", required=True); observe_runtime.add_argument("--event-file", required=True)
     dispatch = sub.add_parser("dispatch"); dispatch.add_argument("--control-root", required=True); dispatch.add_argument("--run-id", required=True); dispatch.add_argument("--owner-token", required=True); dispatch.add_argument("--revision", type=int, required=True); dispatch.add_argument("--ticket-id", required=True); dispatch.add_argument("--attempt-id", required=True); dispatch.add_argument("--lease-id", required=True); dispatch.add_argument("--route-id", required=True); dispatch.add_argument("--packet", required=True); dispatch.add_argument("--route")
     ready = sub.add_parser("ready-ticket"); ready.add_argument("--control-root", required=True); ready.add_argument("--run-id", required=True); ready.add_argument("--owner-token", required=True); ready.add_argument("--revision", type=int, required=True); ready.add_argument("--ticket-id", required=True)
     repair = sub.add_parser("authorize-repair"); repair.add_argument("--control-root", required=True); repair.add_argument("--run-id", required=True); repair.add_argument("--owner-token", required=True); repair.add_argument("--revision", type=int, required=True); repair.add_argument("--ticket-id", required=True); repair.add_argument("--finding-ref"); repair.add_argument("--authorization-id", required=True); repair.add_argument("--repair-contract", required=True); repair.add_argument("--packet"); repair.add_argument("--route-id"); repair.add_argument("--route")
@@ -10642,6 +10938,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "validate": result = cmd_validate(args)
         elif args.command == "validate-return": result = cmd_validate_return(args)
         elif args.command == "ingest-return": result = cmd_ingest(args)
+        elif args.command == "observe-runtime": result = cmd_observe_runtime(args)
         elif args.command == "dispatch": result = cmd_dispatch(args)
         elif args.command == "ready-ticket": result = cmd_ready_ticket(args)
         elif args.command == "authorize-repair": result = cmd_authorize_repair(args)

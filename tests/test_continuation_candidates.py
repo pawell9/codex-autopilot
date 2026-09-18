@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from tools import ledger
+from tests.test_phase_b_projections_v110 import install_execution_design
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +66,11 @@ class BlockedContinuationCandidateTests(unittest.TestCase):
         state["repository"].update({"checkout": str(repo), "branch": "main", "initial_head": base_sha})
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        install_execution_design(paths, repo)
+        state, _ = ledger.load_state(paths)
+        state["repository"]["initial_head"] = base_sha
+        ledger.validate_ledger(state)
+        ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
 
         packet = {
             "identity": {"run_id": RUN_ID, "ticket_id": TICKET_ID, "attempt_id": ATTEMPT_ID, "epoch": 0},
@@ -80,15 +86,40 @@ class BlockedContinuationCandidateTests(unittest.TestCase):
             "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}],
             "return_target": {"path": "return.json"},
         }
+        intent = ledger.current_intent_binding(state)
+        publication = state["design_publication"]
+        packet["identity"].update({
+            "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+            "intent_document_hash": intent["document_hash"], "design_publication_ref": publication["id"],
+            "design_publication_hash": publication["publication_hash"],
+            "design_publication_revision": publication["published_revision"], "contract_refs": [],
+        })
+        packet.update({"intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+                       "intent_document_hash": intent["document_hash"]})
         packet_path = root / "packet.json"
         write_json(packet_path, packet)
         run("dispatch", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
             "--revision", "1", "--ticket-id", TICKET_ID, "--attempt-id", ATTEMPT_ID,
             "--lease-id", "L-1", "--route-id", "route-1", "--packet", str(packet_path))
         state, _ = ledger.load_state(paths)
+        attempt = ledger.attempt_by_id(state, ATTEMPT_ID)
+        for event, event_id, descendants in (("start", "OBS-WORKER-START", "not_applicable"), ("stop", "OBS-WORKER-STOP", "included")):
+            observation = {
+                "kind": "runtime_observation", "event_id": event_id, "event": event,
+                "run_id": RUN_ID, "attempt_id": ATTEMPT_ID, "epoch": attempt["epoch"],
+                "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+                "runtime_instance_id": "runtime-continuation-worker", "observed_at": "2026-09-18T12:00:00Z",
+                "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+                "coverage": {"scope": "test process tree", "descendant_writers": descendants},
+            }
+            observation_path = root / f"{event_id}.json"
+            write_json(observation_path, observation)
+            run("observe-runtime", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
+                "--revision", str(state["revision"]), "--attempt-id", ATTEMPT_ID, "--event", event,
+                "--event-id", event_id, "--event-file", str(observation_path))
+            state, _ = ledger.load_state(paths)
         worker_return = {
-            "identity": {"run_id": RUN_ID, "ticket_id": TICKET_ID, "attempt_id": ATTEMPT_ID,
-                         "packet_hash": state["attempts"][0]["packet_hash"], "epoch": 0},
+            "identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]},
             "status": return_status, "result": "focused work is complete; the full suite has an external resource blocker",
             "files": [{"path": declared_path, "operation": "modify"}],
             "checks": [
@@ -111,12 +142,12 @@ class BlockedContinuationCandidateTests(unittest.TestCase):
         inbox = paths["scratch"] / ATTEMPT_ID / "return.json"
         write_json(inbox, worker_return)
         run("ingest-return", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
-            "--revision", "2", "--attempt-id", ATTEMPT_ID, "--return-file", str(inbox), "--kind", "worker")
+            "--revision", str(state["revision"]), "--attempt-id", ATTEMPT_ID, "--return-file", str(inbox), "--kind", "worker")
         state, _ = ledger.load_state(paths)
         blocker = next(item for item in state["issues"] if item["type"] == "external_test_fixture_blocker")
         auth_id = "AUTH-CONT-1"
         run("prepare-effect", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
-            "--revision", "3", "--operation-id", "OP-CONT-1", "--kind", "candidate_commit",
+            "--revision", str(state["revision"]), "--operation-id", "OP-CONT-1", "--kind", "candidate_commit",
             "--target", str(repo), "--expected-before", base_sha, "--authority-ref", auth_id)
 
         (repo / "app.txt").write_text("candidate\n", encoding="utf-8")
@@ -191,6 +222,22 @@ class BlockedContinuationCandidateTests(unittest.TestCase):
                 "--revision", str(state["revision"]), "--ticket-id", TICKET_ID, "--review-attempt-id", "RV-1",
                 "--lease-id", "RL-1", "--packet", str(review_path))
             state, _ = ledger.load_state(case["paths"])
+            review_attempt = ledger.attempt_by_id(state, "RV-1")
+            for event, event_id, descendants in (("start", "OBS-REVIEW-START", "not_applicable"), ("stop", "OBS-REVIEW-STOP", "included")):
+                observation = {
+                    "kind": "runtime_observation", "event_id": event_id, "event": event,
+                    "run_id": RUN_ID, "attempt_id": "RV-1", "epoch": review_attempt["epoch"],
+                    "packet_hash": review_attempt["packet_hash"], "spawn_request_id": review_attempt["runtime"]["spawn_request_id"],
+                    "runtime_instance_id": "runtime-continuation-review", "observed_at": "2026-09-18T12:00:00Z",
+                    "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+                    "coverage": {"scope": "test process tree", "descendant_writers": descendants},
+                }
+                observation_path = case["root"] / f"{event_id}.json"
+                write_json(observation_path, observation)
+                run("observe-runtime", "--control-root", str(case["control"]), "--run-id", RUN_ID,
+                    "--owner-token", OWNER, "--revision", str(state["revision"]), "--attempt-id", "RV-1",
+                    "--event", event, "--event-id", event_id, "--event-file", str(observation_path))
+                state, _ = ledger.load_state(case["paths"])
             self.assertEqual("BLOCKED", state["lifecycle"]["control"])
             self.assertEqual("BLOCKED", next(item for item in state["tickets"] if item["id"] == TICKET_ID)["state"])
             integrity_path = case["root"] / "integrity.json"
@@ -227,7 +274,7 @@ class BlockedContinuationCandidateTests(unittest.TestCase):
             self.assertEqual("BLOCKED", state["lifecycle"]["control"])
             self.assertEqual("READY", next(item for item in state["tickets"] if item["id"] == TICKET_ID)["state"])
             repair_packet = dict(case["packet"])
-            repair_packet["identity"] = {"run_id": RUN_ID, "ticket_id": TICKET_ID, "attempt_id": "A-2", "epoch": 0}
+            repair_packet["identity"] = {**case["packet"]["identity"], "attempt_id": "A-2"}
             repair_packet["mode"] = "repair"
             repair_packet["workspace"] = {"root": str(case["repo"]), "expected_base": case["candidate_sha"]}
             repair_packet["repair"] = repair

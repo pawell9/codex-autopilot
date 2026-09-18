@@ -98,6 +98,25 @@ class PhaseEReviewQualificationTests(unittest.TestCase):
         )
         prepared, raw = ledger.load_state(case["paths"])
         attempt = ledger.attempt_by_id(prepared, attempt_id)
+        for event, event_id, descendants in (("start", f"OBS-{attempt_id}-START", "not_applicable"), ("stop", f"OBS-{attempt_id}-STOP", "included")):
+            observation = {
+                "kind": "runtime_observation", "event_id": event_id, "event": event,
+                "run_id": RUN_ID, "attempt_id": attempt_id, "epoch": attempt["epoch"],
+                "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+                "runtime_instance_id": f"runtime-{attempt_id}", "observed_at": "2026-09-18T12:00:00Z",
+                "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+                "coverage": {"scope": "test process tree", "descendant_writers": descendants},
+            }
+            observation_path = case["root"] / f"{event_id}.json"
+            write_json(observation_path, observation)
+            run(
+                "observe-runtime", "--control-root", str(case["control"]), "--run-id", RUN_ID,
+                "--owner-token", OWNER, "--revision", str(prepared["revision"]),
+                "--attempt-id", attempt_id, "--event", event, "--event-id", event_id,
+                "--event-file", str(observation_path),
+            )
+            prepared, raw = ledger.load_state(case["paths"])
+            attempt = ledger.attempt_by_id(prepared, attempt_id)
         receipt_path = case["root"] / f"{attempt_id}.integrity.json"
         write_json(receipt_path, {
             "status": "PASS",

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from tools import ledger
+from tests.test_phase_b_projections_v110 import install_execution_design
 
 try:
     import test_continuation_candidates as continuation_test_helpers
@@ -94,6 +95,11 @@ class PhaseDCandidateProofTests(unittest.TestCase):
         ledger.refresh_control_projection(state)
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        install_execution_design(paths, repo)
+        state, _ = ledger.load_state(paths)
+        state["repository"]["initial_head"] = base_sha
+        ledger.validate_ledger(state)
+        ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
 
         packet = {
             "identity": {"run_id": RUN_ID, "ticket_id": TICKET_ID, "attempt_id": ATTEMPT_ID, "epoch": 0},
@@ -105,6 +111,18 @@ class PhaseDCandidateProofTests(unittest.TestCase):
             "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}],
             "return_target": {"path": "return.json"},
         }
+        intent = ledger.current_intent_binding(state)
+        publication = state["design_publication"]
+        packet["identity"].update({
+            "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+            "intent_document_hash": intent["document_hash"], "design_publication_ref": publication["id"],
+            "design_publication_hash": publication["publication_hash"],
+            "design_publication_revision": publication["published_revision"], "contract_refs": [],
+        })
+        packet.update({
+            "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+            "intent_document_hash": intent["document_hash"],
+        })
         packet_path = root / "packet.json"
         write_json(packet_path, packet)
         run(
@@ -113,10 +131,30 @@ class PhaseDCandidateProofTests(unittest.TestCase):
             "--lease-id", "L-1", "--route-id", "route-1", "--packet", str(packet_path),
         )
         state, _ = ledger.load_state(paths)
+        attempt = ledger.attempt_by_id(state, ATTEMPT_ID)
+        for event, event_id, revision, descendants in (
+            ("start", "OBS-START", state["revision"], "not_applicable"),
+            ("stop", "OBS-STOP", state["revision"] + 1, "included"),
+        ):
+            observation = {
+                "kind": "runtime_observation", "event_id": event_id, "event": event,
+                "run_id": RUN_ID, "attempt_id": ATTEMPT_ID, "epoch": attempt["epoch"],
+                "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+                "runtime_instance_id": "runtime-phase-d", "observed_at": "2026-09-18T12:00:00Z",
+                "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+                "coverage": {"scope": "test process tree", "descendant_writers": descendants},
+            }
+            observation_path = root / f"{event_id}.json"
+            write_json(observation_path, observation)
+            run(
+                "observe-runtime", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
+                "--revision", str(revision), "--attempt-id", ATTEMPT_ID, "--event", event,
+                "--event-id", event_id, "--event-file", str(observation_path),
+            )
+            state, _ = ledger.load_state(paths)
         worker_return = {
             "identity": {
-                "run_id": RUN_ID, "ticket_id": TICKET_ID, "attempt_id": ATTEMPT_ID,
-                "packet_hash": state["attempts"][0]["packet_hash"], "epoch": 0,
+                **packet["identity"], "packet_hash": state["attempts"][0]["packet_hash"],
             },
             "status": "DONE", "result": "focused proof passed",
             "files": [{"path": "app.txt", "operation": "modify"}],
@@ -127,11 +165,12 @@ class PhaseDCandidateProofTests(unittest.TestCase):
         write_json(return_path, worker_return)
         run(
             "ingest-return", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
-            "--revision", "2", "--attempt-id", ATTEMPT_ID, "--return-file", str(return_path), "--kind", "worker",
+            "--revision", str(state["revision"]), "--attempt-id", ATTEMPT_ID, "--return-file", str(return_path), "--kind", "worker",
         )
+        state, _ = ledger.load_state(paths)
         run(
             "prepare-effect", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
-            "--revision", "3", "--operation-id", OPERATION_ID, "--kind", "candidate_commit",
+            "--revision", str(state["revision"]), "--operation-id", OPERATION_ID, "--kind", "candidate_commit",
             "--target", str(repo), "--expected-before", base_sha, "--authority-ref", AUTHORITY_REF,
         )
 

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from tools import ledger
+from tests.test_phase_b_projections_v110 import install_execution_design
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +88,11 @@ class PhaseCAttemptFinalizationTests(unittest.TestCase):
             case.update({"candidate_sha": candidate_sha, "candidate_tree": candidate_tree, "candidate": candidate})
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        install_execution_design(paths, repo)
+        state, _ = ledger.load_state(paths)
+        state["repository"]["initial_head"] = baseline_sha
+        ledger.validate_ledger(state)
+        ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
         return case
 
     def _packet(self, case: dict[str, Any], attempt_id: str, *, base_sha: str | None, mode: str = "implement", repair: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -100,9 +106,47 @@ class PhaseCAttemptFinalizationTests(unittest.TestCase):
             "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}],
             "return_target": {"path": "return.json"},
         }
+        state, _ = ledger.load_state(case["paths"])
+        if state.get("intent") and state.get("design_publication"):
+            intent = ledger.current_intent_binding(state)
+            publication = state["design_publication"]
+            packet["identity"].update({
+                "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+                "intent_document_hash": intent["document_hash"], "design_publication_ref": publication["id"],
+                "design_publication_hash": publication["publication_hash"],
+                "design_publication_revision": publication["published_revision"], "contract_refs": [],
+            })
+            packet.update({
+                "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+                "intent_document_hash": intent["document_hash"],
+            })
         if repair is not None:
             packet["repair"] = repair
         return packet
+
+    def _observe_runtime(
+        self, case: dict[str, Any], attempt_id: str, event: str, *,
+        descendants: str = "not_applicable", instance: str = "runtime-phase-c",
+    ) -> Path:
+        state, _ = ledger.load_state(case["paths"])
+        attempt = ledger.attempt_by_id(state, attempt_id)
+        event_id = f"OBS-{attempt_id}-{event.upper()}"
+        receipt = {
+            "kind": "runtime_observation", "event_id": event_id, "event": event,
+            "run_id": RUN_ID, "attempt_id": attempt_id, "epoch": attempt["epoch"],
+            "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+            "runtime_instance_id": instance, "observed_at": "2026-09-18T12:00:00Z",
+            "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+            "coverage": {"scope": "test process tree", "descendant_writers": descendants},
+        }
+        receipt_path = case["root"] / f"{event_id}.json"
+        write_json(receipt_path, receipt)
+        run(
+            "observe-runtime", "--control-root", str(case["control"]), "--run-id", RUN_ID,
+            "--owner-token", OWNER, "--revision", str(state["revision"]), "--attempt-id", attempt_id,
+            "--event", event, "--event-id", event_id, "--event-file", str(receipt_path),
+        )
+        return receipt_path
 
     def _seed_prior_candidate(
         self, case: dict[str, Any], state: dict[str, Any], ticket: dict[str, Any],
@@ -294,12 +338,12 @@ class PhaseCAttemptFinalizationTests(unittest.TestCase):
                 run("dispatch", "--control-root", str(case["control"]), "--run-id", RUN_ID, "--owner-token", OWNER,
                     "--revision", "1", "--ticket-id", TICKET_ID, "--attempt-id", "A-STOPPED", "--lease-id", "L-STOPPED",
                     "--route-id", "route-STOPPED", "--packet", str(packet_path))
+                self._observe_runtime(case, "A-STOPPED", "start")
+                stop_receipt = self._observe_runtime(case, "A-STOPPED", "stop", descendants="included")
                 state, _ = ledger.load_state(case["paths"])
-                evidence = case["root"] / "stop.json"
-                write_json(evidence, {"status": "PASS", "writer_stopped": True, "observation": "process handle stopped and checkout unchanged"})
                 run("terminate-attempt", "--control-root", str(case["control"]), "--run-id", RUN_ID, "--owner-token", OWNER,
                     "--revision", str(state["revision"]), "--attempt-id", "A-STOPPED", "--state", terminal_state,
-                    "--lease-state", "released", "--evidence", str(evidence))
+                    "--lease-state", "released", "--evidence", str(stop_receipt))
                 result = json.loads(self.finalize(case, "A-STOPPED").stdout)
                 closed, _ = ledger.load_state(case["paths"])
                 self.assertTrue(result["closed"])
@@ -338,13 +382,13 @@ class PhaseCAttemptFinalizationTests(unittest.TestCase):
             run("dispatch", "--control-root", str(case["control"]), "--run-id", RUN_ID, "--owner-token", OWNER,
                 "--revision", "1", "--ticket-id", TICKET_ID, "--attempt-id", "A-FOREIGN", "--lease-id", "L-FOREIGN",
                 "--route-id", "route-FOREIGN", "--packet", str(packet_path))
+            self._observe_runtime(case, "A-FOREIGN", "start")
+            stop_receipt = self._observe_runtime(case, "A-FOREIGN", "stop", descendants="included")
             (case["repo"] / "foreign.txt").write_text("unowned write\n", encoding="utf-8")
             state, _ = ledger.load_state(case["paths"])
-            evidence = case["root"] / "stop.json"
-            write_json(evidence, {"status": "PASS", "writer_stopped": True, "observation": "writer stopped; foreign path remains"})
             run("terminate-attempt", "--control-root", str(case["control"]), "--run-id", RUN_ID, "--owner-token", OWNER,
                 "--revision", str(state["revision"]), "--attempt-id", "A-FOREIGN", "--state", "INTERRUPTED",
-                "--lease-state", "released", "--evidence", str(evidence))
+                "--lease-state", "released", "--evidence", str(stop_receipt))
             self.finalize(case, "A-FOREIGN")
             state, _ = ledger.load_state(case["paths"])
             attempt = ledger.attempt_by_id(state, "A-FOREIGN")
@@ -370,6 +414,7 @@ class PhaseCAttemptFinalizationTests(unittest.TestCase):
                 "--revision", str(state["revision"]), "--attempt-id", "A-QUARANTINED", "--state", "LOST",
                 "--lease-state", "quarantined", "--evidence", str(unknown))
             self.finalize(case, "A-QUARANTINED")
+            self._observe_runtime(case, "A-QUARANTINED", "stop", descendants="included", instance="late-runtime")
 
             failed_proof = case["root"] / "failed-reconciliation.json"
             write_json(failed_proof, {
