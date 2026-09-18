@@ -1,0 +1,221 @@
+{
+  "identity": {
+    "run_id": "2026-09-17-idea-scout-v2-successor",
+    "ticket_id": "T02-R17",
+    "attempt_id": "T02-R17-REVIEW-CODE-05",
+    "packet_hash": "e8b28341a5e2202e22c0281de105780bc92b9d5079f7104df9475bdf26001a00",
+    "epoch": 0,
+    "source_revision": 56,
+    "registration_revision": 56,
+    "subject_revision": 56,
+    "intent_revision": "2",
+    "intent_document_ref": "idea-scout-v2-intent-v2",
+    "intent_document_hash": "ffe8fb5a5347f7384a78e911abada38938a9e05b661caf9366e20088b31032e7",
+    "contract_refs": [
+      "CT-V2-ARCHITECTURE-R17",
+      "CT-V2-CHECKPOINT-R17",
+      "CT-V2-ROUTING-R17",
+      "CT-V2-PERSISTENCE-R17",
+      "CT-V2-MIGRATION-R17",
+      "CT-V2-SEMANTIC-R17",
+      "CT-V2-EVIDENCE-R17",
+      "CT-V2-QUICK-R17",
+      "CT-V2-RUNTIME-R17"
+    ]
+  },
+  "subject_fingerprint": "ef8da4ff49cc7f8014d90f463acf8319ad7c1335",
+  "verdict": "BLOCK",
+  "coverage": [
+    {
+      "criterion_id": "C-V2-01",
+      "outcome": "fulfilled",
+      "evidence_refs": [
+        "candidate/migrations/009_v2_core.sql",
+        "candidate/tests/test_v2_migrations.py",
+        "check:CHK-T02-MIGRATION-SAFETY"
+      ]
+    },
+    {
+      "criterion_id": "C-V2-03",
+      "outcome": "partial",
+      "evidence_refs": [
+        "candidate/migrations/009_v2_core.sql:semantic_signals",
+        "candidate/src/idea_scout/store/store.py:insert_v2_record",
+        "check:CHK-T02-SEMANTIC-ZERO-REVISION",
+        "finding:C-V2-03-zero-signal-active-revision"
+      ]
+    },
+    {
+      "criterion_id": "C-V2-07",
+      "outcome": "partial",
+      "evidence_refs": [
+        "candidate/migrations/009_v2_core.sql:research_questions",
+        "candidate/src/idea_scout/store/store.py:_validate_research_attempt_questions",
+        "check:CHK-T02-QUESTION-CORRESPONDENCE",
+        "finding:C-V2-07-question-correspondence"
+      ]
+    },
+    {
+      "criterion_id": "C-V2-09",
+      "outcome": "fulfilled",
+      "evidence_refs": [
+        "candidate/src/idea_scout/store/store.py:promote_candidate_to_idea",
+        "candidate/tests/test_v2_store.py:test_unqualified_pass_promotion_is_rejected_without_partial_writes",
+        "check:CHK-T02-PASS-PROMOTION"
+      ]
+    },
+    {
+      "criterion_id": "C-V2-10",
+      "outcome": "partial",
+      "evidence_refs": [
+        "candidate/migrations/009_v2_core.sql:search_run_events_monotonic",
+        "candidate/migrations/009_v2_core.sql:search_runs_settings_immutable",
+        "check:CHK-T02-SEARCH-RUN-DURABILITY",
+        "finding:C-V2-10-search-run-delete-recreate"
+      ]
+    },
+    {
+      "criterion_id": "C-V2-11",
+      "outcome": "fulfilled",
+      "evidence_refs": [
+        "candidate/migrations/009_v2_core.sql:region_profiles",
+        "candidate/migrations/009_v2_core.sql:domain_profiles",
+        "candidate/tests/test_v2_store.py:test_search_run_settings_and_exact_profile_bindings_are_immutable",
+        "check:CHK-T02-PROFILE-VERSIONS"
+      ]
+    },
+    {
+      "criterion_id": "C-V2-19",
+      "outcome": "fulfilled",
+      "evidence_refs": [
+        "context/architecture-preservation-successor-v3.md:v1-store-migrations",
+        "context/architecture-preservation-successor-v3.md:v1-domain-types",
+        "candidate/migrations/009_v2_core.sql:ideas compatibility columns",
+        "check:CHK-T02-V1-REGRESSION"
+      ]
+    },
+    {
+      "criterion_id": "C-V2-20",
+      "outcome": "fulfilled",
+      "evidence_refs": [
+        "candidate/tests/test_v2_migrations.py:test_v1_copy_upgrade_preserves_rows_hashes_and_recovery_copy",
+        "candidate/tests/test_v2_store.py:test_profile_and_search_run_json_round_trip_preserves_unknown_and_decimal",
+        "check:CHK-T02-V1-REGRESSION"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "check_id": "CHK-T02-REQUIRED-SUITE",
+      "axis": "correctness",
+      "outcome": "fulfilled",
+      "actual": "The packet-aligned suite completed with 152 passed in 1.98s on a separate mutable copy, with PYTHONDONTWRITEBYTECODE=1 and pytest -p no:cacheprovider.",
+      "evidence_ref": "pytest:-q tests/test_v2_store.py tests/test_v2_migrations.py tests/test_types.py tests/test_store.py tests/test_migrations.py"
+    },
+    {
+      "check_id": "CHK-T02-MIGRATION-SAFETY",
+      "axis": "migration-safety-review",
+      "outcome": "fulfilled",
+      "actual": "Empty migration, copied-V1 migration, row/hash preservation, FK/integrity checks, recovery copy, and failed-forward-migration rollback all passed in the required suite.",
+      "evidence_ref": "candidate/tests/test_v2_migrations.py"
+    },
+    {
+      "check_id": "CHK-T02-PASS-PROMOTION",
+      "axis": "contract-conformance",
+      "outcome": "fulfilled",
+      "actual": "Promotion checks non-empty user/problem/product/grounding/goal context, groundedness and run-goal flags, linked Signal and candidate-linked evidence IDs; seven negative cases leave no decision, Idea, or Candidate mutation.",
+      "evidence_ref": "candidate/src/idea_scout/store/store.py:460-581; candidate/tests/test_v2_store.py:465-569"
+    },
+    {
+      "check_id": "CHK-T02-PROFILE-VERSIONS",
+      "axis": "contract-conformance",
+      "outcome": "fulfilled",
+      "actual": "Region, Domain, and Capability Profile revisions are immutable; Search Runs use composite foreign keys to exact versions and update triggers reject profile-binding changes.",
+      "evidence_ref": "candidate/migrations/009_v2_core.sql:1-111,497-515"
+    },
+    {
+      "check_id": "CHK-T02-SEMANTIC-ZERO-REVISION",
+      "axis": "contract-conformance",
+      "outcome": "failed",
+      "actual": "Only semantic_signals rows carry raw_item_id/revision/active. An extraction yielding zero signals writes no row, so its revision cannot be marked active or distinguished from never processed; the negative probe found no independent extraction-revision record.",
+      "evidence_ref": "candidate/migrations/009_v2_core.sql:115-143,516-574; mutable-copy probe test_zero_signal_extraction_revision_has_a_durable_active_revision_record"
+    },
+    {
+      "check_id": "CHK-T02-QUESTION-CORRESPONDENCE",
+      "axis": "contract-conformance",
+      "outcome": "failed",
+      "actual": "The Store validates attempt outcome keys, but persistence enforces only that inserted normalized/QUICK question IDs are declared. A plan with one declared question committed with zero normalized rows, and a QUICK plan for a two-question ResearchPlan committed with only q1.",
+      "evidence_ref": "mutable-copy probes test_normalized_question_rows_cannot_silently_omit_a_declared_plan_question and test_quick_plan_rejects_a_strict_subset_of_its_research_plan_questions"
+    },
+    {
+      "check_id": "CHK-T02-SEARCH-RUN-DURABILITY",
+      "axis": "contract-conformance",
+      "outcome": "failed",
+      "actual": "Update triggers protect settings/profile columns and event rows are append-only, but a Search Run without children can be deleted successfully; the same ID can then be recreated with a different settings snapshot.",
+      "evidence_ref": "candidate/migrations/009_v2_core.sql:504-515; mutable-copy probe test_search_run_cannot_be_deleted_and_recreated_with_changed_settings"
+    },
+    {
+      "check_id": "CHK-T02-V1-REGRESSION",
+      "axis": "V1-regression-review",
+      "outcome": "fulfilled",
+      "actual": "The offline product suite excluding evaluation inputs not supplied in this review export completed with 565 passed and 12 deselected in 10.08s; V1 store/actions/project/export tests remained green.",
+      "evidence_ref": "pytest:-q --ignore=tests/evaluation_v2 --ignore=tests/test_review_contract_probes.py"
+    }
+  ],
+  "context_refs": [
+    "packet:e8b28341a5e2202e22c0281de105780bc92b9d5079f7104df9475bdf26001a00",
+    "context/autopilot-reviewer-contract.md",
+    "context/contracts.schema.json#/$defs/review_return",
+    "context/intent-v2.md",
+    "context/interfaces-successor-v3.md",
+    "context/design-successor-v3.md",
+    "context/plan-successor-v3.md",
+    "context/tickets-successor-v3.md",
+    "context/architecture-preservation-successor-v3.md"
+  ],
+  "findings": [
+    {
+      "axis": "contract-conformance",
+      "impact": "blocking",
+      "claim": "A zero-signal extraction cannot persist or activate its extraction revision.",
+      "expected": "A RawItem may yield zero or multiple Semantic Signals, and every reprocessing extraction creates a durable revision whose active state supersedes the previous revision without deleting history.",
+      "actual": "Revision and active state exist only on semantic_signals rows. When extraction yields zero rows, there is no persisted revision, no active marker, and no way to distinguish a successful zero-signal result from an unprocessed RawItem.",
+      "evidence": "candidate/migrations/009_v2_core.sql defines revision/active only on semantic_signals (lines 115-143) and all active-revision triggers operate on those rows (lines 516-574); the independent mutable-copy structural probe fails because no extraction-revision record exists.",
+      "affected_refs": [
+        "C-V2-03",
+        "R-V2-03",
+        "CT-V2-SEMANTIC-R17",
+        "CT-V2-PERSISTENCE-R17"
+      ]
+    },
+    {
+      "axis": "contract-conformance",
+      "impact": "blocking",
+      "claim": "ResearchPlan questions, normalized question rows, attempt outcomes, and QUICK references are not required to correspond exactly.",
+      "expected": "Every declared plan question has a normalized row, every attempt outcome covers exactly those questions, and a QUICK plan carries the exact question refs for its Candidate revision; missing question outcomes or references are invalid.",
+      "actual": "Store-level attempt insertion checks exact JSON outcome keys, but plan insertion permits zero normalized rows, schema triggers check only inserted IDs, and QUICK insertion requires merely a non-empty unique subset. Independent probes committed a declared question with zero normalized rows and a two-question plan with a one-question QUICK reference list.",
+      "evidence": "candidate/src/idea_scout/store/store.py:254-318 and 391-427; candidate/migrations/009_v2_core.sql:281-454; failing mutable-copy probes CHK-T02-QUESTION-CORRESPONDENCE.",
+      "affected_refs": [
+        "C-V2-07",
+        "R-V2-07",
+        "CT-V2-EVIDENCE-R17",
+        "CT-V2-QUICK-R17",
+        "CT-V2-PERSISTENCE-R17"
+      ]
+    },
+    {
+      "axis": "contract-conformance",
+      "impact": "blocking",
+      "claim": "Search Run settings immutability can be bypassed by deleting and recreating the run.",
+      "expected": "A durable Search Run retains its immutable settings snapshot and exact profile versions for its lifetime; persistence must not permit the same run identity to be rebound to different settings.",
+      "actual": "The migration blocks updates to settings/profile columns but defines no append-only/no-delete guard for search_runs. A newly created run with no children was deleted successfully in the independent probe, permitting recreation under the same ID with changed settings.",
+      "evidence": "candidate/migrations/009_v2_core.sql:65-111 and 509-515; failing mutable-copy probe CHK-T02-SEARCH-RUN-DURABILITY.",
+      "affected_refs": [
+        "C-V2-10",
+        "R-V2-10",
+        "CT-V2-RUNTIME-R17",
+        "CT-V2-PERSISTENCE-R17"
+      ]
+    }
+  ]
+}

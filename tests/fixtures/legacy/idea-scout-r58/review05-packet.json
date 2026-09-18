@@ -1,0 +1,43 @@
+{
+  "axes": [
+    "correctness",
+    "contract-conformance",
+    "migration-safety-review",
+    "V1-regression-review"
+  ],
+  "criteria": [
+    {"criterion_id": "C-V2-01", "expected": "Additive V2 schema/migration for required records; forward-only migration and preserved V1 data. Verify source approvals and quick validation plan persistence are present and versioned.", "oracle": "migration verifier + independent reviewer", "requirement_id": "R-V2-01"},
+    {"criterion_id": "C-V2-03", "expected": "Semantic signals/source context are persisted separately from numeric MetricClaim records, with cardinality and active extraction revision semantics matching the contract.", "oracle": "context/source-role fixture oracle", "requirement_id": "R-V2-03"},
+    {"criterion_id": "C-V2-07", "expected": "Evidence artifacts, claims, links, questions and provenance constraints are persisted with referential integrity, including exact plan/attempt question coverage.", "oracle": "evidence-integrity oracle", "requirement_id": "R-V2-07"},
+    {"criterion_id": "C-V2-09", "expected": "Qualification decisions preserve explicit semantics; PASS promotion requires contract-defined user/problem/product grounding, source evidence and run-goal relevance, with atomic rollback on rejection.", "oracle": "assessment/ranking oracle", "requirement_id": "R-V2-09"},
+    {"criterion_id": "C-V2-10", "expected": "Search Run event ordering is durable, monotonic and append-only; Search Run settings snapshots remain immutable.", "oracle": "runtime durability oracle", "requirement_id": "R-V2-10"},
+    {"criterion_id": "C-V2-11", "expected": "Region/Domain profiles are immutable versioned records, and Search Runs reference the exact immutable profile versions used.", "oracle": "coverage/profile oracle + product owner", "requirement_id": "R-V2-11"},
+    {"criterion_id": "C-V2-19", "expected": "T02-owned architecture components and nullable compatibility links match the published v3 map.", "oracle": "architecture coverage reviewer", "requirement_id": "R-V2-19"},
+    {"criterion_id": "C-V2-20", "expected": "V1 read/action behavior remains compatible; unknown and Decimal values round-trip without loss.", "oracle": "V1 regression/export oracle", "requirement_id": "R-V2-20"}
+  ],
+  "identity": {
+    "attempt_id": "T02-R17-REVIEW-CODE-05",
+    "contract_refs": ["CT-V2-ARCHITECTURE-R17", "CT-V2-CHECKPOINT-R17", "CT-V2-ROUTING-R17", "CT-V2-PERSISTENCE-R17", "CT-V2-MIGRATION-R17", "CT-V2-SEMANTIC-R17", "CT-V2-EVIDENCE-R17", "CT-V2-QUICK-R17", "CT-V2-RUNTIME-R17"],
+    "epoch": 0,
+    "intent_document_hash": "ffe8fb5a5347f7384a78e911abada38938a9e05b661caf9366e20088b31032e7",
+    "intent_document_ref": "idea-scout-v2-intent-v2",
+    "intent_revision": "2",
+    "registration_revision": 56,
+    "run_id": "2026-09-17-idea-scout-v2-successor",
+    "source_revision": 56,
+    "subject_revision": 56,
+    "ticket_id": "T02-R17"
+  },
+  "isolation_ref": "sha256:067103328c0e262faf3c64a9d57d6ef2d4ce7c6617c289da24e60267edb5cf5c",
+  "kind": "review",
+  "mandate": "Fresh independent change review of frozen T02-R17 continuation candidate ef8da4ff49cc7f8014d90f463acf8319ad7c1335. Assess all eight criteria and these five obligations: semantic-signal cardinality/active-revision behavior; PASS grounding/evidence/run-goal guards and rollback; exact ResearchPlan question correspondence across normalized rows, attempt outcomes, and QUICK refs; source-approval and QUICK persistence/idempotency/references; immutable Search Run settings and exact profile versions. Report each criterion exactly once and every blocking finding. Review only the supplied read-only pristine export and context. Do not inspect the authoritative repository, ledger, prior reviews/returns, repair narrative, commit history, network, or connectors. For every test, first create a separate mutable copy under /private/tmp; never test in the pristine export. Set PYTHONDONTWRITEBYTECODE=1 and use pytest -p no:cacheprovider. The existing project virtualenv may be used only as executable/dependency toolchain with PYTHONPATH bound to the mutable candidate copy. Validate the final return against context/contracts.schema.json $defs.review_return, then atomically write exact JSON to return_target. This routine review neither resolves an external lifecycle blocker nor substitutes for the separately required manual critical migration/data-integrity axis.",
+  "return_target": {
+    "exact_json_only": true,
+    "no_scripts": true,
+    "path": "/Users/pawell_9/Documents/Pet-project - поиск идей проектов/.autopilot/scratch/2026-09-17-idea-scout-v2-successor/T02-R17-REVIEW-CODE-05/return.json",
+    "schema": "review_return",
+    "size_bound": 20000,
+    "transport": "file"
+  },
+  "subject_fingerprint": "ef8da4ff49cc7f8014d90f463acf8319ad7c1335"
+}

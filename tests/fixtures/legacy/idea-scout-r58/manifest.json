@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "source_archive": {
+    "filename": "autopilot-hardening-evidence.zip",
+    "path": "/Users/pawell_9/Documents/Autopilot Astra-review/autopilot-hardening-evidence.zip",
+    "sha256": "3ff2fd367680aa2066007fe66c2ded8f7835561698e4dc4a9576f6e283dc5772"
+  },
+  "redaction_and_sanitization": "The frozen evidence archive is already sanitized. The included rev-058-ledger.json contains the literal placeholder <REDACTED_OWNER_TOKEN> at owner.token. No included source artifact was edited, redacted, normalized, or reconstructed; each is byte-identical to its archive member. The full evidence archive and unrelated product artifacts are not included.",
+  "files": [
+    {
+      "path": "rev-058-ledger.json",
+      "source_path": "autopilot-hardening-evidence/state/successor/rev-058-ledger.json",
+      "sha256": "dbfe634b0ea9bb94cc91f14f249d38b5947b74f0c285c9a80d131f74d582a894",
+      "reason": "Canonical successor revision 58 state, including lifecycle, tickets, producers, findings, review bindings, continuation linkage, external blocker, and stale next_action."
+    },
+    {
+      "path": "review05-packet.json",
+      "source_path": "autopilot-hardening-evidence/reviews/review05-packet.json",
+      "sha256": "e8b28341a5e2202e22c0281de105780bc92b9d5079f7104df9475bdf26001a00",
+      "reason": "Exact Review05 subject, candidate fingerprint, criteria, and review mandate needed to diagnose the accepted return binding."
+    },
+    {
+      "path": "review05-return.json",
+      "source_path": "autopilot-hardening-evidence/reviews/review05-return.json",
+      "sha256": "e977b0f75bde0456a1a644fb82ad683f31ae10926b804b5798b8912ddc5dcd1c",
+      "reason": "Immutable accepted Review05 BLOCK return containing the three current findings and packet binding."
+    },
+    {
+      "path": "worker05-continuation-receipt.json",
+      "source_path": "autopilot-hardening-evidence/receipts/worker05-continuation-receipt.json",
+      "sha256": "8391797669bfcfe374950008c9dc3a343724ad4cf687b405ed870586c7d3c0d0",
+      "reason": "Continuation proof binding the Worker05 commit candidate, tree, write set, and external blocker."
+    }
+  ]
+}
