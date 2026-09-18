@@ -147,6 +147,34 @@ def write_state(paths: dict[str, Path], state: dict[str, Any]) -> None:
     ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
 
 
+def record_runtime_event(
+    paths: dict[str, Path], attempt_id: str, event: str = "stop", *,
+    event_id: str | None = None, instance: str | None = "runtime-fixture",
+) -> dict[str, Any]:
+    """Record exact synthetic runtime evidence through the public owner CLI."""
+    state, _ = ledger.load_state(paths)
+    attempt = ledger.attempt_by_id(state, attempt_id)
+    event_id = event_id or f"OBS-{attempt_id}-{event.upper()}"
+    receipt = {
+        "kind": "runtime_observation", "event_id": event_id, "event": event,
+        "run_id": state["run_id"], "attempt_id": attempt_id, "epoch": attempt["epoch"],
+        "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+        "runtime_instance_id": instance if event != "not_started" else None,
+        "observed_at": "2026-09-18T12:00:00Z", "observer": "runtime-adapter-test",
+        "runtime_build": "fixture-1", "return_hash": None,
+        "coverage": {"scope": "test process tree", "descendant_writers": "included" if event == "stop" else "not_applicable"},
+    }
+    event_path = paths["run"] / f"{event_id}.json"
+    write_json(event_path, receipt)
+    run(
+        "observe-runtime", "--control-root", str(paths["root"]),
+        "--run-id", state["run_id"], "--owner-token", state["owner"]["token"],
+        "--revision", str(state["revision"]), "--attempt-id", attempt_id,
+        "--event", event, "--event-id", event_id, "--event-file", str(event_path),
+    )
+    return receipt
+
+
 def set_terminal_control(state: dict[str, Any], control: str) -> None:
     state["lifecycle"]["control"] = control
     state["lifecycle"]["next_action"] = {
@@ -185,6 +213,7 @@ def integrated_review_fixture(
     if quality == "CONTINUATION":
         producer.update({"continuation_ref": "objects/" + "a" * 64, "continuation_authorization_ref": "DEC-CONTINUATION"})
     state["attempts"].append(producer)
+    ledger.initialize_attempt_runtime(state["run_id"], producer)
     candidate = ledger.publish_candidate_projection(state, ticket, producer, quality=quality)
     if latest_attempt_drift:
         drift = attempt_record("W-NO-CANDIDATE", kind="worker", candidate_sha=None)
@@ -197,6 +226,7 @@ def integrated_review_fixture(
         "RV-INTEGRATE", kind="review", candidate_sha=sha, return_ref="objects/" + "b" * 64,
         review_result="PASS",
     )
+    ledger.initialize_attempt_runtime(state["run_id"], reviewer)
     state["attempts"].append(reviewer)
     state["reviews"] = [{
         "id": "REVIEW-PASS", "mandate": "Independent candidate review", "subject_fingerprint": sha,
@@ -555,6 +585,7 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
             sha = "4" * 40
             worker = attempt_record("W-CURRENT", kind="worker", candidate_sha=sha)
             worker.update({"candidate_tree_sha": "5" * 40, "checkout": str(repo)})
+            ledger.initialize_attempt_runtime(state["run_id"], worker)
             state["attempts"].append(worker)
             candidate = ledger.publish_candidate_projection(state, ticket, worker, quality="DONE")
             ticket["state"] = "CANDIDATE"
@@ -586,6 +617,8 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
             }]
             state["lifecycle"]["issue_refs"] = ["I-LINKED-VERDICT", "I-UNLINKED-VERDICT"]
             write_state(paths, state)
+            record_runtime_event(paths, "W-CURRENT", event_id="OBS-W-CURRENT-STOP")
+            state, _ = ledger.load_state(paths)
 
             packet_path = root / "pass-review.packet.json"
             write_json(packet_path, {
@@ -1071,6 +1104,9 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
             self.assertEqual("W-NO-CANDIDATE", ticket["current_attempt"])
             self.assertEqual(candidate["id"], ticket["current_candidate"])
             write_state(paths, state)
+            record_runtime_event(paths, "W-CANDIDATE", event_id="OBS-W-CANDIDATE-STOP")
+            record_runtime_event(paths, "RV-INTEGRATE", event_id="OBS-RV-INTEGRATE-STOP")
+            state, _ = ledger.load_state(paths)
             integrity = root / "integrity.json"
             write_json(integrity, {
                 "status": "PASS", "candidate_fingerprint": candidate["sha"], "ledger_hash": None,
@@ -1101,6 +1137,9 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
                 "source_ref": "UNKNOWN-REVIEW", "invalidated_by": [],
             }]
             write_state(paths, state)
+            record_runtime_event(paths, "W-CANDIDATE", event_id="OBS-W-CANDIDATE-STOP")
+            record_runtime_event(paths, "RV-INTEGRATE", event_id="OBS-RV-INTEGRATE-STOP")
+            state, _ = ledger.load_state(paths)
             integrity = root / "integrity.json"
             write_json(integrity, {
                 "status": "PASS", "candidate_fingerprint": candidate["sha"], "ledger_hash": None,

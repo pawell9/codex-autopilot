@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from tools import ledger
-from tests.test_phase_b_projections_v110 import install_execution_design
+from tests.test_phase_b_projections_v110 import install_execution_design, record_runtime_event
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -455,8 +455,10 @@ class BlockedContinuationCandidateTests(unittest.TestCase):
                 "lifecycle": {"phase": "EXECUTE", "control": "BLOCKED", "reason": "worker_blocked", "issue_refs": ["ISS-EXT"], "stop_target": None,
                               "next_action": {"kind": "triage_or_repair", "subject_refs": ["A-repair"], "preconditions": [], "read_refs": []}},
             })
+            ledger.initialize_attempt_runtime(RUN_ID, ledger.attempt_by_id(state, "A-repair"))
             ledger.validate_ledger(state)
             ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            record_runtime_event(paths, "A-repair", event_id="OBS-A-REPAIR-STOP")
             commit_receipt = root / "commit.json"
             write_json(commit_receipt, {"status": "PASS", "run_id": RUN_ID, "ticket_id": TICKET_ID,
                                         "attempt_id": "A-repair", "operation_id": "OP-CONT", "kind": "candidate_commit",
@@ -470,8 +472,9 @@ class BlockedContinuationCandidateTests(unittest.TestCase):
                              "external_criterion_ids": ["C-1"]}
             auth_path = root / "authorization.json"
             write_json(auth_path, authorization)
+            state, _ = ledger.load_state(paths)
             result = run("preserve-blocked-candidate", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
-                         "--revision", "1", "--ticket-id", TICKET_ID, "--attempt-id", "A-repair",
+                         "--revision", str(state["revision"]), "--ticket-id", TICKET_ID, "--attempt-id", "A-repair",
                          "--authorization-file", str(auth_path), "--commit-receipt", str(commit_receipt), "--operation-id", "OP-CONT")
             self.assertIn(candidate_sha, result.stdout)
             final, _ = ledger.load_state(paths)
