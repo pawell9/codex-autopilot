@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from tools import ledger
 
@@ -212,18 +213,123 @@ class Wave1Tests(unittest.TestCase):
     def test_e03m_manual_import_roundtrip_remains_resumable(self) -> None:
         source = ROOT / "experiments" / "fixtures" / "e03m" / "seed-repo"
         with tempfile.TemporaryDirectory() as directory:
-            copied = Path(directory) / "seed-repo"
-            shutil.copytree(source, copied, symlinks=True)
-            paths = ledger.paths(copied, "e03m-manual-g5-2026-09-13")
-            state, raw = ledger.load_state(paths)
-            inbox = paths["scratch"] / "A-E03M-WORKER-1"
-            integrity = Path(directory) / "post-import-integrity.json"
-            write_json(integrity, {"status": "PASS", "candidate_fingerprint": state["attempts"][0]["candidate_sha"], "ledger_hash": ledger.sha256_bytes(raw)})
-            result = run("import-manual", "--control-root", str(copied), "--run-id", "e03m-manual-g5-2026-09-13", "--owner-token", state["owner"]["token"], "--revision", str(state["revision"]), "--attempt-id", "A-E03M-WORKER-1", "--return-file", str(inbox / "acceptance-return.json"), "--environment-receipt", str(inbox / "environment-receipt.json"), "--context-receipt", str(inbox / "context-receipt.json"), "--integrity-receipt", str(integrity), "--intent-revision", "intent-v1", "--candidate-fingerprint", state["attempts"][0]["candidate_sha"], "--required-criteria", "C-E03M-1")
+            run_id = "e03m-manual-g5-2026-09-13"
+            attempt_id = "A-E03M-WORKER-1"
+
+            def tree_bytes(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
+                entries: dict[str, tuple[str, bytes | str | None]] = {}
+                for path in sorted(root.rglob("*")):
+                    relative = str(path.relative_to(root))
+                    # Lock acquisition may create this empty, noncanonical
+                    # coordination file; all persisted run/evidence bytes are
+                    # still compared exactly.
+                    if relative == ".autopilot/owner.lock":
+                        continue
+                    if path.is_symlink():
+                        entries[relative] = ("symlink", os.readlink(path))
+                    elif path.is_file():
+                        entries[relative] = ("file", path.read_bytes())
+                    elif path.is_dir():
+                        entries[relative] = ("directory", None)
+                return entries
+
+            def import_args(control_root: Path, state: dict[str, Any], integrity: Path) -> list[str]:
+                paths = ledger.paths(control_root, run_id)
+                inbox = paths["scratch"] / attempt_id
+                attempt = state["attempts"][0]
+                return [
+                    "import-manual", "--control-root", str(control_root), "--run-id", run_id,
+                    "--owner-token", state["owner"]["token"], "--revision", str(state["revision"]),
+                    "--attempt-id", attempt_id, "--return-file", str(inbox / "acceptance-return.json"),
+                    "--environment-receipt", str(inbox / "environment-receipt.json"),
+                    "--context-receipt", str(inbox / "context-receipt.json"),
+                    "--integrity-receipt", str(integrity), "--intent-revision", "intent-v1",
+                    "--candidate-fingerprint", attempt["candidate_sha"], "--required-criteria", "C-E03M-1",
+                ]
+
+            # The frozen copy remains a valid, readable legacy state, but the
+            # writer floor must reject even this otherwise-valid mutation.
+            legacy_copy = Path(directory) / "legacy-seed-repo"
+            shutil.copytree(source, legacy_copy, symlinks=True)
+            legacy_paths = ledger.paths(legacy_copy, run_id)
+            legacy_state, legacy_raw = ledger.load_state(legacy_paths)
+            legacy_integrity = Path(directory) / "legacy-integrity.json"
+            write_json(legacy_integrity, {
+                "status": "PASS",
+                "candidate_fingerprint": legacy_state["attempts"][0]["candidate_sha"],
+                "ledger_hash": ledger.sha256_bytes(legacy_raw),
+            })
+            before = tree_bytes(legacy_copy)
+            diagnostic = json.loads(run("diagnose", "--control-root", str(legacy_copy), "--run-id", run_id).stdout)
+            self.assertTrue(diagnostic["readable"])
+            self.assertFalse(diagnostic["mutation_eligible"])
+            self.assertIn("append-only migration", diagnostic["reason"])
+            self.assertEqual(before, tree_bytes(legacy_copy))
+            rejected = run(*import_args(legacy_copy, legacy_state, legacy_integrity), expect=2)
+            self.assertIn("mutation is read-only", rejected.stderr)
+            self.assertIn("append-only migration", rejected.stderr)
+            self.assertEqual(before, tree_bytes(legacy_copy))
+
+            # A separate disposable copy represents the result of an explicit,
+            # owner-authorized append-only semantic migration. This is only a
+            # test marker; the actual migration command is implemented later.
+            migrated_copy = Path(directory) / "migrated-seed-repo"
+            shutil.copytree(source, migrated_copy, symlinks=True)
+            migrated_paths = ledger.paths(migrated_copy, run_id)
+            migrated_state, prior_raw = ledger.load_state(migrated_paths)
+            marker = "semantic-contract-1.1-owner-approved-test"
+            migrated_revision = migrated_state["revision"] + 1
+            manifest = {
+                "migration_id": marker,
+                "migration": "semantic-writer-floor",
+                "owner_authorization": "test-fixture:owner-approved-append-only-migration",
+                "source_ledger_hash": ledger.sha256_bytes(prior_raw),
+                "target_state_contract_version": "1.1",
+                "target_minimum_writer_version": "1.1.0",
+            }
+            manifest_raw = ledger.canonical_bytes(manifest)
+            manifest_hash = ledger.sha256_bytes(manifest_raw)
+            migrated_state["runtime_provenance"] = {
+                "creation_skill_version": migrated_state["skill_version"],
+                "current_schema_version": migrated_state["schema_version"],
+                "last_mutating_skill_version": ledger.WRITER_VERSION,
+                "compatibility_floor": ledger.COMPATIBILITY_FLOOR,
+                "state_contract_version": "1.1",
+                "minimum_writer_version": "1.1.0",
+                "applied_migrations": [{
+                    "id": marker,
+                    "helper_version": ledger.WRITER_VERSION,
+                    "applied_revision": migrated_revision,
+                    "manifest_hash": manifest_hash,
+                    "object_ref": f"objects/{manifest_hash}",
+                }],
+            }
+            migrated_state["revision"] = migrated_revision
+            migrated_state["previous_publication_hash"] = ledger.sha256_bytes(prior_raw)
+            migrated_state["updated_at"] = ledger.now()
+            migrated_paths["objects"].mkdir(parents=True, exist_ok=True)
+            ledger.atomic_write(migrated_paths["objects"] / manifest_hash, manifest_raw)
+            ledger.atomic_write(migrated_paths["prev"], prior_raw)
+            write_json(migrated_paths["ledger"], migrated_state)
+
+            migrated_state, migrated_raw = ledger.load_state(migrated_paths)
+            migrated_diagnostic = json.loads(run("diagnose", "--control-root", str(migrated_copy), "--run-id", run_id).stdout)
+            self.assertTrue(migrated_diagnostic["mutation_eligible"])
+            migrated_integrity = Path(directory) / "migrated-integrity.json"
+            write_json(migrated_integrity, {
+                "status": "PASS",
+                "candidate_fingerprint": migrated_state["attempts"][0]["candidate_sha"],
+                "ledger_hash": ledger.sha256_bytes(migrated_raw),
+            })
+            result = run(*import_args(migrated_copy, migrated_state, migrated_integrity))
             self.assertIn('"imported": true', result.stdout)
-            final, _ = ledger.load_state(paths)
+            final, _ = ledger.load_state(migrated_paths)
             self.assertEqual("INTEGRATED", final["tickets"][0]["state"])
             self.assertEqual("released", final["attempts"][0]["lease"]["state"])
+            repeated = run(*import_args(migrated_copy, final, migrated_integrity))
+            self.assertIn('"idempotent": true', repeated.stdout)
+            repeated_state, _ = ledger.load_state(migrated_paths)
+            self.assertEqual(final["revision"], repeated_state["revision"])
 
 
 if __name__ == "__main__":
