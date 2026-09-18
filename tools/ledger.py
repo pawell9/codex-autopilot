@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import contextvars
 import datetime as dt
 import fcntl
 import hashlib
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -58,6 +60,69 @@ class IdempotentResult(Exception):
     def __init__(self, result: dict[str, Any]):
         super().__init__("idempotent")
         self.result = result
+
+
+@dataclass(frozen=True)
+class PlannedWrite:
+    """One immutable destination and its exact intended bytes."""
+
+    destination: Path
+    data: bytes
+    kind: str
+
+
+@dataclass(frozen=True)
+class ImmutableWritePlan:
+    """Preflighted immutable writes published only after transition validation."""
+
+    writes: tuple[PlannedWrite, ...]
+
+    def preflight(self) -> None:
+        seen: dict[Path, bytes] = {}
+        for write in self.writes:
+            destination = write.destination
+            prior = seen.get(destination)
+            if prior is not None and prior != write.data:
+                fail(f"immutable write plan has conflicting bytes for {destination}")
+            seen[destination] = write.data
+            if destination.parent.exists():
+                if destination.parent.is_symlink() or not destination.parent.is_dir():
+                    fail(f"immutable write namespace is not a regular directory: {destination.parent}")
+            if destination.exists() or destination.is_symlink():
+                regular_non_symlink(destination)
+                if destination.read_bytes() != write.data:
+                    fail(f"immutable destination already exists with different bytes: {destination}")
+
+    def publish(self) -> tuple[PlannedWrite, ...]:
+        self.preflight()
+        created: list[PlannedWrite] = []
+        for write in self.writes:
+            if atomic_create(write.destination, write.data):
+                created.append(write)
+        return tuple(created)
+
+
+class WritePlanBuilder:
+    """Collect writes while a locked transition is being evaluated."""
+
+    def __init__(self) -> None:
+        self._writes: dict[Path, PlannedWrite] = {}
+
+    def add(self, destination: Path, data: bytes, kind: str) -> None:
+        destination = Path(destination)
+        planned = PlannedWrite(destination, bytes(data), kind)
+        prior = self._writes.get(destination)
+        if prior is not None and prior.data != planned.data:
+            fail(f"immutable write plan has conflicting bytes for {destination}")
+        self._writes[destination] = planned
+
+    def freeze(self) -> ImmutableWritePlan:
+        return ImmutableWritePlan(tuple(self._writes.values()))
+
+
+_ACTIVE_WRITE_PLAN: contextvars.ContextVar[WritePlanBuilder | None] = contextvars.ContextVar(
+    "autopilot_active_write_plan", default=None
+)
 
 
 def fail(message: str) -> None:
@@ -217,7 +282,11 @@ def under(path: Path, parent: Path) -> bool:
 
 
 def regular_non_symlink(path: Path) -> None:
-    if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+    try:
+        mode = path.lstat().st_mode
+    except OSError as exc:
+        fail(f"expected regular non-symlink file: {path}: {exc}")
+    if not stat.S_ISREG(mode):
         fail(f"expected regular non-symlink file: {path}")
 
 
@@ -261,6 +330,35 @@ def atomic_write(path: Path, data: bytes) -> None:
     finally:
         if temp.exists():
             temp.unlink()
+
+
+def atomic_create(path: Path, data: bytes) -> bool:
+    """Create one immutable file without replacing a concurrently-created path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temp, path, follow_symlinks=False)
+            created = True
+        except FileExistsError:
+            regular_non_symlink(path)
+            if path.read_bytes() != data:
+                fail(f"immutable destination already exists with different bytes: {path}")
+            created = False
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    return created
 
 
 class Lock:
@@ -583,16 +681,27 @@ def snapshot_is_pinned(state: dict[str, Any]) -> bool:
     )
 
 
+def snapshot_path(p: dict[str, Path], state: dict[str, Any], kind: str) -> Path:
+    snapshot_root = p["run"] / "snapshots"
+    safe_kind = re.sub(r"[^A-Za-z0-9._-]+", "-", kind).strip("-") or "checkpoint"
+    prefix = "pinned-" if snapshot_is_pinned(state) else ""
+    return snapshot_root / f"{prefix}{state['revision']}-{safe_kind}.json"
+
+
 def write_snapshot(p: dict[str, Path], state: dict[str, Any], kind: str) -> Path:
     snapshot_root = p["run"] / "snapshots"
     regular_directory(p["run"], "run directory")
     if snapshot_root.exists() and (snapshot_root.is_symlink() or not snapshot_root.is_dir()):
         fail("recovery snapshot namespace is not a regular directory")
     snapshot_root.mkdir(parents=True, exist_ok=True)
-    safe_kind = re.sub(r"[^A-Za-z0-9._-]+", "-", kind).strip("-") or "checkpoint"
-    prefix = "pinned-" if snapshot_is_pinned(state) else ""
-    target = snapshot_root / f"{prefix}{state['revision']}-{safe_kind}.json"
-    atomic_write(target, canonical_bytes(state))
+    target = snapshot_path(p, state, kind)
+    raw = canonical_bytes(state)
+    if target.exists() or target.is_symlink():
+        regular_non_symlink(target)
+        if target.read_bytes() != raw:
+            fail(f"recovery snapshot destination already exists with different bytes: {target}")
+    else:
+        atomic_create(target, raw)
     return target
 
 
@@ -617,20 +726,39 @@ def publish(p: dict[str, Path], state: dict[str, Any], previous_raw: bytes | Non
     raw = canonical_bytes(state)
     atomic_write(p["ledger"], raw)
     if snapshot_kind:
-        write_snapshot(p, state, snapshot_kind)
-        prune_snapshots(p)
+        try:
+            write_snapshot(p, state, snapshot_kind)
+            prune_snapshots(p)
+        except (OSError, LedgerError) as exc:
+            fail(f"ledger revision {state['revision']} committed; recovery snapshot publication failed: {exc}")
 
 
-def transaction(p: dict[str, Path], token: str, expected_revision: int | None, change: Callable[[dict[str, Any]], None], snapshot_kind: str | None = None) -> dict[str, Any]:
+def transaction(
+    p: dict[str, Path],
+    token: str,
+    expected_revision: int | None,
+    change: Callable[[dict[str, Any]], None],
+    snapshot_kind: str | None = None,
+    retry_reconcile: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
     started = time.monotonic()
     with Lock(p["lock"]):
         state, previous_raw = load_state(p)
         if state["owner"]["token"] != token:
             fail("owner token mismatch; stale orchestrator is fenced")
         if expected_revision is not None and state["revision"] != expected_revision:
+            if retry_reconcile is not None and state["revision"] == expected_revision + 1:
+                reconciled = retry_reconcile(state)
+                if reconciled is not None:
+                    raise IdempotentResult(reconciled)
             fail(f"revision mismatch: expected {expected_revision}, current {state['revision']}")
         next_state = copy.deepcopy(state)
-        change(next_state)
+        builder = WritePlanBuilder()
+        plan_context = _ACTIVE_WRITE_PLAN.set(builder)
+        try:
+            change(next_state)
+        finally:
+            _ACTIVE_WRITE_PLAN.reset(plan_context)
         usage = next_state.setdefault("usage", default_usage())
         usage.setdefault("counters", zero_usage())
         usage.setdefault("trace", [])
@@ -645,22 +773,54 @@ def transaction(p: dict[str, Path], token: str, expected_revision: int | None, c
         next_state["revision"] = state["revision"] + 1
         next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
         next_state["updated_at"] = now()
-        publish(p, next_state, previous_raw, snapshot_kind)
+        ensure_runtime_provenance(next_state)
+        # All schema and state invariants run before an immutable artifact is
+        # made visible. File-backed references are checked after plan publish.
+        validate_ledger(next_state, verify_files=False)
+        plan = builder.freeze()
+        plan.preflight()
+        created = plan.publish()
+        try:
+            publish(p, next_state, previous_raw, snapshot_kind)
+        except (OSError, LedgerError):
+            # If the ledger remains at its exact pre-transition bytes, newly
+            # created canonical files are unpublished staging. Content-
+            # addressed objects remain harmless orphans after this boundary.
+            try:
+                ledger_raw = p["ledger"].read_bytes()
+            except OSError:
+                ledger_raw = None
+            if ledger_raw == previous_raw:
+                for write in reversed(created):
+                    if write.kind != "canonical" or not write.destination.exists():
+                        continue
+                    regular_non_symlink(write.destination)
+                    if write.destination.read_bytes() == write.data:
+                        write.destination.unlink()
+            raise
         return next_state
 
 
 def object_store(p: dict[str, Path], raw: bytes) -> str:
     digest = sha256_bytes(raw)
     target = p["objects"] / digest
+    active_plan = _ACTIVE_WRITE_PLAN.get()
+    if active_plan is not None:
+        if p["run"].is_symlink() or (p["objects"].exists() and p["objects"].is_symlink()):
+            fail("immutable object namespace may not contain symlink directories")
+        active_plan.add(target, raw, "object")
+        return digest
+    if p["run"].is_symlink():
+        fail("immutable object run directory may not be a symlink")
     if p["objects"].exists() and (p["objects"].is_symlink() or not p["objects"].is_dir()):
         fail("immutable object namespace is not a regular directory")
     p["objects"].mkdir(parents=True, exist_ok=True)
-    if target.exists():
+    if target.exists() or target.is_symlink():
         regular_non_symlink(target)
         if sha256_file(target) != digest:
             fail(f"immutable object collision: {target}")
     else:
-        atomic_write(target, raw)
+        atomic_create(target, raw)
     return digest
 
 
@@ -668,11 +828,18 @@ def canonical_document_path(p: dict[str, Path], document_id: str, document_versi
     """Resolve one immutable Markdown destination without permitting docs/ escape."""
     safe_id(document_id, "document_id")
     safe_id(document_version, "document_version")
-    docs_root = p["docs"].resolve()
     if p["docs"].exists() and (p["docs"].is_symlink() or not p["docs"].is_dir()):
         fail("canonical document namespace is not a regular directory")
-    destination = (p["docs"] / document_id / f"{document_version}.md").resolve()
-    if not under(destination, docs_root):
+    docs_root = p["docs"].resolve()
+    document_dir = p["docs"] / document_id
+    destination = document_dir / f"{document_version}.md"
+    if document_dir.is_symlink():
+        fail("canonical document directory may not be a symlink")
+    if document_dir.exists() and not document_dir.is_dir():
+        fail("canonical document directory is not a regular directory")
+    if destination.is_symlink():
+        fail("canonical document destination may not be a symlink")
+    if not under(destination.resolve(), docs_root):
         fail("canonical document path escapes the run document namespace")
     return destination
 
@@ -893,12 +1060,39 @@ def validate_current_design_contract_bindings(state: dict[str, Any]) -> None:
 
 
 def stored_payload(p: dict[str, Path], ref: str | None, label: str) -> dict[str, Any]:
-    if not isinstance(ref, str) or not ref.startswith("objects/"):
+    match = re.fullmatch(r"objects/([0-9a-f]{64})", ref) if isinstance(ref, str) else None
+    if match is None:
         fail(f"{label} is not an immutable object reference")
-    path = (p["run"] / ref).resolve()
-    if not under(path, p["objects"]):
-        fail(f"{label} escapes immutable object namespace")
-    return read_json(path, label)
+    run_fd = objects_fd = object_fd = None
+    try:
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        run_fd = os.open(p["run"], directory_flags)
+        if not stat.S_ISDIR(os.fstat(run_fd).st_mode):
+            fail(f"{label} run namespace is not a regular directory")
+        objects_fd = os.open("objects", directory_flags, dir_fd=run_fd)
+        if not stat.S_ISDIR(os.fstat(objects_fd).st_mode):
+            fail(f"{label} immutable object namespace is not a regular directory")
+        object_fd = os.open(match.group(1), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=objects_fd)
+        if not stat.S_ISREG(os.fstat(object_fd).st_mode):
+            fail(f"{label} immutable object is not a regular file")
+        with os.fdopen(object_fd, "rb") as stream:
+            object_fd = None
+            raw = stream.read()
+    except OSError as exc:
+        fail(f"{label} immutable object is unavailable: {exc}")
+    finally:
+        for descriptor in (object_fd, objects_fd, run_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+    if sha256_bytes(raw) != match.group(1):
+        fail(f"{label} immutable object hash does not match its reference")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"invalid {label} immutable object objects/{match.group(1)}: {exc}")
+    if not isinstance(value, dict):
+        fail(f"{label} immutable object must contain a JSON object")
+    return value
 
 
 def validate_worker_return_semantics(payload: dict[str, Any], packet: dict[str, Any]) -> None:
@@ -1596,10 +1790,13 @@ def validate_standalone_contract(value: dict[str, Any], kind: str) -> None:
         validate_design_bundle(value)
 
 
-def ingest_payload(p: dict[str, Path], state: dict[str, Any], attempt_id: str, payload_path: Path, expected_packet_hash: str | None = None, kind: str | None = None) -> tuple[dict[str, Any], str]:
+def ingest_payload(p: dict[str, Path], state: dict[str, Any], attempt_id: str, payload_path: Path, expected_packet_hash: str | None = None, kind: str | None = None) -> tuple[dict[str, Any], str, bytes]:
     payload_path = inbox_file(p, attempt_id, payload_path)
     raw = payload_path.read_bytes()
-    payload = read_json(payload_path, "return")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"invalid return {payload_path}: {exc}")
     identity = packet_identity(payload)
     if identity.get("attempt_id") != attempt_id:
         fail("return attempt_id does not match exact inbox attempt")
@@ -1620,8 +1817,8 @@ def ingest_payload(p: dict[str, Path], state: dict[str, Any], attempt_id: str, p
                 attempt = attempt_by_id(state, attempt_id)
                 packet = stored_payload(p, attempt.get("packet_ref"), "review packet")
                 validate_review_return_semantics(payload, packet)
-    digest = object_store(p, raw)
-    return payload, digest
+    digest = sha256_bytes(raw)
+    return payload, digest, raw
 
 
 def append_issue(state: dict[str, Any], issue: dict[str, Any], *, source_ref: str | None = None, finding_ref: str | None = None) -> str:
@@ -1730,7 +1927,8 @@ def cmd_publish_usage(args: argparse.Namespace) -> dict[str, Any]:
     root = schema()
     validate(event, root["$defs"]["usage_event"], root, "$.usage_event")
     raw = event_path.read_bytes()
-    event_ref = f"objects/{object_store(p, raw)}"
+    event_hash = sha256_bytes(raw)
+    event_ref = f"objects/{event_hash}"
     with Lock(p["lock"]):
         state, previous_raw = load_state(p)
         if state["owner"]["token"] != args.owner_token:
@@ -1766,6 +1964,8 @@ def cmd_publish_usage(args: argparse.Namespace) -> dict[str, Any]:
         state["revision"] += 1
         state["previous_publication_hash"] = sha256_bytes(previous_raw)
         state["updated_at"] = now()
+        validate_ledger(state, verify_files=False)
+        object_store(p, raw)
         publish(p, state, previous_raw, "usage")
     return {"published": True, "event_id": event["id"], "event_ref": event_ref, "scope": event.get("scope", "run"), "tokens": state["usage"].get("tokens"), "token_reason": state["usage"].get("token_reason"), "revision": state["revision"]}
 
@@ -1847,7 +2047,7 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
             fail("return conflicts with a terminal lost/interrupted attempt")
         if state["revision"] != args.revision:
             fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
-        payload, digest = ingest_payload(p, state, args.attempt_id, Path(args.return_file), attempt.get("packet_hash"), args.kind)
+        payload, digest, return_raw = ingest_payload(p, state, args.attempt_id, Path(args.return_file), attempt.get("packet_hash"), args.kind)
         identity = packet_identity(payload)
         packet = validate_return_against_attempt(p, state, attempt, payload, args.kind)
         if args.kind == "review" and attempt.get("mode") in ("coverage", "plan"):
@@ -1946,6 +2146,8 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         next_state["revision"] += 1
         next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
         next_state["updated_at"] = now()
+        validate_ledger(next_state, verify_files=False)
+        object_store(p, return_raw)
         publish(p, next_state, previous_raw)
     return {"ingested": True, "idempotent": False, "attempt_id": args.attempt_id, "return_ref": f"objects/{digest}", "status": "BLOCKED" if write_set_violations else payload.get("status", payload.get("verdict")), "quarantined": bool(write_set_violations), "revision": next_state["revision"]}
 
@@ -1971,7 +2173,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             validate(repair, root["$defs"]["repair_contract"], root, "$.packet.repair")
     else:
         fail("dispatch is only for worker packets; reviewer attempts use prepare-review")
-    packet_hash = object_store(p, packet_raw)
+    packet_hash = sha256_bytes(packet_raw)
     route = read_json(Path(args.route), "route") if args.route else None
     if route is not None:
         root = schema()
@@ -2020,6 +2222,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             if dep.get("state") != "INTEGRATED":
                 fail(f"dependency is not current INTEGRATED: {dependency}")
         lease_zone, repair_lease_provenance = effective_worker_lease(p, state, ticket, packet)
+        object_store(p, packet_raw)
         lease = {"id": args.lease_id, "state": "active", "zone": lease_zone}
         attempt_record = {"id": args.attempt_id, "kind": packet.get("kind", "worker"), "mode": packet.get("mode", "implement"), "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": lease, "route_ref": args.route_id, "checkout": packet.get("workspace", {}).get("root"), "base_sha": packet.get("workspace", {}).get("expected_base"), "candidate_sha": None, "candidate_tree_sha": None, "return_ref": None, "finding_refs": []}
         if binding:
@@ -2178,7 +2381,7 @@ def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
     evidence_path = Path(args.evidence).expanduser().resolve()
     evidence = read_json(evidence_path, "attempt termination evidence")
     evidence_raw = evidence_path.read_bytes()
-    evidence_digest = object_store(p, evidence_raw)
+    evidence_digest = sha256_bytes(evidence_raw)
     if args.lease_state == "released" and (evidence.get("status") != "PASS" or evidence.get("writer_stopped") is not True):
         fail("lease release requires PASS writer_stopped evidence")
 
@@ -2188,6 +2391,7 @@ def cmd_terminate_attempt(args: argparse.Namespace) -> dict[str, Any]:
             fail("only an in-flight attempt may be terminated")
         if attempt.get("epoch") != state["owner"]["epoch"] and args.lease_state == "released":
             fail("stale-epoch attempt may only be quarantined until takeover reconciliation")
+        object_store(p, evidence_raw)
         attempt["state"] = args.state
         attempt["lease"]["state"] = args.lease_state
         ticket = next((item for item in state.get("tickets", []) if item.get("current_attempt") == args.attempt_id), None)
@@ -2595,11 +2799,13 @@ def cmd_prepare_effect(args: argparse.Namespace) -> dict[str, Any]:
 def cmd_reconcile_effect(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     receipt = None
+    receipt_raw = None
     receipt_ref = None
     if args.receipt:
         receipt_path = Path(args.receipt).expanduser().resolve()
         receipt = read_json(receipt_path, "effect receipt")
-        receipt_ref = f"objects/{object_store(p, receipt_path.read_bytes())}"
+        receipt_raw = receipt_path.read_bytes()
+        receipt_ref = f"objects/{sha256_bytes(receipt_raw)}"
     observed, _ = load_state(p)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
@@ -2632,6 +2838,8 @@ def cmd_reconcile_effect(args: argparse.Namespace) -> dict[str, Any]:
                     fail(f"effect reconciliation cannot inspect Git target: {exc}")
                 if actual_head != commit_sha or (receipt.get("tree_sha") and actual_tree != receipt.get("tree_sha")):
                     fail("effect receipt does not match actual Git target")
+            if receipt_raw is not None:
+                object_store(p, receipt_raw)
         if args.result == "applied":
             if not receipt:
                 fail("applied reconciliation requires an exact effect receipt")
@@ -2661,7 +2869,8 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
     identity = packet_identity(packet)
     if identity.get("run_id") not in (None, args.run_id) or identity.get("attempt_id") != args.review_attempt_id:
         fail("review packet identity does not match review attempt")
-    packet_hash = object_store(p, packet_path.read_bytes())
+    packet_raw = packet_path.read_bytes()
+    packet_hash = sha256_bytes(packet_raw)
     def change(state: dict[str, Any]) -> None:
         ticket = next((t for t in state.get("tickets", []) if t.get("id") == args.ticket_id), None)
         is_blocked_continuation = bool(ticket and ticket.get("state") == "BLOCKED" and state["lifecycle"].get("control") == "BLOCKED")
@@ -2690,6 +2899,7 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
             fail("review packet intent document hash is stale")
         if any(a.get("id") == args.review_attempt_id for a in state.get("attempts", [])):
             fail("review attempt ID already exists")
+        object_store(p, packet_raw)
         attempt_record = {"id": args.review_attempt_id, "kind": "review", "mode": "change", "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": {"id": args.lease_id, "state": "active", "zone": []}, "route_ref": None, "checkout": None, "base_sha": worker.get("candidate_sha"), "candidate_sha": worker.get("candidate_sha"), "candidate_tree_sha": worker.get("candidate_tree_sha"), "return_ref": None, "finding_refs": [], "subject_fingerprint": worker.get("candidate_sha"), "packet_registration_revision": registration_revision, "packet_source_revision": identity.get("source_revision", registration_revision), "subject_revision": identity.get("subject_revision", state["revision"]), "attempt_created_revision": state["revision"] + 1, "return_source_revision": None}
         if binding:
             attempt_record.update({"intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"]})
@@ -2718,7 +2928,8 @@ def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
         fail("design review kind must be coverage or plan")
     reviewer_identity = nonempty_string(args.reviewer_identity, "reviewer identity")
     reviewer_role = nonempty_string(args.reviewer_role, "reviewer role")
-    packet_hash = object_store(p, packet_path.read_bytes())
+    packet_raw = packet_path.read_bytes()
+    packet_hash = sha256_bytes(packet_raw)
 
     def change(state: dict[str, Any]) -> None:
         if state["lifecycle"]["phase"] != "DESIGN" and not (args.review_kind == "plan" and state["lifecycle"]["phase"] == "PLAN"):
@@ -2755,6 +2966,7 @@ def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
             if existing_attempt.get("packet_hash") == packet_hash and existing_attempt.get("mode") == args.review_kind and existing_attempt.get("subject_ref") == publication.get("id") and existing_attempt.get("reviewer_identity") == reviewer_identity and existing_attempt.get("reviewer_role") == reviewer_role:
                 raise IdempotentResult({"prepared": True, "idempotent": True, "attempt_id": args.review_attempt_id, "review_kind": args.review_kind, "packet_hash": packet_hash, "revision": state["revision"]})
             fail("review attempt ID already exists with conflicting registration")
+        object_store(p, packet_raw)
         target_refs = [*publication["document_refs"], *publication["contract_refs"], *publication["ticket_refs"], *publication["route_refs"]]
         documents = {item["id"]: item for item in state.get("documents", [])}
         target_versions = [{"ref": ref, "version": documents[ref]["version"]} for ref in publication["document_refs"]]
@@ -2880,7 +3092,7 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
         if attempt.get("state") not in ("PREPARED", "RETURNED"):
             fail("review attempt is not active")
         packet = stored_payload(p, attempt.get("packet_ref"), "review packet")
-        review, digest = ingest_payload(p, state, args.attempt_id, Path(args.review_file), attempt.get("packet_hash"), "review")
+        review, digest, review_raw = ingest_payload(p, state, args.attempt_id, Path(args.review_file), attempt.get("packet_hash"), "review")
         validate_return_against_attempt(p, state, attempt, review, "review")
         if review.get("verdict") != "PASS":
             fail("integration requires reviewer PASS; BLOCK/UNVERIFIABLE remains outside integration")
@@ -2933,6 +3145,8 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
         next_state["revision"] += 1
         next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
         next_state["updated_at"] = now()
+        validate_ledger(next_state, verify_files=False)
+        object_store(p, review_raw)
         publish(p, next_state, previous_raw)
     return {"integrated": True, "attempt_id": args.attempt_id, "review_ref": f"objects/{digest}", "revision": next_state["revision"]}
 
@@ -3852,8 +4066,8 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
         fail("bundle root is not a regular directory")
     if not export.is_dir():
         fail("export root does not exist")
-    bundle.mkdir(parents=True, exist_ok=True)
-    packet_hash = object_store(p, packet_path.read_bytes())
+    packet_raw = packet_path.read_bytes()
+    packet_hash = sha256_bytes(packet_raw)
     manifest: list[dict[str, Any]] = []
     for path in sorted(export.rglob("*")):
         rel = path.relative_to(export)
@@ -3867,11 +4081,13 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
             data = path.read_bytes()
             manifest.append({"path": rel.as_posix(), "sha256": sha256_bytes(data), "bytes": len(data), "mode": stat.S_IMODE(path.stat().st_mode)})
     manifest_bytes = canonical_bytes({"candidate_fingerprint": projection.get("candidate_fingerprint"), "files": manifest})
-    atomic_write(bundle / "manifest.json", manifest_bytes)
-    atomic_write(bundle / "packet.json", canonical_bytes(packet))
-    atomic_write(bundle / "projection.json", canonical_bytes(projection))
     checklist = "# Operator checklist\n\nTransfer only this bundle. Start a new clean reviewer session; do not fork/resume author context. Record the packet/export hashes and environment/context receipts before running checks. Return exact structured JSON.\n"
-    atomic_write(bundle / "operator-checklist.md", checklist.encode())
+    bundle_writes = (
+        (bundle / "manifest.json", manifest_bytes),
+        (bundle / "packet.json", canonical_bytes(packet)),
+        (bundle / "projection.json", canonical_bytes(projection)),
+        (bundle / "operator-checklist.md", checklist.encode()),
+    )
     manifest_hash = sha256_bytes(manifest_bytes)
     def change(state: dict[str, Any]) -> None:
         attempt = attempt_by_id(state, args.attempt_id)
@@ -3879,6 +4095,12 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
             fail("handoff attempt is stale")
         if attempt.get("kind") not in ("review", "acceptance"):
             fail("handoff requires a separate reviewer/acceptance attempt")
+        active_plan = _ACTIVE_WRITE_PLAN.get()
+        if active_plan is None:
+            fail("handoff bundle writes require a locked immutable write plan")
+        for destination, data in bundle_writes:
+            active_plan.add(destination, data, "canonical")
+        object_store(p, packet_raw)
         attempt["state"] = "PREPARED"
         attempt["kind"] = "review"
         attempt["mode"] = "user_assisted"
@@ -3940,7 +4162,7 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
         if expected_manifest and context.get("export_hash") != expected_manifest.removeprefix("sha256:"):
             fail("context receipt export hash does not match prepared handoff")
         verify_manual_inventory(env, attempt.get("handoff") or {})
-        payload, digest = ingest_payload(p, state, args.attempt_id, return_path, attempt.get("packet_hash"), "acceptance")
+        payload, digest, return_raw = ingest_payload(p, state, args.attempt_id, return_path, attempt.get("packet_hash"), "acceptance")
         identity = packet_identity(payload)
         if identity.get("intent_revision") != args.intent_revision:
             fail("manual return intent revision mismatch")
@@ -3992,7 +4214,9 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
             if ticket and ticket.get("state") == "REVIEW":
                 ticket["state"] = "INTEGRATED"
         acceptance = next_state.setdefault("acceptance", [])
-        acceptance.append({"round": len(acceptance) + 1, "intent_revision": args.intent_revision, "candidate_fingerprint": candidate, "verdict": payload.get("verdict"), "transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "setup_receipt_ref": f"objects/{object_store(p, canonical_bytes(env))}", "context_receipt_ref": f"objects/{object_store(p, canonical_bytes(context))}", "return_ref": f"objects/{digest}", "outcome_refs": []})
+        environment_raw = canonical_bytes(env)
+        context_raw = canonical_bytes(context)
+        acceptance.append({"round": len(acceptance) + 1, "intent_revision": args.intent_revision, "candidate_fingerprint": candidate, "verdict": payload.get("verdict"), "transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "setup_receipt_ref": f"objects/{sha256_bytes(environment_raw)}", "context_receipt_ref": f"objects/{sha256_bytes(context_raw)}", "return_ref": f"objects/{digest}", "outcome_refs": []})
         evidence = next_state.setdefault("evidence", [])
         add_usage(next_state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"return_bytes": len(canonical_bytes(payload))})
         evidence.append({"id": f"ev-{digest[:16]}", "hash": digest, "source": "manual_review_return", "scenario": "critical/G5", "outcome": payload.get("verdict"), "observer": "independent-reviewer", "subject": candidate})
@@ -4007,6 +4231,10 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
         next_state["revision"] += 1
         next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
         next_state["updated_at"] = now()
+        validate_ledger(next_state, verify_files=False)
+        object_store(p, return_raw)
+        object_store(p, environment_raw)
+        object_store(p, context_raw)
         publish(p, next_state, previous_raw)
     return {"imported": True, "idempotent": False, "verdict": payload.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False, "revision": next_state["revision"]}
 
@@ -4099,7 +4327,7 @@ def cmd_publish_intent(args: argparse.Namespace) -> dict[str, Any]:
             if doc_path.read_bytes() != raw:
                 fail("canonical initial intent destination already exists with different bytes")
         else:
-            atomic_write(doc_path, raw)
+            atomic_create(doc_path, raw)
         publish(p, next_state, previous_raw)
 
     return {
@@ -4203,10 +4431,11 @@ def cmd_adopt_requirements(args: argparse.Namespace) -> dict[str, Any]:
         migration_id = f"adopt-requirements-{manifest['publication_id']}"
         provenance["applied_migrations"].append({"id": migration_id, "helper_version": SKILL_VERSION, "applied_revision": state["revision"] + 1, "manifest_hash": digest, "object_ref": f"objects/{digest}"})
         next_state["lifecycle"]["next_action"] = {"kind": "publish_design_bundle", "subject_refs": [manifest["publication_id"]], "preconditions": ["requirements/criteria publication is current", "design bundle refs resolve exactly"], "read_refs": ["phases/design.md", "references/ledger.md"]}
-        object_store(p, raw)
         next_state["revision"] = state["revision"] + 1
         next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
         next_state["updated_at"] = now()
+        validate_ledger(next_state, verify_files=False)
+        object_store(p, raw)
         publish(p, next_state, previous_raw, "requirements-adoption")
     return {"published": True, "idempotent": False, "publication_id": manifest["publication_id"], "publication_hash": digest, "requirement_count": len(requirement_ids), "criterion_count": len(criterion_ids), "revision": next_state["revision"], "next_action": next_state["lifecycle"]["next_action"]}
 
@@ -4611,7 +4840,7 @@ def cmd_migrate_review_currentness(args: argparse.Namespace) -> dict[str, Any]:
             "remaining_current_blocker_ids": current_blocker_ids,
         }
         report_raw = canonical_bytes(report)
-        report_hash = object_store(p, report_raw)
+        report_hash = sha256_bytes(report_raw)
         runtime = ensure_runtime_provenance(next_state)
         runtime["applied_migrations"].append({
             "id": marker,
@@ -4641,6 +4870,8 @@ def cmd_migrate_review_currentness(args: argparse.Namespace) -> dict[str, Any]:
         next_state["revision"] = state["revision"] + 1
         next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
         next_state["updated_at"] = now()
+        validate_ledger(next_state, verify_files=False)
+        object_store(p, report_raw)
         publish(p, next_state, previous_raw, "review-currentness-migration")
         return {
             "migrated": True,
@@ -4779,7 +5010,6 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
                 next_state["lifecycle"]["issue_refs"] = []
                 next_state["lifecycle"]["control"] = "ACTIVE"
         next_state["lifecycle"]["next_action"] = {"kind": "prepare_g2_coverage_review", "subject_refs": [bundle["bundle_id"], *document_refs], "preconditions": ["published design bundle is current", "fresh coverage reviewer attempt"], "read_refs": ["phases/design.md", "contracts/reviewer.md", "references/ledger.md"]}
-        validate_ledger(next_state, verify_files=False)
         destinations: list[tuple[Path, bytes, str]] = []
         for document in bundle["documents"]:
             destination = canonical_document_path(p, document["id"], document["version"])
@@ -4788,10 +5018,6 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
                 if destination.read_bytes() != source_bytes[document["id"]]:
                     fail(f"canonical design document destination already exists with different bytes: {document['id']}")
             destinations.append((destination, source_bytes[document["id"]], document["id"]))
-        object_store(p, canonical_bytes(bundle))
-        for destination, raw, _document_id in destinations:
-            if not destination.exists():
-                atomic_write(destination, raw)
         usage = next_state.setdefault("usage", default_usage())
         usage.setdefault("counters", zero_usage()); usage.setdefault("trace", []); usage.setdefault("shared_setup", zero_usage()); usage.setdefault("gate_costs", {f"G{i}": zero_usage() for i in range(7)})
         delta = {field: 0 for field in USAGE_FIELDS}; delta["helper_calls"] = 1; delta["internal_publications"] = 1; delta["wall_time_ms"] = max(0, int((time.monotonic() - started) * 1000))
@@ -4800,6 +5026,11 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
         next_state["revision"] = state["revision"] + 1
         next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
         next_state["updated_at"] = now()
+        validate_ledger(next_state, verify_files=False)
+        object_store(p, canonical_bytes(bundle))
+        for destination, raw, _document_id in destinations:
+            if not destination.exists():
+                atomic_create(destination, raw)
         validate_ledger(next_state)
         publish(p, next_state, previous_raw, "design-publication")
     return {"published": True, "idempotent": False, "bundle_id": bundle["bundle_id"], "publication_hash": bundle_hash, "revision": next_state["revision"], "next_action": next_state["lifecycle"]["next_action"]}
@@ -4807,14 +5038,47 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
-    source = Path(args.intent_file).expanduser().resolve()
-    regular_non_symlink(source)
-    raw = source.read_bytes()
+    raw = intent_source_bytes(args.intent_file)
     digest = sha256_bytes(raw)
-    doc_dir = p["docs"] / safe_id(args.doc_id, "document_id")
-    doc_path = doc_dir / f"{safe_id(args.doc_version, 'document_version')}.md"
-    atomic_write(doc_path, raw)
+    doc_path = canonical_document_path(p, args.doc_id, args.doc_version)
     doc_id = args.doc_id
+
+    def reconcile_retry(state: dict[str, Any]) -> dict[str, Any] | None:
+        """Recognize only this exact amendment after a committed publication."""
+        if state.get("revision") != args.revision + 1:
+            return None
+        if not p["prev"].exists() or sha256_bytes(p["prev"].read_bytes()) != state.get("previous_publication_hash"):
+            return None
+        invalidation = next((item for item in state.get("invalidations", []) if item.get("amendment_ref") == args.amendment_id), None)
+        document = next((item for item in state.get("documents", []) if item.get("id") == doc_id and item.get("version") == args.doc_version), None)
+        intent = state.get("intent", {})
+        if (
+            invalidation is None
+            or invalidation.get("intent_revision") != args.intent_revision
+            or document is None
+            or document.get("path") != str(doc_path)
+            or document.get("hash") != digest
+            or intent.get("current_revision") != args.intent_revision
+            or intent.get("document_ref") != doc_id
+            or intent.get("document_hash") != digest
+            or args.amendment_id not in intent.get("approved_amendments", [])
+        ):
+            return None
+        regular_non_symlink(doc_path)
+        if doc_path.read_bytes() != raw:
+            return None
+        # The ledger is authoritative after replacement. Complete the missing
+        # deterministic snapshot before acknowledging this exact retry.
+        write_snapshot(p, state, "amendment")
+        prune_snapshots(p)
+        return {
+            "amended": True,
+            "idempotent": True,
+            "document_hash": digest,
+            "revision": state["revision"],
+            "next_action": state["lifecycle"]["next_action"],
+        }
+
     def change(state: dict[str, Any]) -> None:
         if not args.authority_ref:
             fail("amendment requires explicit user authority reference")
@@ -4822,7 +5086,7 @@ def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
         documents = state.setdefault("documents", [])
         if any(d.get("id") == doc_id and d.get("version") == args.doc_version for d in documents):
             fail("document revision already exists")
-        if any(item.get("id") == args.amendment_id for item in state.get("invalidations", [])):
+        if any(item.get("amendment_ref") == args.amendment_id for item in state.get("invalidations", [])):
             fail("amendment ID already exists")
         documents.append({"id": doc_id, "version": args.doc_version, "path": str(doc_path), "hash": digest, "kind": "intent", "section_anchors": []})
 
@@ -4864,7 +5128,15 @@ def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
         state["lifecycle"]["control"] = "ACTIVE"
         state["lifecycle"]["reason"] = "user_amendment"
         state["lifecycle"]["next_action"] = {"kind": "g1_recheck", "subject_refs": [args.amendment_id], "preconditions": ["affected work quiesced", "current intent hash verified"], "read_refs": ["phases/intent.md", "references/ledger.md"]}
-    result = transaction(p, args.owner_token, args.revision, change)
+        active_plan = _ACTIVE_WRITE_PLAN.get()
+        if active_plan is None:
+            fail("canonical amendment write requires a locked immutable write plan")
+        active_plan.add(doc_path, raw, "canonical")
+
+    try:
+        result = transaction(p, args.owner_token, args.revision, change, "amendment", retry_reconcile=reconcile_retry)
+    except IdempotentResult as prior:
+        return prior.result
     return {"amended": True, "document_hash": digest, "revision": result["revision"], "next_action": result["lifecycle"]["next_action"]}
 
 
