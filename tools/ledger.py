@@ -2135,6 +2135,301 @@ def cmd_diagnose(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def _legacy_attempt_order(attempt: dict[str, Any], fallback: int) -> tuple[int, int, str]:
+    """Return a deterministic durable ordering key without consulting object files."""
+    for field in ("attempt_created_revision", "packet_registration_revision", "return_source_revision", "subject_revision"):
+        value = attempt.get(field)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return (value, fallback, str(attempt.get("id", "")))
+    return (-1, fallback, str(attempt.get("id", "")))
+
+
+def _legacy_structural_analysis(state: dict[str, Any]) -> dict[str, Any]:
+    """Project legacy state for diagnosis using ledger-resident data only."""
+    attempts = state.get("attempts", [])
+    attempts_by_id = {item["id"]: item for item in attempts}
+    tickets_by_id = {item["id"]: item for item in state.get("tickets", [])}
+    contracts_by_id = {item["id"]: item for item in state.get("contracts", [])}
+    evidence_ids = {item["id"] for item in state.get("evidence", [])}
+    attempt_positions = {item["id"]: index for index, item in enumerate(attempts)}
+
+    intersections: list[dict[str, str]] = []
+    publication = state.get("design_publication")
+    if isinstance(publication, dict) and publication.get("status") == "PUBLISHED":
+        published_tickets = set(publication.get("ticket_refs", []))
+        for contract_ref in sorted(set(publication.get("contract_refs", []))):
+            contract = contracts_by_id.get(contract_ref)
+            if contract is None:
+                continue
+            producer_refs = set(contract.get("producer_refs", []))
+            for ticket_ref in sorted(published_tickets & producer_refs):
+                ticket = tickets_by_id.get(ticket_ref)
+                if ticket is not None and contract_ref in set(ticket.get("contract_refs", [])):
+                    intersections.append({"contract_ref": contract_ref, "ticket_ref": ticket_ref})
+
+    candidates: list[dict[str, Any]] = []
+    for ticket_id, ticket in sorted(tickets_by_id.items()):
+        current_attempt_ref = ticket.get("current_attempt")
+        attempt = attempts_by_id.get(current_attempt_ref)
+        if (
+            attempt is None
+            or attempt.get("kind") != "worker"
+            or attempt.get("subject_ref") != ticket_id
+            or not attempt.get("continuation_ref")
+            or not attempt.get("candidate_sha")
+        ):
+            continue
+        candidates.append({
+            "ticket_ref": ticket_id,
+            "ticket_state": ticket.get("state"),
+            "attempt_ref": attempt["id"],
+            "attempt_state": attempt.get("state"),
+            "candidate_sha": attempt["candidate_sha"],
+            "continuation_ref": attempt["continuation_ref"],
+            "qualification": "continuation_only",
+            "integrated": False,
+        })
+
+    current_reviews: list[dict[str, Any]] = []
+    current_review_ids: dict[str, str] = {}
+    for candidate in candidates:
+        matching = [
+            (index, item)
+            for index, item in enumerate(attempts)
+            if item.get("kind") == "review"
+            and item.get("subject_ref") == candidate["ticket_ref"]
+            and item.get("candidate_sha") == candidate["candidate_sha"]
+            and item.get("state") == "RETURNED"
+            and isinstance(item.get("return_ref"), str)
+            and bool(item.get("return_ref"))
+        ]
+        if not matching:
+            current_reviews.append({
+                "ticket_ref": candidate["ticket_ref"],
+                "candidate_sha": candidate["candidate_sha"],
+                "attempt_ref": None,
+                "state": None,
+                "review_result": None,
+                "attempt_revision": None,
+                "return_source_revision": None,
+                "finding_refs": [],
+                "finding_count": 0,
+            })
+            continue
+        index, review = max(matching, key=lambda pair: _legacy_attempt_order(pair[1], pair[0]))
+        finding_refs = sorted(set(review.get("finding_refs", [])))
+        current_review_ids[candidate["ticket_ref"]] = review["id"]
+        current_reviews.append({
+            "ticket_ref": candidate["ticket_ref"],
+            "candidate_sha": candidate["candidate_sha"],
+            "attempt_ref": review["id"],
+            "state": review.get("state"),
+            "review_result": review.get("review_result"),
+            "attempt_revision": review.get("attempt_created_revision"),
+            "return_source_revision": review.get("return_source_revision"),
+            "finding_refs": finding_refs,
+            "finding_count": len(finding_refs),
+        })
+
+    historical_ticket_reviews: list[dict[str, Any]] = []
+    historical_ticket_finding_refs: set[str] = set()
+    for ticket_id in sorted(candidate["ticket_ref"] for candidate in candidates):
+        current_review_id = current_review_ids.get(ticket_id)
+        current_order = (
+            _legacy_attempt_order(attempts_by_id[current_review_id], attempt_positions[current_review_id])
+            if current_review_id is not None
+            else None
+        )
+        for index, attempt in enumerate(attempts):
+            if (
+                attempt.get("kind") != "review"
+                or attempt.get("subject_ref") != ticket_id
+                or attempt.get("id") == current_review_id
+                or (current_order is not None and _legacy_attempt_order(attempt, index) >= current_order)
+            ):
+                continue
+            finding_refs = sorted(set(attempt.get("finding_refs", [])))
+            if not finding_refs:
+                continue
+            historical_ticket_finding_refs.update(finding_refs)
+            historical_ticket_reviews.append({
+                "ticket_ref": ticket_id,
+                "review_attempt_ref": attempt["id"],
+                "state": attempt.get("state"),
+                "finding_refs": finding_refs,
+                "finding_count": len(finding_refs),
+            })
+    historical_ticket_reviews.sort(key=lambda item: (item["ticket_ref"], item["review_attempt_ref"]))
+
+    historical_design_reviews: list[dict[str, Any]] = []
+    historical_design_finding_refs: set[str] = set()
+    for attempt in attempts:
+        if attempt.get("kind") != "review" or attempt.get("mode") not in ("coverage", "plan"):
+            continue
+        finding_refs = sorted(set(attempt.get("finding_refs", [])))
+        if finding_refs:
+            historical_design_finding_refs.update(finding_refs)
+            historical_design_reviews.append({
+                "review_attempt_ref": attempt["id"],
+                "review_kind": attempt.get("mode"),
+                "state": attempt.get("state"),
+                "finding_refs": finding_refs,
+                "finding_count": len(finding_refs),
+            })
+    historical_design_reviews.sort(key=lambda item: item["review_attempt_ref"])
+
+    external_blockers: list[dict[str, Any]] = []
+    external_causes = {"environment", "permission", "user_intent"}
+    for issue in state.get("issues", []):
+        if issue.get("impact") != "blocking" or issue.get("invalidated_by"):
+            continue
+        issue_type = str(issue.get("type", "")).lower()
+        type_tokens = set(re.split(r"[^a-z0-9]+", issue_type))
+        source_ref = issue.get("source_ref")
+        source_attempt = attempts_by_id.get(source_ref)
+        source_evidence = source_ref in evidence_ids if isinstance(source_ref, str) else False
+        if source_attempt is None and not source_evidence:
+            continue
+        basis: list[str] = ["source_ref resolves to a durable ledger attempt" if source_attempt else "source_ref resolves to durable ledger evidence"]
+        if "external" in type_tokens:
+            basis.append("issue type explicitly marks an external blocker")
+        if issue.get("cause") in external_causes:
+            basis.append(f"cause is {issue['cause']}")
+        if len(basis) == 1:
+            continue
+        external_blockers.append({
+            "issue_ref": issue["id"],
+            "type": issue.get("type"),
+            "cause": issue.get("cause"),
+            "source_ref": source_ref,
+            "source_attempt_state": source_attempt.get("state") if source_attempt else None,
+            "affected_refs": sorted(set(issue.get("affected_refs", []))),
+            "classification_basis": basis,
+        })
+    external_blockers.sort(key=lambda item: item["issue_ref"])
+
+    next_action = state.get("lifecycle", {}).get("next_action", {})
+    action_kind = next_action.get("kind") if isinstance(next_action, dict) else None
+    subject_refs = next_action.get("subject_refs", []) if isinstance(next_action, dict) else []
+    is_await = isinstance(action_kind, str) and action_kind.startswith("await_")
+    referenced_attempts = [attempts_by_id[ref] for ref in subject_refs if ref in attempts_by_id]
+    unresolved_subject_refs = sorted(ref for ref in subject_refs if ref not in attempts_by_id)
+    terminal_states = {"RETURNED", "LOST", "INTERRUPTED"}
+    stale = bool(
+        is_await
+        and referenced_attempts
+        and not unresolved_subject_refs
+        and all(attempt.get("state") in terminal_states for attempt in referenced_attempts)
+    )
+    stale_reasons = []
+    if stale:
+        for attempt in sorted(referenced_attempts, key=lambda item: item["id"]):
+            stale_reasons.append({
+                "attempt_ref": attempt["id"],
+                "kind": attempt.get("kind"),
+                "state": attempt.get("state"),
+                "reason": f"await target is terminal: attempt state is {attempt.get('state')}",
+            })
+
+    return {
+        "revision": state.get("revision"),
+        "lifecycle": {
+            "phase": state.get("lifecycle", {}).get("phase"),
+            "control": state.get("lifecycle", {}).get("control"),
+        },
+        "accepted_design_intersections": {
+            "records": intersections,
+            "total_count": len(intersections),
+            "distinct_ticket_count": len({item["ticket_ref"] for item in intersections}),
+        },
+        "current_candidates": candidates,
+        "current_review_attempts": current_reviews,
+        "historical_ticket_review_findings": {
+            "reviews": historical_ticket_reviews,
+            "finding_refs": sorted(historical_ticket_finding_refs),
+            "finding_count": len(historical_ticket_finding_refs),
+        },
+        "historical_design_findings": {
+            "reviews": historical_design_reviews,
+            "finding_refs": sorted(historical_design_finding_refs),
+            "finding_count": len(historical_design_finding_refs),
+        },
+        "active_external_blockers": external_blockers,
+        "next_action_analysis": {
+            "stored": next_action,
+            "await_action": is_await,
+            "stale": stale if is_await else None,
+            "referenced_attempts": [
+                {"attempt_ref": item["id"], "kind": item.get("kind"), "state": item.get("state")}
+                for item in sorted(referenced_attempts, key=lambda item: item["id"])
+            ],
+            "unresolved_subject_refs": unresolved_subject_refs,
+            "stale_reasons": stale_reasons,
+        },
+    }
+
+
+def cmd_diagnose_legacy(args: argparse.Namespace) -> dict[str, Any]:
+    """Read one standalone ledger file and report structural diagnostics only."""
+    target = Path(args.file)
+    result: dict[str, Any] = {
+        "read_only": True,
+        "source_path": str(target.absolute()),
+        "source_sha256": None,
+        "schema_version": None,
+        "shape_supported": False,
+        "valid": False,
+        "validation_error": None,
+        "mutation_eligible": False,
+        "mutation_reason": "ledger has not passed known-schema validation",
+        "revision": None,
+        "lifecycle": {"phase": None, "control": None},
+    }
+    try:
+        regular_non_symlink(target)
+        raw = target.read_bytes()
+    except (LedgerError, OSError) as exc:
+        result["validation_error"] = str(exc)
+        result["mutation_reason"] = "selected ledger could not be safely read; mutation is forbidden"
+        return result
+
+    result["source_sha256"] = sha256_bytes(raw)
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        result["validation_error"] = f"corrupt ledger JSON: {exc}"
+        result["mutation_reason"] = "corrupt ledger JSON; mutation is forbidden"
+        return result
+
+    if not isinstance(state, dict):
+        result["validation_error"] = "ledger root must be an object"
+        result["mutation_reason"] = "invalid ledger shape; mutation is forbidden"
+        return result
+    result["schema_version"] = state.get("schema_version")
+    result["revision"] = state.get("revision")
+    lifecycle = state.get("lifecycle")
+    if isinstance(lifecycle, dict):
+        result["lifecycle"] = {"phase": lifecycle.get("phase"), "control": lifecycle.get("control")}
+    result["shape_supported"] = state.get("schema_version") == SCHEMA_VERSION
+    if not result["shape_supported"]:
+        result["validation_error"] = f"unsupported shape schema {state.get('schema_version')!r}; supported schema is {SCHEMA_VERSION}"
+        result["mutation_reason"] = "unknown shape schema; mutation is forbidden"
+        return result
+    try:
+        validate_ledger(state, verify_files=False)
+    except (LedgerError, KeyError, TypeError, ValueError, IndexError) as exc:
+        result["validation_error"] = str(exc)
+        result["mutation_reason"] = "known-schema ledger validation failed; mutation is forbidden"
+        return result
+
+    result["valid"] = True
+    reason = mutation_ineligibility(state)
+    result["mutation_eligible"] = reason is None
+    result["mutation_reason"] = reason
+    result.update(_legacy_structural_analysis(state))
+    return result
+
+
 def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     with Lock(p["lock"]):
@@ -5397,6 +5692,7 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init"); init.add_argument("--control-root", required=True); init.add_argument("--repo-root", required=True); init.add_argument("--run-id", required=True); init.add_argument("--owner-token", required=True); init.add_argument("--request", default=None, help="optional natural-language request used to resolve run presets"); init.add_argument("--interaction-mode", choices=["semi", "full"], default=None); init.add_argument("--depth", choices=["normal", "deep"], default=None)
     status = sub.add_parser("status"); status.add_argument("--control-root", required=True); status.add_argument("--run-id", required=True); status.add_argument("--brief", action="store_true")
     diagnose = sub.add_parser("diagnose"); diagnose.add_argument("--control-root", required=True); diagnose.add_argument("--run-id", required=True)
+    legacy_diagnose = sub.add_parser("diagnose-legacy", help="read-only structural analysis of a standalone ledger file"); legacy_diagnose.add_argument("--file", required=True)
     brief = sub.add_parser("brief"); brief.add_argument("--control-root", required=True); brief.add_argument("--run-id", required=True); brief.set_defaults(brief=True)
     view = sub.add_parser("render-view"); view.add_argument("--control-root", required=True); view.add_argument("--run-id", required=True); view.add_argument("--kind", choices=["status", "final-report"], default="status")
     valid = sub.add_parser("validate"); valid.add_argument("--file", required=True); valid.add_argument("--kind", default="ledger")
@@ -5437,6 +5733,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init": result = cmd_init(args)
         elif args.command == "status": result = cmd_status(args)
         elif args.command == "diagnose": result = cmd_diagnose(args)
+        elif args.command == "diagnose-legacy": result = cmd_diagnose_legacy(args)
         elif args.command == "brief": result = cmd_status(args)
         elif args.command == "render-view": result = cmd_render_view(args)
         elif args.command == "validate": result = cmd_validate(args)
