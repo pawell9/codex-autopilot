@@ -599,6 +599,25 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
                 "--revision", str(state["revision"]), "--ticket-id", TICKET_ID,
                 "--review-attempt-id", "RV-PASS", "--lease-id", "L-RV-PASS", "--packet", str(packet_path),
             )
+            prepared, _ = ledger.load_state(paths)
+            prepared_review = ledger.attempt_by_id(prepared, "RV-PASS")
+            observation_id = "OBS-RV-PASS-NOT-STARTED"
+            observation_path = root / f"{observation_id}.json"
+            write_json(observation_path, {
+                "kind": "runtime_observation", "event_id": observation_id, "event": "not_started",
+                "run_id": RUN_ID, "attempt_id": prepared_review["id"], "epoch": prepared_review["epoch"],
+                "packet_hash": prepared_review["packet_hash"],
+                "spawn_request_id": prepared_review["runtime"]["spawn_request_id"],
+                "runtime_instance_id": None, "observed_at": "2026-09-18T12:00:00Z",
+                "observer": "runtime-adapter-test", "runtime_build": "fixture-1", "return_hash": None,
+                "coverage": {"scope": "review process tree", "descendant_writers": "not_applicable"},
+            })
+            run(
+                "observe-runtime", "--control-root", str(control), "--run-id", RUN_ID,
+                "--owner-token", OWNER, "--revision", str(prepared["revision"]),
+                "--attempt-id", prepared_review["id"], "--event", "not_started",
+                "--event-id", observation_id, "--event-file", str(observation_path),
+            )
             before, raw_before = ledger.load_state(paths)
             review_attempt = ledger.attempt_by_id(before, "RV-PASS")
             resolution_entries = [{

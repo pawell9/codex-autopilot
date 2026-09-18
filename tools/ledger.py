@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import ExitStack
 import contextvars
 import datetime as dt
 import fcntl
@@ -1095,6 +1096,50 @@ def safe_root(path: str | Path, label: str) -> Path:
     return result
 
 
+def repository_identity(path: str | Path) -> dict[str, str]:
+    """Resolve one stable ownership identity across control roots and Git worktrees."""
+    root = safe_root(path, "execution root")
+    regular_directory(root, "execution root")
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        common = safe_root(result.stdout.strip(), "Git common directory")
+        regular_directory(common, "Git common directory")
+        return {"key": f"git-common-dir:{common}", "common_dir": str(common), "kind": "git"}
+    return {"key": f"directory:{root}", "common_dir": "", "kind": "directory"}
+
+
+def repository_owner_paths(execution_root: str | Path, identity: dict[str, str] | None = None) -> dict[str, Path | str]:
+    """Return a durable lock/registry shared by all control roots for this repository."""
+    root = safe_root(execution_root, "execution root")
+    identity = identity or repository_identity(root)
+    owner_root = (
+        Path(identity["common_dir"]) / "codex-autopilot-ownership"
+        if identity["kind"] == "git"
+        else root.parent / ".codex-autopilot-ownership" / hashlib.sha256(os.fsencode(root)).hexdigest()
+    )
+    if owner_root.is_symlink() or owner_root.parent.is_symlink():
+        fail("repository owner namespace may not be a symlink")
+    return {
+        "root": owner_root, "lock": owner_root / "owner.lock", "registry": owner_root / "owner.json",
+        "identity_key": identity["key"],
+    }
+
+
+def acquire_locks(*lock_paths: Path) -> ExitStack:
+    """Acquire distinct locks in path order to keep multi-namespace operations deadlock-free."""
+    stack = ExitStack()
+    try:
+        for path in sorted({str(item) for item in lock_paths}):
+            stack.enter_context(Lock(Path(path)))
+    except Exception:
+        stack.close()
+        raise
+    return stack
+
+
 def under(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -1509,14 +1554,22 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
             fail(f"repair wave references unknown findings: {wave['id']}")
         if wave.get("state") == "CLOSED":
             final = qualifications_by_id.get(wave.get("final_g5_qualification_ref"))
+            ready, reason = repair_wave_close_readiness(
+                state, wave, final or {}, wave.get("repaired_candidate_fingerprint") or "",
+            )
+            if not ready:
+                fail(f"closed repair wave fails aggregate close validation ({reason}): {wave['id']}")
             if (
-                final is None or final.get("result") != "PASS"
-                or final.get("required_purposes") != ["final_g5"]
-                or final.get("subject_fingerprint") != wave.get("repaired_candidate_fingerprint")
-                or final.get("subject_fingerprint") == wave.get("source_candidate_fingerprint")
+                wave.get("closed_revision") is None
+                or wave.get("closed_revision") <= wave.get("created_revision", 0)
+                or wave.get("closed_revision") > state.get("revision", 0)
             ):
-                fail(f"closed repair wave lacks a fresh final-G5 qualification: {wave['id']}")
-        elif wave.get("final_g5_qualification_ref") is not None or wave.get("repaired_candidate_fingerprint") is not None:
+                fail(f"closed repair wave lacks an exact close revision: {wave['id']}")
+        elif (
+            wave.get("final_g5_qualification_ref") is not None
+            or wave.get("repaired_candidate_fingerprint") is not None
+            or wave.get("closed_revision") is not None
+        ):
             fail(f"open repair wave contains terminal qualification linkage: {wave['id']}")
     for candidate in state.get("candidates", []):
         ticket = next((item for item in state.get("tickets", []) if item.get("id") == candidate.get("ticket_ref")), None)
@@ -1775,6 +1828,31 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
         migration_ids = [item["id"] for item in provenance.get("applied_migrations", [])]
         if len(migration_ids) != len(set(migration_ids)):
             fail("runtime provenance contains duplicate migration IDs")
+    successor = state.get("successor_manifest")
+    if successor:
+        manifest = successor["manifest"]
+        expected_ref = f"objects/{successor['manifest_hash']}"
+        if successor.get("manifest_ref") != expected_ref:
+            fail("successor manifest object ref does not match its hash")
+        if successor["manifest_hash"] != sha256_bytes(canonical_bytes(manifest)):
+            fail("successor manifest hash does not match its typed contents")
+        evidence = {(item["kind"], item["ref"]): item for item in manifest["accepted_evidence"]}
+        scope = manifest["scope_decision"]
+        if evidence.get(("accepted_decision", scope["ref"]), {}).get("sha256") != scope["sha256"]:
+            fail("successor scope decision is not included in accepted carry-forward evidence")
+        candidate = manifest["candidate"]
+        candidate_parts = [candidate.get(key) for key in ("candidate_ref", "commit_sha", "tree_sha", "proof_ref", "proof_hash")]
+        if any(value is None for value in candidate_parts) and not all(value is None for value in candidate_parts):
+            fail("successor candidate identity must be fully bound or explicitly absent")
+        if candidate.get("proof_ref") and candidate["proof_ref"] != f"objects/{candidate['proof_hash']}":
+            fail("successor candidate proof ref does not match its exact proof hash")
+        if verify_files:
+            object_path = Path(state["repository"]["control_root"]) / ".autopilot" / "runs" / state["run_id"] / expected_ref
+            if not object_path.exists() or object_path.is_symlink() or not object_path.is_file():
+                fail("successor manifest object is unavailable")
+            object_raw = object_path.read_bytes()
+            if sha256_bytes(object_raw) != successor["manifest_hash"] or object_raw != canonical_bytes(manifest):
+                fail("successor manifest object is changed or not canonical")
 
 
 def paths(control_root: str | Path, run_id: str) -> dict[str, Path]:
@@ -1785,6 +1863,105 @@ def paths(control_root: str | Path, run_id: str) -> dict[str, Path]:
         fail("canonical .autopilot namespace may not be a symlink")
     run = base / "runs" / run_id
     return {"root": root, "base": base, "run": run, "ledger": run / "ledger.json", "prev": run / "ledger.prev.json", "lock": base / "owner.lock", "objects": run / "objects", "packets": run / "packets", "docs": run / "docs", "scratch": base / "scratch" / run_id}
+
+
+def _owner_registry_record(owner: dict[str, Any], identity_key: str, status: str) -> dict[str, Any]:
+    return {
+        "version": 1, "identity_key": identity_key, "status": status,
+        "control_root": str(owner["root"]), "run_id": owner["run"].name,
+        "ledger_path": str(owner["ledger"]),
+    }
+
+
+def terminal_owner_verification_error(state: dict[str, Any]) -> str | None:
+    """Return why this exact publication is not safe to displace as a terminal owner."""
+    if state.get("lifecycle", {}).get("control") not in TERMINAL_CONTROLS:
+        return "owner control is not terminal"
+    if any(item.get("state") in ("PREPARED", "DISPATCHED") for item in state.get("attempts", [])):
+        return "terminal owner still has an in-flight attempt"
+    if any(item.get("lease", {}).get("state") in ("active", "quarantined") for item in state.get("attempts", [])):
+        return "terminal owner still has an active or quarantined reservation"
+    if any(effect_is_unresolved(item) for item in state.get("operations", [])):
+        return "terminal owner still has an unresolved durable effect"
+    return None
+
+
+def _verify_registered_owner(record: dict[str, Any], identity_key: str) -> tuple[dict[str, Any], bytes, dict[str, Path]]:
+    if (
+        record.get("version") != 1 or record.get("identity_key") != identity_key
+        or record.get("status") not in ("pending", "active")
+    ):
+        fail("repository owner registry is malformed or belongs to another repository")
+    owner_paths = paths(record.get("control_root", ""), record.get("run_id", ""))
+    if str(owner_paths["ledger"]) != record.get("ledger_path"):
+        fail("repository owner registry ledger path is not canonical")
+    if not owner_paths["ledger"].exists():
+        fail("repository owner registry points to a missing ledger; ownership remains blocked")
+    state, raw = load_state(owner_paths)
+    if (
+        canonical_bytes(state) != raw or state.get("run_id") != record.get("run_id")
+        or state.get("repository", {}).get("control_root") != str(owner_paths["root"])
+    ):
+        fail("repository owner ledger is not the exact canonical publication")
+    actual_identity = repository_identity(state.get("repository", {}).get("execution_root", ""))
+    if actual_identity["key"] != identity_key:
+        fail("repository owner ledger identifies a different execution repository")
+    return state, raw, owner_paths
+
+
+def claim_repository_owner(registry_paths: dict[str, Path | str], target_paths: dict[str, Path]) -> bool:
+    """Reserve the repository namespace; only a verified terminal ledger can be displaced.
+
+    Returns true only when resuming this exact pending bootstrap. The caller holds
+    the repository lock and the target control-root lock for the whole operation.
+    """
+    registry_path = Path(registry_paths["registry"])
+    identity_key = str(registry_paths["identity_key"])
+    proposed = _owner_registry_record(target_paths, identity_key, "pending")
+    if registry_path.exists():
+        if registry_path.is_symlink():
+            fail("repository owner registry may not be a symlink")
+        record = read_json(registry_path, "repository owner registry")
+        if not isinstance(record, dict) or set(record) != {"version", "identity_key", "status", "control_root", "run_id", "ledger_path"}:
+            fail("repository owner registry has an invalid shape")
+        if record.get("version") != 1 or record.get("identity_key") != identity_key or record.get("status") not in ("pending", "active"):
+            fail("repository owner registry is malformed or belongs to another repository")
+        same_owner = record.get("ledger_path") == proposed["ledger_path"]
+        if record.get("status") == "active" and same_owner:
+            _verify_registered_owner(record, identity_key)
+            return False
+        if record.get("status") == "pending" and same_owner:
+            if target_paths["ledger"].exists():
+                state, _raw, _owner = _verify_registered_owner(record, identity_key)
+                active = _owner_registry_record(target_paths, identity_key, "active")
+                atomic_write(registry_path, canonical_bytes(active))
+                if state["lifecycle"]["control"] in TERMINAL_CONTROLS:
+                    return False
+                return False
+            return True
+        state, _raw, _owner = _verify_registered_owner(record, identity_key)
+        terminal_error = terminal_owner_verification_error(state)
+        if terminal_error:
+            fail(
+                f"repository already has nonterminal owner {state['run_id']} "
+                f"({state['lifecycle']['control']}): {terminal_error}; use its recovery path"
+            )
+    elif target_paths["ledger"].exists():
+        fail("run ledger already exists without a repository owner registry")
+    atomic_write(registry_path, canonical_bytes(proposed))
+    return False
+
+
+def activate_repository_owner(registry_paths: dict[str, Path | str], target_paths: dict[str, Path]) -> None:
+    registry_path = Path(registry_paths["registry"])
+    record = read_json(registry_path, "repository owner registry")
+    if record.get("status") != "pending" or record.get("ledger_path") != str(target_paths["ledger"]):
+        fail("repository owner reservation changed before ledger publication")
+    # The just-published target is validated before the registry becomes active.
+    state, raw = load_state(target_paths)
+    if canonical_bytes(state) != raw or repository_identity(state["repository"]["execution_root"])["key"] != str(registry_paths["identity_key"]):
+        fail("new owner ledger does not match its exact repository reservation")
+    atomic_write(registry_path, canonical_bytes(_owner_registry_record(target_paths, str(registry_paths["identity_key"]), "active")))
 
 
 def load_state(p: dict[str, Path]) -> tuple[dict[str, Any], bytes]:
@@ -4043,6 +4220,105 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def repair_wave_close_readiness(
+    state: dict[str, Any], wave: dict[str, Any], qualification: dict[str, Any], repaired_fingerprint: str,
+) -> tuple[bool, str]:
+    """Pure aggregate gate shared by G5 wave mutation and closed-wave validation."""
+    qualifications = {item.get("id"): item for item in state.get("review_qualifications", [])}
+    source = qualifications.get(wave.get("source_qualification_ref"))
+    if (
+        source is None or source.get("result") != "BLOCK"
+        or source.get("required_purposes") != ["final_g5"]
+        or source.get("subject_fingerprint") != wave.get("source_candidate_fingerprint")
+        or source.get("created_revision", -1) >= qualification.get("created_revision", -1)
+    ):
+        return False, "source BLOCK qualification is not an earlier exact final-G5 record"
+    if (
+        qualification.get("result") != "PASS"
+        or qualification.get("required_purposes") != ["final_g5"]
+        or qualification.get("subject_fingerprint") != repaired_fingerprint
+        or repaired_fingerprint == wave.get("source_candidate_fingerprint")
+        or qualification.get("created_revision", -1) <= wave.get("created_revision", -1)
+    ):
+        return False, "repair wave lacks a fresh PASS final-G5 qualification for a new candidate"
+    try:
+        current_intent = current_intent_binding(state)["revision"]
+    except (LedgerError, KeyError, TypeError):
+        return False, "repair wave has no verifiable current intent binding"
+    if qualification.get("intent_revision") != current_intent:
+        return False, "repair wave final-G5 qualification is stale for the current intent"
+
+    reviews = {item.get("id"): item for item in state.get("reviews", [])}
+    attempts = {item.get("id"): item for item in state.get("attempts", [])}
+    accepted = [reviews.get(ref) for ref in qualification.get("accepted_review_refs", [])]
+    if not accepted or any(
+        review is None or review.get("accepted") is not True or review.get("purpose") != "final_g5"
+        or review.get("verdict") != "PASS" or review.get("invalidated_by")
+        or attempts.get(review.get("attempt_ref"), {}).get("epoch") != state.get("owner", {}).get("epoch")
+        or attempts.get(review.get("attempt_ref"), {}).get("state") != "RETURNED"
+        or attempts.get(review.get("attempt_ref"), {}).get("lease", {}).get("state") != "released"
+        for review in accepted
+    ):
+        return False, "repair wave final-G5 qualification contains stale or nonterminal review evidence"
+
+    if any(item.get("state") in ("PREPARED", "DISPATCHED") for item in state.get("attempts", [])):
+        return False, "repair wave cannot close while an attempt is in flight"
+    if any(item.get("lease", {}).get("state") in ("active", "quarantined") for item in state.get("attempts", [])):
+        return False, "repair wave cannot close with an active or quarantined reservation"
+    if any(effect_is_unresolved(item) for item in state.get("operations", [])):
+        return False, "repair wave cannot close with an unresolved durable effect"
+
+    projection = finding_obligation_projection(state)
+    status_by_finding = {item.get("finding_ref"): item.get("status") for item in projection.get("items", [])}
+    finding_refs = wave.get("finding_refs", [])
+    if not finding_refs or any(status_by_finding.get(ref) not in ("resolved", "superseded") for ref in finding_refs):
+        return False, "repair wave findings are not all resolved or superseded"
+
+    ticket_refs = sorted({
+        ticket_ref
+        for finding_ref in finding_refs
+        for ticket_ref in effective_finding_ticket_refs(state, finding_ref)
+    })
+    if not ticket_refs:
+        return False, "repair wave has no exact ticket aggregate"
+    tickets = {item.get("id"): item for item in state.get("tickets", [])}
+    candidates = {item.get("id"): item for item in state.get("candidates", [])}
+    for ticket_ref in ticket_refs:
+        ticket = tickets.get(ticket_ref)
+        candidate = candidates.get((ticket or {}).get("current_candidate"))
+        if (
+            ticket is None or ticket.get("state") != "INTEGRATED" or candidate is None
+            or candidate.get("ticket_ref") != ticket_ref or candidate.get("quality") != "DONE"
+            or candidate.get("integration_status") != "INTEGRATED"
+            or candidate.get("invalidated_by") or candidate.get("superseded_by")
+        ):
+            return False, f"repair wave ticket {ticket_ref} lacks a current integrated repaired candidate"
+        ticket_qualification = qualifications.get(candidate.get("qualification_ref"))
+        if (
+            ticket_qualification is None or ticket_qualification.get("result") != "PASS"
+            or ticket_qualification.get("required_purposes") != required_review_purposes(ticket, "ticket_review")
+            or ticket_qualification.get("subject_ref") != ticket_ref
+            or ticket_qualification.get("subject_fingerprint") != candidate.get("sha")
+            or ticket_qualification.get("created_revision", -1) <= wave.get("created_revision", -1)
+            or ticket_qualification.get("intent_revision") != current_intent
+        ):
+            return False, f"repair wave ticket {ticket_ref} lacks a fresh current candidate qualification"
+        ticket_reviews = [reviews.get(ref) for ref in ticket_qualification.get("accepted_review_refs", [])]
+        if not ticket_reviews or any(
+            review is None or review.get("accepted") is not True or review.get("verdict") != "PASS"
+            or review.get("purpose") not in ticket_qualification.get("required_purposes", [])
+            or review.get("subject_fingerprint") != candidate.get("sha") or review.get("invalidated_by")
+            or review.get("intent_revision") != current_intent
+            or attempts.get(review.get("attempt_ref"), {}).get("epoch") != state.get("owner", {}).get("epoch")
+            or attempts.get(review.get("attempt_ref"), {}).get("state") != "RETURNED"
+            or attempts.get(review.get("attempt_ref"), {}).get("lease", {}).get("state") != "released"
+            or attempts.get(review.get("attempt_ref"), {}).get("return_ref") != review.get("return_ref")
+            for review in ticket_reviews
+        ):
+            return False, f"repair wave ticket {ticket_ref} qualification contains stale review evidence"
+    return True, ""
+
+
 def _validate_review05_reconciliation(
     state: dict[str, Any], source_raw: bytes, manifest: dict[str, Any],
     payload_loader: Callable[[str, str], tuple[dict[str, Any], bytes]],
@@ -5130,13 +5406,14 @@ def append_review_findings(state: dict[str, Any], payload: dict[str, Any], sourc
 
 
 def base_state(control_root: Path, run_id: str, repo_root: Path, token: str) -> dict[str, Any]:
+    repo_identity = repository_identity(repo_root)
     state = {
         "schema_version": SCHEMA_VERSION, "run_id": run_id, "revision": 0, "previous_publication_hash": None,
         "updated_at": now(), "skill_version": SKILL_VERSION, "policy_version": POLICY_VERSION,
         "candidate_model_version": "1.1", "candidates": [],
         "review_model_version": "1.1", "review_qualifications": [], "repair_waves": [], "acceptance": [],
         "runtime_provenance": {"creation_skill_version": SKILL_VERSION, "current_schema_version": SCHEMA_VERSION, "last_mutating_skill_version": SKILL_VERSION, "compatibility_floor": COMPATIBILITY_FLOOR, "state_contract_version": STATE_CONTRACT_VERSION, "minimum_writer_version": WRITER_VERSION, "applied_migrations": []},
-        "repository": {"control_root": str(control_root), "execution_root": str(repo_root), "common_dir": "", "initial_head": None, "branch": "", "checkout": str(repo_root), "inventory_ref": None, "instruction_refs": []},
+        "repository": {"control_root": str(control_root), "execution_root": str(repo_root), "common_dir": repo_identity["common_dir"], "initial_head": None, "branch": "", "checkout": str(repo_root), "inventory_ref": None, "instruction_refs": []},
         "owner": {"token": token, "epoch": 0, "observed_session": None, "handoff_ref": None, "attestation_ref": None},
         "run_settings": dict(DEFAULT_RUN_SETTINGS),
         "usage": default_usage(),
@@ -5148,10 +5425,16 @@ def base_state(control_root: Path, run_id: str, repo_root: Path, token: str) -> 
 
 def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
-    if not Path(args.repo_root).exists():
-        fail("execution root does not exist")
-    with Lock(p["lock"]):
+    execution_root = safe_root(args.repo_root, "execution root")
+    regular_directory(execution_root, "execution root")
+    identity = repository_identity(execution_root)
+    registry = repository_owner_paths(execution_root, identity)
+    state = base_state(p["root"], args.run_id, execution_root, args.owner_token)
+    state["run_settings"] = run_settings_from_args(args.request, args.interaction_mode, args.depth)
+    validate_ledger(state, verify_files=False)
+    with acquire_locks(Path(registry["lock"]), p["lock"]):
         if p["ledger"].exists():
+            claim_repository_owner(registry, p)
             fail("run already exists; use status/resume/recover instead of overwrite")
         runs_root = p["base"] / "runs"
         if runs_root.exists():
@@ -5161,13 +5444,267 @@ def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
                     continue
                 other_state = read_json(other_ledger, "existing run ledger")
                 validate_ledger(other_state)
-                if other_state["lifecycle"]["control"] not in ("ACCEPTED", "FAILED", "CANCELLED"):
-                    fail(f"another nonterminal run owns this repository: {other.name}")
-        p["run"].mkdir(parents=True, exist_ok=False)
-        state = base_state(p["root"], args.run_id, safe_root(args.repo_root, "execution root"), args.owner_token)
-        state["run_settings"] = run_settings_from_args(args.request, args.interaction_mode, args.depth)
+                if other_state["lifecycle"]["control"] not in TERMINAL_CONTROLS:
+                    fail(f"another nonterminal run owns this control namespace: {other.name}")
+        pending_resume = claim_repository_owner(registry, p)
+        if p["run"].exists():
+            regular_directory(p["run"], "run namespace")
+            contents = list(p["run"].iterdir())
+            if contents and not pending_resume:
+                fail("run namespace already contains data without a canonical ledger")
+            if contents:
+                fail("interrupted pending run namespace requires read-only recovery")
+        else:
+            p["run"].mkdir(parents=True, exist_ok=False)
         validate_ledger(state)
         atomic_write(p["ledger"], canonical_bytes(state))
+        activate_repository_owner(registry, p)
+        result = copy.deepcopy(state)
+        result["display"] = run_settings_display(state["run_settings"])
+        return result
+
+
+def _content_addressed_bytes(p: dict[str, Path], ref: str, label: str) -> bytes:
+    match = re.fullmatch(r"objects/([0-9a-f]{64})", ref)
+    if match is None:
+        fail(f"{label} must use an exact content-addressed object ref")
+    regular_directory(p["objects"], f"{label} object namespace")
+    path = p["objects"] / match.group(1)
+    regular_non_symlink(path)
+    raw = path.read_bytes()
+    if sha256_bytes(raw) != match.group(1):
+        fail(f"{label} object hash mismatch")
+    return raw
+
+
+def validate_successor_manifest(
+    manifest: dict[str, Any], predecessor: dict[str, Any], predecessor_raw: bytes,
+    predecessor_paths: dict[str, Path], expected_identity_key: str,
+) -> None:
+    """Verify all successor provenance against one exact terminal predecessor publication."""
+    root = schema()
+    validate(manifest, root["$defs"]["successor_manifest"], root, "$.successor_manifest")
+    source = manifest["predecessor"]
+    required_exclusions = {"attempts", "live_reservations", "repair_authorizations", "current_pointers"}
+    if set(manifest.get("exclusions", [])) != required_exclusions:
+        fail("successor manifest must explicitly exclude attempts, live reservations, repair authorizations, and current pointers")
+    pred_identity = repository_identity(predecessor.get("repository", {}).get("execution_root", ""))
+    if pred_identity["key"] != expected_identity_key:
+        fail("successor and predecessor do not identify the same repository/common-dir")
+    terminal_error = terminal_owner_verification_error(predecessor)
+    if terminal_error:
+        fail(f"successor predecessor is not exactly terminal and quiescent: {terminal_error}")
+    if source["control_root"] != predecessor["repository"]["control_root"]:
+        fail("successor manifest control root does not match the terminal predecessor")
+    if source["run_id"] != predecessor["run_id"] or source["revision"] != predecessor["revision"]:
+        fail("successor manifest run/revision does not match the terminal predecessor")
+    if source["terminal_control"] != predecessor["lifecycle"]["control"] or source["terminal_control"] not in TERMINAL_CONTROLS:
+        fail("successor manifest does not bind a terminal predecessor control state")
+    if source["ledger_sha256"] != sha256_bytes(predecessor_raw):
+        fail("successor manifest ledger hash does not match exact predecessor bytes")
+    if canonical_bytes(predecessor) != predecessor_raw:
+        fail("successor predecessor ledger bytes are not the exact canonical publication")
+
+    decisions = {item.get("id"): item for item in predecessor.get("decisions", [])}
+    qualifications = {item.get("id"): item for item in predecessor.get("review_qualifications", [])}
+    seen_evidence: set[tuple[str, str]] = set()
+    evidence_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for evidence in manifest["accepted_evidence"]:
+        key = (evidence["kind"], evidence["ref"])
+        if key in seen_evidence:
+            fail("successor manifest repeats accepted carry-forward evidence")
+        seen_evidence.add(key)
+        if evidence["kind"] == "accepted_decision":
+            record = decisions.get(evidence["ref"])
+            if (
+                record is None or record.get("status") != "accepted"
+                or record.get("invalidated_by") or record.get("revoked_by")
+                or record.get("type") in ("repair_authorization", "continuation_candidate_authorization")
+            ):
+                fail(f"successor evidence is not an accepted durable decision: {evidence['ref']}")
+            expected_hash = sha256_bytes(canonical_bytes(record))
+        else:
+            record = qualifications.get(evidence["ref"])
+            if record is None or record.get("result") != "PASS":
+                fail(f"successor evidence is not an accepted PASS qualification: {evidence['ref']}")
+            reviews = {item.get("id"): item for item in predecessor.get("reviews", [])}
+            attempts = {item.get("id"): item for item in predecessor.get("attempts", [])}
+            accepted_reviews = [reviews.get(ref) for ref in record.get("accepted_review_refs", [])]
+            if any(
+                review is None or review.get("accepted") is not True or review.get("verdict") != "PASS"
+                or review.get("invalidated_by")
+                or attempts.get(review.get("attempt_ref"), {}).get("epoch") != predecessor.get("owner", {}).get("epoch")
+                or attempts.get(review.get("attempt_ref"), {}).get("state") != "RETURNED"
+                or attempts.get(review.get("attempt_ref"), {}).get("lease", {}).get("state") != "released"
+                for review in accepted_reviews
+            ):
+                fail(f"successor qualification contains stale or non-PASS accepted review evidence: {evidence['ref']}")
+            expected_hash = sha256_bytes(canonical_bytes(record))
+        if evidence["sha256"] != expected_hash:
+            fail(f"successor accepted evidence hash mismatch: {evidence['ref']}")
+        if evidence.get("subject_sha") is not None and evidence.get("subject_sha") != record.get("subject_fingerprint"):
+            fail(f"successor accepted evidence subject hash mismatch: {evidence['ref']}")
+        evidence_by_key[key] = evidence
+
+    scope = manifest["scope_decision"]
+    scope_record = decisions.get(scope["ref"])
+    scope_entry = evidence_by_key.get(("accepted_decision", scope["ref"]))
+    if (
+        scope_record is None or scope_record.get("type") not in ("scope_decision", "user_scope")
+        or scope_record.get("status") != "accepted" or scope_record.get("invalidated_by")
+        or sha256_bytes(canonical_bytes(scope_record)) != scope["sha256"]
+        or scope_entry is None or scope_entry.get("sha256") != scope["sha256"]
+    ):
+        fail("successor requires an exact accepted scope decision from the predecessor")
+
+    candidate_descriptor = manifest["candidate"]
+    if candidate_descriptor.get("candidate_ref") is None:
+        if any(candidate_descriptor.get(key) is not None for key in ("commit_sha", "tree_sha", "proof_ref", "proof_hash")):
+            fail("absent successor candidate must not carry partial commit/tree/proof identity")
+        if not manifest["unknowns"]:
+            fail("absent predecessor candidate must be recorded as an explicit unknown")
+    else:
+        candidate = next((item for item in predecessor.get("candidates", []) if item.get("id") == candidate_descriptor["candidate_ref"]), None)
+        ticket = next((item for item in predecessor.get("tickets", []) if candidate and item.get("id") == candidate.get("ticket_ref")), None)
+        if (
+            candidate is None or ticket is None or ticket.get("current_candidate") != candidate["id"]
+            or candidate.get("quality") != "DONE" or candidate.get("integration_status") != "INTEGRATED"
+            or candidate.get("invalidated_by") or candidate.get("superseded_by")
+            or candidate.get("sha") != candidate_descriptor.get("commit_sha")
+            or candidate.get("tree_sha") != candidate_descriptor.get("tree_sha")
+            or candidate.get("proof_ref") != candidate_descriptor.get("proof_ref")
+            or candidate.get("proof_ref") is None
+        ):
+            fail("successor candidate is not the exact current, integrated, proof-carrying predecessor candidate")
+        proof_raw = _content_addressed_bytes(predecessor_paths, candidate_descriptor["proof_ref"], "successor candidate proof")
+        if sha256_bytes(proof_raw) != candidate_descriptor.get("proof_hash"):
+            fail("successor candidate proof hash mismatch")
+        proof = verify_verified_candidate_proof(predecessor_paths, candidate_descriptor["proof_ref"])
+        if (
+            proof.get("candidate_sha") != candidate["sha"]
+            or proof.get("candidate_tree_sha") != candidate["tree_sha"]
+            or proof.get("ticket_id") != candidate.get("ticket_ref")
+            or proof.get("run_id") != predecessor.get("run_id")
+        ):
+            fail("successor candidate proof does not bind its exact predecessor candidate")
+        if not any(
+            item["kind"] == "accepted_qualification"
+            and item["ref"] == candidate.get("qualification_ref")
+            and item.get("subject_sha") == candidate["sha"]
+            for item in manifest["accepted_evidence"]
+        ):
+            fail("successor candidate requires accepted qualification evidence on that exact commit")
+        candidate_qualification = qualifications.get(candidate.get("qualification_ref"))
+        if (
+            candidate_qualification is None
+            or candidate_qualification.get("subject_ref") != candidate.get("ticket_ref")
+            or candidate_qualification.get("subject_fingerprint") != candidate.get("sha")
+            or candidate_qualification.get("result") != "PASS"
+            or "ticket_review" not in candidate_qualification.get("required_purposes", [])
+        ):
+            fail("successor candidate qualification is not its exact current ticket qualification")
+
+    seen_resources: set[str] = set()
+    for resource in manifest["resources"]:
+        if resource["ref"] in seen_resources:
+            fail("successor manifest repeats a resource ref")
+        seen_resources.add(resource["ref"])
+        if resource["availability"] != "available":
+            if resource["sha256"] is not None:
+                fail("missing or unknown successor resources cannot claim a content hash")
+            continue
+        if resource["ref"].startswith("objects/"):
+            resource_raw = _content_addressed_bytes(predecessor_paths, resource["ref"], "successor resource")
+        else:
+            resource_path = Path(resource["ref"]).expanduser()
+            if resource_path.is_symlink() or not resource_path.is_absolute():
+                fail("available successor resource must be an absolute regular non-symlink path or an immutable object ref")
+            regular_non_symlink(resource_path)
+            resource_raw = resource_path.read_bytes()
+        if sha256_bytes(resource_raw) != resource["sha256"]:
+            fail(f"successor resource hash mismatch: {resource['ref']}")
+
+
+def _check_init_namespace(p: dict[str, Path], run_id: str) -> None:
+    if p["ledger"].exists():
+        fail("run already exists; use status/resume/recover instead of overwrite")
+    runs_root = p["base"] / "runs"
+    if not runs_root.exists():
+        return
+    for other in sorted(runs_root.iterdir()):
+        other_ledger = other / "ledger.json"
+        if not other_ledger.exists() or other.name == run_id:
+            continue
+        other_state = read_json(other_ledger, "existing run ledger")
+        validate_ledger(other_state)
+        if other_state["lifecycle"]["control"] not in TERMINAL_CONTROLS:
+            fail(f"another nonterminal run owns this control namespace: {other.name}")
+
+
+def cmd_init_successor(args: argparse.Namespace) -> dict[str, Any]:
+    p = paths(args.control_root, args.run_id)
+    predecessor_manifest, _manifest_input_raw = _read_manifest(args.manifest, "successor manifest")
+    root = schema()
+    validate(predecessor_manifest, root["$defs"]["successor_manifest"], root, "$.successor_manifest")
+    source = predecessor_manifest["predecessor"]
+    predecessor_control = safe_root(source["control_root"], "predecessor control root")
+    predecessor_paths = paths(predecessor_control, source["run_id"])
+    execution_root = safe_root(args.repo_root, "execution root")
+    regular_directory(execution_root, "execution root")
+    identity = repository_identity(execution_root)
+    registry = repository_owner_paths(execution_root, identity)
+    if not args.owner_token or args.owner_token == args.predecessor_owner_token:
+        fail("successor requires a fresh owner token distinct from the predecessor owner")
+    if (predecessor_control == p["root"] and source["run_id"] == args.run_id) or predecessor_paths["ledger"] == p["ledger"]:
+        fail("successor must use a fresh run namespace")
+
+    with acquire_locks(Path(registry["lock"]), p["lock"], predecessor_paths["lock"]):
+        predecessor, predecessor_raw = load_state(predecessor_paths)
+        if predecessor.get("owner", {}).get("token") != args.predecessor_owner_token:
+            fail("predecessor owner token mismatch")
+        validate_successor_manifest(predecessor_manifest, predecessor, predecessor_raw, predecessor_paths, str(registry["identity_key"]))
+        state = base_state(p["root"], args.run_id, execution_root, args.owner_token)
+        state["run_settings"] = run_settings_from_args(args.request, args.interaction_mode, args.depth)
+        manifest_raw = canonical_bytes(predecessor_manifest)
+        manifest_hash = sha256_bytes(manifest_raw)
+        state["successor_manifest"] = {
+            "manifest_ref": f"objects/{manifest_hash}", "manifest_hash": manifest_hash,
+            "manifest": predecessor_manifest,
+        }
+        validate_ledger(state, verify_files=False)
+        if p["ledger"].exists():
+            existing, existing_raw = load_state(p)
+            expected = copy.deepcopy(state)
+            expected["updated_at"] = existing.get("updated_at")
+            if canonical_bytes(existing) != existing_raw or canonical_bytes(existing) != canonical_bytes(expected):
+                fail("existing successor publication is not the exact fresh initialization for this manifest")
+            claim_repository_owner(registry, p)
+            result = copy.deepcopy(existing)
+            result["display"] = run_settings_display(existing["run_settings"])
+            return result
+        _check_init_namespace(p, args.run_id)
+        pending_resume = claim_repository_owner(registry, p)
+        if p["run"].exists():
+            regular_directory(p["run"], "run namespace")
+            contents = list(p["run"].iterdir())
+            if contents and not pending_resume:
+                fail("run namespace already contains data without a canonical ledger")
+            if contents:
+                objects = p["objects"]
+                expected_object = objects / manifest_hash
+                if (
+                    contents != [objects] or objects.is_symlink() or not objects.is_dir()
+                    or [item for item in objects.iterdir()] != [expected_object]
+                    or expected_object.is_symlink() or not expected_object.is_file()
+                    or expected_object.read_bytes() != manifest_raw
+                ):
+                    fail("interrupted successor namespace contains data outside its exact pending manifest")
+        else:
+            p["run"].mkdir(parents=True, exist_ok=False)
+        object_store(p, manifest_raw)
+        validate_ledger(state)
+        atomic_write(p["ledger"], canonical_bytes(state))
+        activate_repository_owner(registry, p)
         result = copy.deepcopy(state)
         result["display"] = run_settings_display(state["run_settings"])
         return result
@@ -9612,13 +10149,12 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
             if any(effect_is_unresolved(item) for item in next_state.get("operations", [])):
                 fail("final G5 is blocked by an unresolved durable effect")
             open_waves = [item for item in next_state.get("repair_waves", []) if item.get("state") == "OPEN"]
-            projection = finding_obligation_projection(next_state)
-            status_by_finding = {item.get("finding_ref"): item.get("status") for item in projection.get("items", [])}
             for wave in open_waves:
-                if wave.get("source_candidate_fingerprint") == attempt.get("candidate_sha"):
-                    fail("G5 repair wave requires a fresh repaired candidate before final re-review")
-                if any(status_by_finding.get(ref) not in ("resolved", "superseded") for ref in wave.get("finding_refs", [])):
-                    fail("G5 repair wave findings are not fully resolved on the fresh candidate")
+                ready, reason = repair_wave_close_readiness(
+                    next_state, wave, qualification, attempt.get("candidate_sha") or "",
+                )
+                if not ready:
+                    fail(f"G5 repair wave aggregate is not ready to close: {reason}")
                 wave["state"] = "CLOSED"
                 wave["repaired_candidate_fingerprint"] = attempt.get("candidate_sha")
                 wave["final_g5_qualification_ref"] = qualification["id"]
@@ -10877,6 +11413,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Codex Autopilot deterministic ledger/contract helper")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init"); init.add_argument("--control-root", required=True); init.add_argument("--repo-root", required=True); init.add_argument("--run-id", required=True); init.add_argument("--owner-token", required=True); init.add_argument("--request", default=None, help="optional natural-language request used to resolve run presets"); init.add_argument("--interaction-mode", choices=["semi", "full"], default=None); init.add_argument("--depth", choices=["normal", "deep"], default=None)
+    init_successor = sub.add_parser("init-successor", help="initialize a fresh run from exact accepted predecessor evidence"); init_successor.add_argument("--control-root", required=True); init_successor.add_argument("--repo-root", required=True); init_successor.add_argument("--run-id", required=True); init_successor.add_argument("--owner-token", required=True); init_successor.add_argument("--predecessor-owner-token", required=True); init_successor.add_argument("--manifest", required=True); init_successor.add_argument("--request", default=None); init_successor.add_argument("--interaction-mode", choices=["semi", "full"], default=None); init_successor.add_argument("--depth", choices=["normal", "deep"], default=None)
     status = sub.add_parser("status"); status.add_argument("--control-root", required=True); status.add_argument("--run-id", required=True); status.add_argument("--brief", action="store_true")
     diagnose = sub.add_parser("diagnose"); diagnose.add_argument("--control-root", required=True); diagnose.add_argument("--run-id", required=True)
     legacy_diagnose = sub.add_parser("diagnose-legacy", help="read-only structural analysis of a standalone ledger file"); legacy_diagnose.add_argument("--file", required=True)
@@ -10926,6 +11463,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "init": result = cmd_init(args)
+        elif args.command == "init-successor": result = cmd_init_successor(args)
         elif args.command == "status": result = cmd_status(args)
         elif args.command == "diagnose": result = cmd_diagnose(args)
         elif args.command == "diagnose-legacy": result = cmd_diagnose_legacy(args)
