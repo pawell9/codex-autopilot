@@ -95,13 +95,88 @@ class DesignPublicationTests(unittest.TestCase):
             packet = self.review_packet(root, control, "A-plan", "plan", source_revision=5)
             self.prepare_review(control, packet, "A-plan", "plan", 5); self.finish_review(root, control, "A-plan", 6)
             state, _ = ledger.load_state(paths)
-            run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "ACTIVE", "--next-action", "g2_pass")
+            run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "ACTIVE", "--gate-id", "G2", "--next-action", "g2_pass")
             state, _ = ledger.load_state(paths)
-            run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "PLAN", "--control", "ACTIVE", "--next-action", "g3_pass")
+            run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "PLAN", "--control", "ACTIVE", "--gate-id", "G3", "--next-action", "g3_pass")
             final, _ = ledger.load_state(paths)
             self.assertEqual("PLAN", final["lifecycle"]["phase"])
             self.assertEqual({"coverage", "plan"}, {item["review_kind"] for item in final["reviews"]})
             self.assertTrue(all(item["reviewer_identity"] and item["reviewer_role"] for item in final["reviews"]))
+
+    def test_gate_id_is_explicit_and_next_action_text_cannot_claim_g3(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, _, _ = self.setup_g1(root)
+            self.publish(control, self.bundle(root, control))
+            self.prepare_review(
+                control, self.review_packet(root, control, "A-coverage-only", "coverage", source_revision=3),
+                "A-coverage-only", "coverage", 3,
+            )
+            self.finish_review(root, control, "A-coverage-only", 4)
+            state, raw_before = ledger.load_state(ledger.paths(control, "design-run"))
+            self.assertFalse(ledger.design_review_pass(state, "plan"))
+
+            guessed = run(
+                "gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a",
+                "--revision", str(state["revision"]), "--phase", "PLAN", "--control", "ACTIVE",
+                "--next-action", "G3 plan PASS (untrusted descriptive text)", expect=2,
+            )
+            self.assertRegex(guessed.stderr.lower(), r"gate.?id|explicit")
+            unchanged, raw_after_guess = ledger.load_state(ledger.paths(control, "design-run"))
+            self.assertEqual(state["revision"], unchanged["revision"])
+            self.assertEqual(raw_before, raw_after_guess)
+
+            rejected_g3 = run(
+                "gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a",
+                "--revision", str(state["revision"]), "--phase", "PLAN", "--control", "ACTIVE",
+                "--gate-id", "G3", "--next-action", "ordinary inspection text", expect=2,
+            )
+            self.assertIn("G3", rejected_g3.stderr)
+            self.assertIn("plan", rejected_g3.stderr.lower())
+            unchanged, raw_after_rejection = ledger.load_state(ledger.paths(control, "design-run"))
+            self.assertEqual(state["revision"], unchanged["revision"])
+            self.assertEqual(raw_before, raw_after_rejection)
+
+    def test_blocked_design_to_plan_requires_g3_but_same_phase_recovery_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control, _, _ = self.setup_g1(root)
+            paths = ledger.paths(control, "design-run")
+            state, raw_before = ledger.load_state(paths)
+            self.assertEqual("DESIGN", state["lifecycle"]["phase"])
+            self.assertEqual("BLOCKED", state["lifecycle"]["control"])
+
+            guessed = run(
+                "gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a",
+                "--revision", str(state["revision"]), "--phase", "PLAN", "--control", "ACTIVE",
+                "--next-action", "G3 coverage and plan PASS", expect=2,
+            )
+            self.assertRegex(guessed.stderr.lower(), r"gate.?id|explicit|g3")
+            unchanged, raw_after = ledger.load_state(paths)
+            self.assertEqual(state["revision"], unchanged["revision"])
+            self.assertEqual(raw_before, raw_after)
+
+            explicit_without_evidence = run(
+                "gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a",
+                "--revision", str(state["revision"]), "--phase", "PLAN", "--control", "ACTIVE",
+                "--gate-id", "G3", "--next-action", "ordinary descriptive text", expect=2,
+            )
+            self.assertRegex(explicit_without_evidence.stderr.lower(), r"publication|coverage|plan|pass|review|design bundle")
+            unchanged, raw_after = ledger.load_state(paths)
+            self.assertEqual(state["revision"], unchanged["revision"])
+            self.assertEqual(raw_before, raw_after)
+
+            # Resuming the blocked DESIGN phase is not a gate edge and must not
+            # require G2 or G3 evidence just to continue owner work.
+            recovered = run(
+                "gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a",
+                "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "ACTIVE",
+                "--next-action", "continue_design_recovery",
+            )
+            self.assertEqual("ACTIVE", json.loads(recovered.stdout)["control"])
+            final, _ = ledger.load_state(paths)
+            self.assertEqual("DESIGN", final["lifecycle"]["phase"])
+            self.assertEqual("ACTIVE", final["lifecycle"]["control"])
 
     def test_blocked_design_review_can_publish_revised_immutable_publication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -147,7 +222,7 @@ class DesignPublicationTests(unittest.TestCase):
             self.assertEqual("B-design-v3", state["design_publication"]["id"])
             self.assertTrue(ledger.design_review_pass(state, "coverage"))
             self.assertEqual(2, len({item["subject_fingerprint"] for item in state["reviews"]}))
-            run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "ACTIVE", "--next-action", "g2_pass")
+            run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "ACTIVE", "--gate-id", "G2", "--next-action", "g2_pass")
 
     def test_unverifiable_review_is_terminal_and_releases_lease(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -374,7 +449,7 @@ class DesignPublicationTests(unittest.TestCase):
             ticket["contract_refs"] = ["K-design"]  # Simulate a mixed bundle published by an older helper.
             ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
 
-            rejected = run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "ACTIVE", "--next-action", "g2_pass", expect=2)
+            rejected = run("gate", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--phase", "DESIGN", "--control", "ACTIVE", "--gate-id", "G2", "--next-action", "g2_pass", expect=2)
 
             self.assertIn("requires self-produced contract", rejected.stderr)
             unchanged, _ = ledger.load_state(paths)

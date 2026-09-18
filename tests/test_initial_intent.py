@@ -59,7 +59,8 @@ class InitialIntentTests(unittest.TestCase):
             self.assertEqual(1, published["revision"])
             self.assertEqual("INTENT", published["phase"])
             self.assertEqual("ACTIVE", published["control"])
-            self.assertEqual("g1_build", published["next_action"]["kind"])
+            self.assertEqual("complete_g1", published["next_action"]["kind"])
+            self.assertEqual("lifecycle.advance", published["next_action"]["event_id"])
 
             state, raw = ledger.load_state(paths)
             ledger.validate_ledger(state)
@@ -104,7 +105,8 @@ class InitialIntentTests(unittest.TestCase):
             self.assertEqual("intent-v2", final["intent"]["current_revision"])
             self.assertEqual(["AM-1"], final["intent"]["approved_amendments"])
             self.assertEqual("intent-v1", final["invalidations"][0]["previous_intent_revision"])
-            self.assertEqual("g1_recheck", final["lifecycle"]["next_action"]["kind"])
+            self.assertEqual("complete_g1", final["lifecycle"]["next_action"]["kind"])
+            self.assertEqual("lifecycle.advance", final["lifecycle"]["next_action"]["event_id"])
 
     def test_legacy_ledger_is_readable_but_requires_explicit_migration_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -196,7 +198,8 @@ class InitialIntentTests(unittest.TestCase):
             published = json.loads(self.publish(control, source, revision=1).stdout)
             self.assertEqual(2, published["revision"])
             self.assertEqual("RECOVERING", published["control"])
-            self.assertEqual("finish_recovery_then_g1", published["next_action"]["kind"])
+            self.assertEqual("reconcile_actual_state", published["next_action"]["kind"])
+            self.assertEqual("attempt.reconcile", published["next_action"]["event_id"])
             recovering, _ = ledger.load_state(paths)
             self.assertEqual("INTENT", recovering["lifecycle"]["phase"])
             self.assertEqual("RECOVERING", recovering["lifecycle"]["control"])
@@ -213,7 +216,8 @@ class InitialIntentTests(unittest.TestCase):
             )
             resumed, _ = ledger.load_state(paths)
             self.assertEqual("ACTIVE", resumed["lifecycle"]["control"])
-            self.assertEqual("g1_build", resumed["lifecycle"]["next_action"]["kind"])
+            self.assertEqual("complete_g1", resumed["lifecycle"]["next_action"]["kind"])
+            self.assertEqual("lifecycle.advance", resumed["lifecycle"]["next_action"]["event_id"])
 
     def test_same_byte_orphan_is_resumable_and_conflicting_orphan_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

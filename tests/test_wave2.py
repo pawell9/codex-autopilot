@@ -172,10 +172,32 @@ class Wave2Tests(unittest.TestCase):
 
     def test_repair_packet_requires_contract_and_rejects_same_signature(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); control, _ = self.init_run(root)
+            root = Path(directory); control, repo = self.init_run(root)
             paths = ledger.paths(control, "run-2")
             state, previous = ledger.load_state(paths)
-            state["findings"] = [{"id": "F-1", "axis": "correctness", "impact": "blocking", "claim": "fixture defect", "expected": "fixed", "actual": "broken", "evidence": "ev-1", "affected_refs": ["T-1"], "source_ref": "T-1"}]
+            producer_return = {
+                "identity": {"run_id": "run-2", "ticket_id": "T-1", "attempt_id": "A-CANDIDATE",
+                             "packet_hash": "2" * 64, "epoch": 0},
+                "status": "DONE", "result": "candidate-bound repair source fixture", "files": [],
+                "checks": [{"check_id": "oracle", "outcome": "pass", "actual": "fixture",
+                            "evidence_ref": "ev-candidate"}],
+                "criteria": [{"criterion_id": "C-1", "outcome": "satisfied",
+                              "evidence_refs": ["ev-candidate"]}],
+            }
+            producer_return_ref = "objects/" + ledger.object_store(paths, ledger.canonical_bytes(producer_return))
+            producer = {
+                "id": "A-CANDIDATE", "kind": "worker", "mode": "implement", "subject_ref": "T-1",
+                "packet_ref": "objects/" + "1" * 64, "packet_hash": "2" * 64, "epoch": 0,
+                "state": "RETURNED", "lease": {"id": "L-A-CANDIDATE", "state": "released", "zone": []},
+                "route_ref": "route-A-CANDIDATE", "checkout": str(repo), "base_sha": "3" * 40,
+                "candidate_sha": "4" * 40, "candidate_tree_sha": "5" * 40,
+                "return_ref": producer_return_ref, "finding_refs": [],
+            }
+            state.setdefault("candidates", [])
+            state.setdefault("attempts", []).append(producer)
+            ledger.publish_candidate_projection(state, state["tickets"][0], producer, quality="DONE")
+            state["tickets"][0]["current_worker_attempt"] = None
+            state["findings"] = [{"id": "F-1", "axis": "correctness", "impact": "blocking", "claim": "fixture defect", "expected": "fixed", "actual": "broken", "evidence": "ev-1", "affected_refs": ["T-1"], "source_ref": "A-CANDIDATE"}]
             state["tickets"][0]["state"] = "BLOCKED"
             state["lifecycle"]["control"] = "BLOCKED"
             state["revision"] = 1; state["previous_publication_hash"] = ledger.sha256_bytes(previous)

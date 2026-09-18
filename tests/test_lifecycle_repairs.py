@@ -29,13 +29,28 @@ class LifecycleRepairTests(unittest.TestCase):
         run("init", "--control-root", str(control), "--repo-root", str(repo), "--run-id", "repair-run", "--owner-token", "owner-a")
         paths = ledger.paths(control, "repair-run")
         state, previous = ledger.load_state(paths)
-        state["tickets"] = [{"id": "T-1", "goal_ref": "G-1", "criterion_refs": [], "contract_refs": [], "dependency_refs": [], "state": "READY", "complexity": "bounded", "risk": "routine", "zone": [{"path": "app.txt", "operations": [operation]}], "current_attempt": None, "replacement_refs": []}]
+        state["tickets"] = [{"id": "T-1", "goal_ref": "G-1", "criterion_refs": [], "contract_refs": [], "dependency_refs": [], "state": "READY", "complexity": "bounded", "risk": "routine", "zone": [{"path": "app.txt", "operations": [operation]}], "current_attempt": None, "current_worker_attempt": None, "last_worker_attempt": None, "current_candidate": None, "replacement_refs": []}]
         state["lifecycle"] = {"phase": "EXECUTE", "control": "ACTIVE", "reason": None, "issue_refs": [], "stop_target": None, "next_action": {"kind": "dispatch", "subject_refs": ["T-1"], "preconditions": [], "read_refs": []}}
         state["revision"] = 1
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
         return control, repo, paths
+
+    def publish_candidate_history(self, state: dict[str, object]) -> None:
+        """Project each seeded candidate producer in chronological order."""
+        for ticket in state.get("tickets", []):
+            worker_attempts = [
+                attempt for attempt in state.get("attempts", [])
+                if attempt.get("kind") == "worker" and attempt.get("subject_ref") == ticket.get("id")
+            ]
+            for attempt in worker_attempts:
+                if attempt.get("candidate_sha") and attempt.get("candidate_tree_sha"):
+                    ledger.publish_candidate_projection(state, ticket, attempt, quality="DONE")
+            latest_worker = worker_attempts[-1] if worker_attempts else None
+            ticket["current_attempt"] = latest_worker.get("id") if latest_worker else None
+            ticket["last_worker_attempt"] = latest_worker.get("id") if latest_worker else None
+            ticket["current_worker_attempt"] = None
 
     def worker_packet(self, root: Path, attempt_id: str, *, mode: str = "implement", base: str | None = None, path: str = "app.txt", operation: str = "modify", repair: dict[str, object] | None = None) -> Path:
         packet = {
@@ -81,11 +96,11 @@ class LifecycleRepairTests(unittest.TestCase):
         ]
         state["findings"] = [{"id": "F-1", "axis": "correctness", "impact": "blocking", "claim": "created file needs correction", "expected": "correct", "actual": "incorrect", "evidence": "EV-review", "affected_refs": ["T-1"], "source_ref": "A-review", "intent_revision": None, "repair_contract_ref": None, "invalidated_by": []}]
         state["tickets"][0]["state"] = "REVIEW"
-        state["tickets"][0]["current_attempt"] = "A-create"
         state["lifecycle"]["control"] = "BLOCKED"
         state["lifecycle"]["reason"] = "review_not_pass"
         state["revision"] = 2
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+        self.publish_candidate_history(state)
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
         repair = {"cause": "implementation", "finding_ref": "F-1", "hypothesis": "created content is wrong", "expected_proof": "regression observes corrected content", "stopping_condition": "stop after the focused regression passes", "causal_change": "replace the generated value"}
@@ -185,11 +200,11 @@ class LifecycleRepairTests(unittest.TestCase):
         state["findings"] = findings
         state["decisions"] = decisions
         state["tickets"][0]["state"] = "REVIEW"
-        state["tickets"][0]["current_attempt"] = prior_worker
         state["lifecycle"]["control"] = "BLOCKED"
         state["lifecycle"]["reason"] = "review_not_pass"
         state["revision"] = 2
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+        self.publish_candidate_history(state)
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
         next_index = completed_repairs + 1
@@ -263,10 +278,10 @@ class LifecycleRepairTests(unittest.TestCase):
         state["decisions"] = [{"id": "AUTH-1", "type": "repair_authorization", "status": "authorized", "decision": "REPAIR", "reason": repair["hypothesis"], "evidence_refs": ["F-1"], "affected_refs": ["T-1", "F-1"], "intent_revision": None, "invalidated_by": []}]
         state["issues"] = [{"id": "ISS-quarantine", "type": issue_type, "cause": "ownership", "impact": "blocking", "affected_refs": ["T-1", "A-repair"], "expected": "lease match", "actual": '[{"operation":"modify","path":"app.txt"}]', "disposition": "quarantine", "resolution_condition": "audited reconciliation", "owner": None, "failure_signature": None, "finding_ref": None, "source_ref": "A-repair", "intent_revision": None, "decision_ref": None, "invalidated_by": []}]
         state["tickets"][0]["state"] = "BLOCKED"
-        state["tickets"][0]["current_attempt"] = "A-repair"
         state["lifecycle"] = {"phase": "EXECUTE", "control": "BLOCKED", "reason": "worker_done", "issue_refs": ["ISS-quarantine"], "stop_target": None, "next_action": {"kind": "triage_or_repair", "subject_refs": ["A-repair"], "preconditions": [], "read_refs": []}}
         state["revision"] = 2
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+        self.publish_candidate_history(state)
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
         return control, repo, paths, baseline, candidate
@@ -313,10 +328,10 @@ class LifecycleRepairTests(unittest.TestCase):
         ]
         state["issues"] = [{"id": "ISS-blocked", "type": "scope_blocker", "cause": "ownership", "impact": "blocking", "affected_refs": ["T-1", "A-blocked"], "expected": "bounded repair", "actual": "scope too narrow", "disposition": "authorize changed scope", "resolution_condition": "fresh authorization", "owner": None, "failure_signature": None, "finding_ref": None, "source_ref": "A-blocked", "intent_revision": None, "invalidated_by": []}]
         state["tickets"][0]["state"] = "BLOCKED"
-        state["tickets"][0]["current_attempt"] = "A-blocked"
         state["lifecycle"] = {"phase": "EXECUTE", "control": "BLOCKED", "reason": "worker_blocked", "issue_refs": ["ISS-blocked"], "stop_target": None, "next_action": {"kind": "triage_or_repair", "subject_refs": ["A-blocked"], "preconditions": [], "read_refs": []}}
         state["revision"] = 2
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+        self.publish_candidate_history(state)
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
         return control, repo, paths, old_candidate, candidate
@@ -615,7 +630,7 @@ class LifecycleRepairTests(unittest.TestCase):
             ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
             packet = self.worker_packet(root, "A-foreign-ticket", mode="repair", base=candidate, repair=repair)
             rejected = self.dispatch(control, packet, "A-foreign-ticket", 3, expect=2)
-            self.assertIn("foreign", rejected.stderr)
+            self.assertIn("candidate has no exact same-ticket worker producer", rejected.stderr)
 
     def test_transitive_repair_rejects_missing_original_validated_create(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

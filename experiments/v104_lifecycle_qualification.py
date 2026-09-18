@@ -34,6 +34,7 @@ class Qualification:
         self.token = "owner-v104"
         self.expected_revision = 0
         self.events: list[dict[str, object]] = []
+        self.pending_finding_by_ticket: dict[str, str] = {}
         self.call_git("init", "-q")
         ledger.atomic_write(self.repo / "README.md", b"# synthetic\n")
         self.call_git("add", "README.md")
@@ -170,7 +171,7 @@ class Qualification:
         self.publish_bundle(3)
         self.design_review("coverage", "PASS", "v3")
         self.design_review("plan", "PASS", "v3")
-        self.mutate("g2-g3-to-plan", "gate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--phase", "PLAN", "--control", "ACTIVE", "--reason", "current_g2_g3_pass", "--next-action", "g3_pass")
+        self.mutate("g2-g3-to-plan", "gate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--phase", "PLAN", "--control", "ACTIVE", "--gate-id", "G3", "--reason", "current_g2_g3_pass", "--next-action", "g3_pass")
         self.mutate("plan-to-execute", "gate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--phase", "EXECUTE", "--control", "ACTIVE", "--reason", "execution_ready", "--next-action", "execute_tickets")
 
     def baseline(self, name: str) -> Path:
@@ -206,11 +207,18 @@ class Qualification:
         if not audit["pass"]:
             raise AssertionError(f"write audit failed: {audit}")
         operation_id = f"OP-{attempt_id}"
-        self.mutate(f"prepare-effect-{attempt_id}", "prepare-effect", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(self.repo), "--expected-before", base, "--authority-ref", "synthetic-run")
-        self.idempotent(f"prepare-effect-{attempt_id}-lost-response", "prepare-effect", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision - 1), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(self.repo), "--expected-before", base, "--authority-ref", "synthetic-run")
+        authority_ref = "synthetic-run"
+        if repair:
+            state, _ = self.state()
+            authorization = next((item for item in state.get("decisions", []) if item.get("type") == "repair_authorization" and item.get("status") == "authorized" and ticket_id in item.get("affected_refs", []) and repair.get("finding_ref") in item.get("affected_refs", [])), None)
+            if authorization is None:
+                raise AssertionError("repair candidate commit has no exact active authorization")
+            authority_ref = authorization["id"]
+        self.mutate(f"prepare-effect-{attempt_id}", "prepare-effect", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(self.repo), "--expected-before", base, "--authority-ref", authority_ref)
+        self.idempotent(f"prepare-effect-{attempt_id}-lost-response", "prepare-effect", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision - 1), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(self.repo), "--expected-before", base, "--authority-ref", authority_ref)
         self.call_git("add", filename); self.call_git("-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid", "commit", "-qm", f"candidate {attempt_id}")
         commit = self.call_git("rev-parse", "HEAD"); tree = self.call_git("rev-parse", "HEAD^{tree}")
-        receipt = self.root / f"{attempt_id}-receipt.json"; write_json(receipt, {"status": "PASS", "checkout": str(self.repo), "base_sha": base, "commit_sha": commit, "tree_sha": tree, "authority_ref": "synthetic-run", "receipt_ref": f"git:{commit}"})
+        receipt = self.root / f"{attempt_id}-receipt.json"; write_json(receipt, {"status": "PASS", "checkout": str(self.repo), "base_sha": base, "commit_sha": commit, "tree_sha": tree, "authority_ref": authority_ref, "receipt_ref": f"git:{commit}"})
         self.mutate(f"candidate-{attempt_id}", "candidate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--attempt-id", attempt_id, "--commit-receipt", str(receipt), "--operation-id", operation_id)
         self.idempotent(f"candidate-{attempt_id}-lost-response", "candidate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision - 1), "--attempt-id", attempt_id, "--commit-receipt", str(receipt), "--operation-id", operation_id)
         return commit
@@ -223,14 +231,25 @@ class Qualification:
         attempt = ledger.attempt_by_id(self.state()[0], review_attempt_id)
         outcome = "fulfilled" if verdict == "PASS" else "missing"
         payload = {"identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]}, "subject_fingerprint": worker["candidate_sha"], "verdict": verdict, "coverage": [{"criterion_id": criterion_id, "outcome": outcome, "evidence_refs": [f"EV-{review_attempt_id}"]}], "checks": [{"check_id": "correctness", "axis": "correctness", "outcome": "fulfilled" if verdict == "PASS" else "failed", "actual": verdict, "evidence_ref": f"EV-{review_attempt_id}"}], "context_refs": ["offline-independent"], "findings": [] if verdict == "PASS" else [{"axis": "correctness", "impact": "blocking", "claim": "candidate needs repair", "expected": "correct", "actual": "defect", "evidence": f"EV-{review_attempt_id}", "affected_refs": [ticket_id]}]}
+        finding_ref = self.pending_finding_by_ticket.get(ticket_id)
+        if verdict == "PASS" and finding_ref:
+            payload["finding_resolution"] = [{
+                "finding_ref": finding_ref,
+                "candidate_ref": f"candidate-{worker_attempt_id}",
+                "evidence_refs": [f"EV-{review_attempt_id}"],
+                "reason": "The fresh PASS review verifies the exact repaired finding on the current candidate.",
+            }]
         inbox = self.paths["scratch"] / review_attempt_id / "return.json"; write_json(inbox, payload)
         self.call("validate-return", "--control-root", str(self.control), "--run-id", self.run_id, "--attempt-id", review_attempt_id, "--return-file", str(inbox), "--kind", "review")
         if verdict != "PASS":
             self.mutate(f"ingest-{review_attempt_id}-block", "ingest-return", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--attempt-id", review_attempt_id, "--return-file", str(inbox), "--kind", "review")
             state, _ = self.state()
-            return next(item["id"] for item in reversed(state["issues"]) if item.get("type") == "review_verdict" and ticket_id in item.get("affected_refs", []))
+            finding = next(item for item in reversed(state["findings"]) if item.get("source_ref") == review_attempt_id and ticket_id in item.get("affected_refs", []))
+            self.pending_finding_by_ticket[ticket_id] = finding["id"]
+            return finding["id"]
         state, raw = self.state(); integrity = self.root / f"{review_attempt_id}-integrity.json"; write_json(integrity, {"status": "PASS", "candidate_fingerprint": worker["candidate_sha"], "ledger_hash": ledger.sha256_bytes(raw)})
         self.mutate(f"integrate-{review_attempt_id}", "integrate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--attempt-id", review_attempt_id, "--review-file", str(inbox), "--integrity-receipt", str(integrity), "--review-id", f"REV-{review_attempt_id}")
+        self.pending_finding_by_ticket.pop(ticket_id, None)
         return None
 
     def execute(self) -> tuple[str, str]:
@@ -243,9 +262,17 @@ class Qualification:
         self.mutate("authorize-t1-repair", "authorize-repair", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--ticket-id", ticket1, "--finding-ref", finding_ref, "--authorization-id", "AUTH-T1-1", "--repair-contract", str(repair_path))
         candidate1 = self.worker_candidate(ticket1, "C-1", "A-T1-2", "app-one.txt", "FIXED\n", repair=repair, ready=False)
         self.change_review(ticket1, "C-1", "A-T1-2", "A-T1-review-2", "PASS")
+        state, _ = self.state()
+        if ledger.open_ticket_finding_obligations(state, ticket1):
+            raise AssertionError(f"exact reviewed repair left the ticket obligation open: {ledger.open_ticket_finding_obligations(state, ticket1)}")
+        active_blockers = [item for item in state.get("issues", []) if item.get("impact") == "blocking" and not item.get("invalidated_by")]
+        if active_blockers:
+            raise AssertionError(f"exact reviewed repair left active blocker mirrors: {active_blockers}")
+        if state["lifecycle"]["control"] == "BLOCKED":
+            self.mutate("resume-after-repair", "gate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--phase", "EXECUTE", "--control", "ACTIVE", "--reason", "current_repair_obligation_resolved", "--next-action", "continue_execution")
         candidate2 = self.worker_candidate(ticket2, "C-2", "A-T2-1", "app-two.txt", "DONE\n")
         self.change_review(ticket2, "C-2", "A-T2-1", "A-T2-review-1", "PASS")
-        self.mutate("g4-to-verify", "gate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--phase", "VERIFY", "--control", "ACTIVE", "--reason", "g4_pass", "--next-action", "prepare_g5")
+        self.mutate("g4-to-verify", "gate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--phase", "VERIFY", "--control", "ACTIVE", "--gate-id", "G4", "--reason", "g4_pass", "--next-action", "prepare_g5")
         return candidate1, candidate2
 
     def accept(self, candidate: str) -> None:
@@ -272,7 +299,7 @@ class Qualification:
         return_path = inbox_root / "acceptance.json"; write_json(return_path, base_return)
         self.mutate("import-g5-pass", "import-manual", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--attempt-id", attempt_id, "--return-file", str(return_path), "--environment-receipt", str(env_path), "--context-receipt", str(context_path), "--integrity-receipt", str(integrity), "--intent-revision", "2", "--candidate-fingerprint", candidate, "--required-criteria", "C-1,C-2")
         self.idempotent("import-g5-pass-lost-response", "import-manual", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision - 1), "--attempt-id", attempt_id, "--return-file", str(return_path), "--environment-receipt", str(env_path), "--context-receipt", str(context_path), "--integrity-receipt", str(integrity), "--intent-revision", "2", "--candidate-fingerprint", candidate, "--required-criteria", "C-1,C-2")
-        self.mutate("g6-accepted", "gate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--phase", "ACCEPT", "--control", "ACCEPTED", "--reason", "g6_pass", "--next-action", "terminal_accepted")
+        self.mutate("g6-accepted", "gate", "--control-root", str(self.control), "--run-id", self.run_id, "--owner-token", self.token, "--revision", str(self.expected_revision), "--phase", "ACCEPT", "--control", "ACCEPTED", "--gate-id", "G6", "--reason", "g6_pass", "--next-action", "terminal_accepted")
 
     def run(self) -> dict[str, object]:
         self.bootstrap(); self.design_cycle(); _, final_candidate = self.execute(); self.accept(final_candidate)

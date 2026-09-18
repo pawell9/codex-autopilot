@@ -210,7 +210,7 @@ class Wave1Tests(unittest.TestCase):
         packet = ROOT / "experiments" / "fixtures" / "e03m" / "g5-bundle" / "packet.json"
         run("validate", "--file", str(packet), "--kind", "acceptance_packet")
 
-    def test_e03m_manual_import_roundtrip_remains_resumable(self) -> None:
+    def test_e03m_manual_import_stays_read_only_after_semantic_writer_adoption(self) -> None:
         source = ROOT / "experiments" / "fixtures" / "e03m" / "seed-repo"
         with tempfile.TemporaryDirectory() as directory:
             run_id = "e03m-manual-g5-2026-09-13"
@@ -270,15 +270,15 @@ class Wave1Tests(unittest.TestCase):
             self.assertIn("append-only migration", rejected.stderr)
             self.assertEqual(before, tree_bytes(legacy_copy))
 
-            # A separate disposable copy represents the result of an explicit,
-            # owner-authorized append-only semantic migration. This is only a
-            # test marker; the actual migration command is implemented later.
-            migrated_copy = Path(directory) / "migrated-seed-repo"
-            shutil.copytree(source, migrated_copy, symlinks=True)
-            migrated_paths = ledger.paths(migrated_copy, run_id)
-            migrated_state, prior_raw = ledger.load_state(migrated_paths)
+            # A semantic-writer-only adoption is still insufficient for this
+            # populated ledger: it has no Phase B candidate-model marker or
+            # projection migration. Do not fabricate Phase F migration state.
+            writer_only_copy = Path(directory) / "writer-only-seed-repo"
+            shutil.copytree(source, writer_only_copy, symlinks=True)
+            writer_only_paths = ledger.paths(writer_only_copy, run_id)
+            writer_only_state, prior_raw = ledger.load_state(writer_only_paths)
             marker = "semantic-contract-1.1-owner-approved-test"
-            migrated_revision = migrated_state["revision"] + 1
+            adopted_revision = writer_only_state["revision"] + 1
             manifest = {
                 "migration_id": marker,
                 "migration": "semantic-writer-floor",
@@ -289,9 +289,9 @@ class Wave1Tests(unittest.TestCase):
             }
             manifest_raw = ledger.canonical_bytes(manifest)
             manifest_hash = ledger.sha256_bytes(manifest_raw)
-            migrated_state["runtime_provenance"] = {
-                "creation_skill_version": migrated_state["skill_version"],
-                "current_schema_version": migrated_state["schema_version"],
+            writer_only_state["runtime_provenance"] = {
+                "creation_skill_version": writer_only_state["skill_version"],
+                "current_schema_version": writer_only_state["schema_version"],
                 "last_mutating_skill_version": ledger.WRITER_VERSION,
                 "compatibility_floor": ledger.COMPATIBILITY_FLOOR,
                 "state_contract_version": "1.1",
@@ -299,37 +299,37 @@ class Wave1Tests(unittest.TestCase):
                 "applied_migrations": [{
                     "id": marker,
                     "helper_version": ledger.WRITER_VERSION,
-                    "applied_revision": migrated_revision,
+                    "applied_revision": adopted_revision,
                     "manifest_hash": manifest_hash,
                     "object_ref": f"objects/{manifest_hash}",
                 }],
             }
-            migrated_state["revision"] = migrated_revision
-            migrated_state["previous_publication_hash"] = ledger.sha256_bytes(prior_raw)
-            migrated_state["updated_at"] = ledger.now()
-            migrated_paths["objects"].mkdir(parents=True, exist_ok=True)
-            ledger.atomic_write(migrated_paths["objects"] / manifest_hash, manifest_raw)
-            ledger.atomic_write(migrated_paths["prev"], prior_raw)
-            write_json(migrated_paths["ledger"], migrated_state)
+            writer_only_state["revision"] = adopted_revision
+            writer_only_state["previous_publication_hash"] = ledger.sha256_bytes(prior_raw)
+            writer_only_state["updated_at"] = ledger.now()
+            writer_only_paths["objects"].mkdir(parents=True, exist_ok=True)
+            ledger.atomic_write(writer_only_paths["objects"] / manifest_hash, manifest_raw)
+            ledger.atomic_write(writer_only_paths["prev"], prior_raw)
+            write_json(writer_only_paths["ledger"], writer_only_state)
 
-            migrated_state, migrated_raw = ledger.load_state(migrated_paths)
-            migrated_diagnostic = json.loads(run("diagnose", "--control-root", str(migrated_copy), "--run-id", run_id).stdout)
-            self.assertTrue(migrated_diagnostic["mutation_eligible"])
-            migrated_integrity = Path(directory) / "migrated-integrity.json"
-            write_json(migrated_integrity, {
+            writer_only_state, writer_only_raw = ledger.load_state(writer_only_paths)
+            writer_only_diagnostic = json.loads(run("diagnose", "--control-root", str(writer_only_copy), "--run-id", run_id).stdout)
+            self.assertTrue(writer_only_diagnostic["readable"])
+            self.assertFalse(writer_only_diagnostic["mutation_eligible"])
+            self.assertIn("Phase B candidate model", writer_only_diagnostic["reason"])
+            writer_only_integrity = Path(directory) / "writer-only-integrity.json"
+            write_json(writer_only_integrity, {
                 "status": "PASS",
-                "candidate_fingerprint": migrated_state["attempts"][0]["candidate_sha"],
-                "ledger_hash": ledger.sha256_bytes(migrated_raw),
+                "candidate_fingerprint": writer_only_state["attempts"][0]["candidate_sha"],
+                "ledger_hash": ledger.sha256_bytes(writer_only_raw),
             })
-            result = run(*import_args(migrated_copy, migrated_state, migrated_integrity))
-            self.assertIn('"imported": true', result.stdout)
-            final, _ = ledger.load_state(migrated_paths)
-            self.assertEqual("INTEGRATED", final["tickets"][0]["state"])
-            self.assertEqual("released", final["attempts"][0]["lease"]["state"])
-            repeated = run(*import_args(migrated_copy, final, migrated_integrity))
-            self.assertIn('"idempotent": true', repeated.stdout)
-            repeated_state, _ = ledger.load_state(migrated_paths)
-            self.assertEqual(final["revision"], repeated_state["revision"])
+            writer_only_before = tree_bytes(writer_only_copy)
+            rejected_writer_only = run(
+                *import_args(writer_only_copy, writer_only_state, writer_only_integrity), expect=2,
+            )
+            self.assertIn("mutation is read-only", rejected_writer_only.stderr)
+            self.assertIn("Phase B candidate model", rejected_writer_only.stderr)
+            self.assertEqual(writer_only_before, tree_bytes(writer_only_copy))
 
 
 if __name__ == "__main__":

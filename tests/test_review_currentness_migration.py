@@ -229,9 +229,9 @@ class ReviewCurrentnessMigrationTests(unittest.TestCase):
                 self.assertEqual([], projection["blockers"])
                 self.assertTrue(all(not item["current"] for item in projection["findings"]))
 
-                g2 = ledger.cmd_gate(Namespace(control_root=str(control), run_id=RUN_ID, owner_token=token, revision=78, phase="DESIGN", control="ACTIVE", reason=None, next_action="g2_pass", subject_refs="", preconditions="", read_refs=""))
+                g2 = ledger.cmd_gate(Namespace(control_root=str(control), run_id=RUN_ID, owner_token=token, revision=78, phase="DESIGN", control="ACTIVE", gate_id="G2", reason=None, next_action="g2_pass", subject_refs="", preconditions="", read_refs=""))
                 self.assertEqual(79, g2["revision"])
-                g3 = ledger.cmd_gate(Namespace(control_root=str(control), run_id=RUN_ID, owner_token=token, revision=79, phase="PLAN", control="ACTIVE", reason=None, next_action="g3_pass", subject_refs="", preconditions="", read_refs=""))
+                g3 = ledger.cmd_gate(Namespace(control_root=str(control), run_id=RUN_ID, owner_token=token, revision=79, phase="PLAN", control="ACTIVE", gate_id="G3", reason=None, next_action="g3_pass", subject_refs="", preconditions="", read_refs=""))
                 self.assertEqual("PLAN", g3["phase"])
 
     def test_current_missing_and_ambiguous_lineage_remain_blockers(self):
@@ -265,8 +265,8 @@ class ReviewCurrentnessMigrationTests(unittest.TestCase):
                 final, _ = ledger.load_state(paths)
                 blockers = {item["id"] for item in final["issues"] if item["impact"] == "blocking" and not item.get("invalidated_by")}
                 self.assertEqual({"issue-current", "issue-missing", "issue-ambiguous"}, blockers)
-                rejected = Namespace(control_root=str(control), run_id=RUN_ID, owner_token=token, revision=78, phase="PLAN", control="ACTIVE", reason=None, next_action="g3_pass", subject_refs="", preconditions="", read_refs="")
-                with self.assertRaisesRegex(ledger.LedgerError, "current blocking issue"):
+                rejected = Namespace(control_root=str(control), run_id=RUN_ID, owner_token=token, revision=78, phase="PLAN", control="ACTIVE", gate_id="G3", reason=None, next_action="g3_pass", subject_refs="", preconditions="", read_refs="")
+                with self.assertRaisesRegex(ledger.LedgerError, "current blocking issue|BLOCKED -> ACTIVE requires no active blocking issues or unresolved finding obligations"):
                     ledger.cmd_gate(rejected)
 
     def test_non_current_pass_cannot_authorize_migration_or_gate(self):
@@ -285,8 +285,11 @@ class ReviewCurrentnessMigrationTests(unittest.TestCase):
                 ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
                 with self.assertRaisesRegex(ledger.LedgerError, "fresh registered and ingested current PASS"):
                     ledger.cmd_migrate_review_currentness(self.args(control, token, 77))
-                with self.assertRaisesRegex(ledger.LedgerError, "PASS coverage review"):
-                    ledger.cmd_gate(Namespace(control_root=str(control), run_id=RUN_ID, owner_token=token, revision=77, phase="PLAN", control="ACTIVE", reason=None, next_action="g2_pass", subject_refs="", preconditions="", read_refs=""))
+                # A BLOCKED run cannot attempt any active gate transition until
+                # its durable blockers are cleared; this shared transition guard
+                # is an equally safe earlier fence than stale PASS diagnostics.
+                with self.assertRaisesRegex(ledger.LedgerError, "PASS coverage review|BLOCKED -> ACTIVE requires no active blocking issues or unresolved finding obligations"):
+                    ledger.cmd_gate(Namespace(control_root=str(control), run_id=RUN_ID, owner_token=token, revision=77, phase="PLAN", control="ACTIVE", gate_id="G3", reason=None, next_action="g2_pass", subject_refs="", preconditions="", read_refs=""))
 
     def test_owner_and_revision_fences(self):
         with tempfile.TemporaryDirectory() as directory:

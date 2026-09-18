@@ -121,35 +121,35 @@ def mark_ready(control: Path, run_id: str, ticket: dict[str, object], token: str
     return result
 
 
-def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, object], root: Path, repair: bool = False) -> tuple[bool, int]:
+def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, object], root: Path, repair: bool = False, repair_authority_ref: str | None = None) -> tuple[bool, int]:
     paths = ledger.paths(control, run_id)
     state, _ = ledger.load_state(paths)
     index = int(str(ticket["id"]).rsplit("-", 1)[1])
     attempt_id = f"attempt-{index:02d}" + ("-repair" if repair else "")
+    repair_contract = ticket.get("repair") if repair else None
     packet_path = root / f"{attempt_id}.packet.json"
     route_path = root / f"{attempt_id}.route.json"
-    write_json(packet_path, worker_packet(run_id, ticket, attempt_id, "repair" if repair else "implement", ticket.get("repair")))
+    packet = worker_packet(run_id, ticket, attempt_id, "repair" if repair else "implement", repair_contract)
+    # The BLOCKED repair candidate commit must bind to the worker's actual
+    # checkout and base, not a fixture-only authority string.
+    packet["workspace"] = {"root": str(repo), "expected_base": None}
+    write_json(packet_path, packet)
     write_json(route_path, {"id": f"route-{attempt_id}", "capability": "fixture-worker", "reasoning": "synthetic", "requested_binding": "fixture-model", "observed_binding": "fixture-model", "adequacy": "CONFIRMED", "context_grade": "PACKET_SCOPED"})
     cli("dispatch", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--ticket-id", str(ticket["id"]), "--attempt-id", attempt_id, "--lease-id", f"lease-{attempt_id}", "--route-id", f"route-{attempt_id}", "--packet", str(packet_path), "--route", str(route_path))
     state, _ = ledger.load_state(paths)
     attempt = next(item for item in state["attempts"] if item["id"] == attempt_id)
     inbox = paths["scratch"] / attempt_id / "return.json"
-    if not repair and index == 0:
-        payload: dict[str, object] = {"identity": {"run_id": run_id, "ticket_id": ticket["id"], "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0}, "status": "BLOCKED", "result": "synthetic repair trigger", "files": [], "checks": [{"check_id": "synthetic-oracle", "outcome": "not_run", "actual": "seeded failure", "evidence_ref": "ev-repair"}], "criteria": [{"criterion_id": "C-qualification", "outcome": "unverifiable", "evidence_refs": ["ev-repair"]}], "issues": [{"id": "ISS-repair-qualification", "type": "synthetic_failure", "cause": "implementation", "impact": "blocking", "affected_refs": [ticket["id"]], "disposition": "repair"}]}
-        write_json(inbox, payload)
-        cli("ingest-return", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "worker")
-        return True, int(ledger.load_state(paths)[0]["revision"])
-
     payload = {"identity": {"run_id": run_id, "ticket_id": ticket["id"], "attempt_id": attempt_id, "packet_hash": attempt["packet_hash"], "epoch": 0}, "status": "DONE", "result": "synthetic completed worker", "files": [], "checks": [{"check_id": "synthetic-oracle", "outcome": "pass", "actual": "fixture", "evidence_ref": "ev-worker"}], "criteria": [{"criterion_id": "C-qualification", "outcome": "satisfied", "evidence_refs": ["ev-worker"]}]}
     write_json(inbox, payload)
     cli("ingest-return", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--return-file", str(inbox), "--kind", "worker")
     state, _ = ledger.load_state(paths)
     operation_id = f"operation-{index:02d}" + ("-repair" if repair else "")
-    cli("prepare-effect", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(repo), "--authority-ref", "qualification")
+    authority_ref = repair_authority_ref if repair and repair_authority_ref else "qualification"
+    cli("prepare-effect", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(repo), "--authority-ref", authority_ref)
     candidate_sha = f"{index + 1:040x}"
     tree_sha = f"{index + 1001:040x}"
     receipt = root / f"{operation_id}.receipt.json"
-    write_json(receipt, {"status": "PASS", "checkout": str(repo), "base_sha": None, "commit_sha": candidate_sha, "tree_sha": tree_sha, "authority_ref": "qualification", "receipt_ref": operation_id})
+    write_json(receipt, {"status": "PASS", "checkout": str(repo), "base_sha": None, "commit_sha": candidate_sha, "tree_sha": tree_sha, "authority_ref": authority_ref, "receipt_ref": operation_id})
     state, _ = ledger.load_state(paths)
     cli("candidate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--commit-receipt", str(receipt), "--operation-id", operation_id)
     state, _ = ledger.load_state(paths)
@@ -160,7 +160,36 @@ def process_ticket(control: Path, repo: Path, run_id: str, ticket: dict[str, obj
     state, raw = ledger.load_state(paths)
     review_attempt = next(item for item in state["attempts"] if item["id"] == review_attempt_id)
     review_return = paths["scratch"] / review_attempt_id / "return.json"
-    write_json(review_return, {"identity": {"run_id": run_id, "ticket_id": ticket["id"], "attempt_id": review_attempt_id, "packet_hash": review_attempt["packet_hash"], "epoch": 0}, "subject_fingerprint": candidate_sha, "verdict": "PASS", "coverage": [{"criterion_id": "C-qualification", "outcome": "fulfilled", "evidence_refs": ["ev-review"]}], "checks": [{"check_id": "correctness", "axis": "correctness", "outcome": "fulfilled", "actual": "fixture", "evidence_ref": "ev-review"}], "context_refs": ["synthetic-clean-review"], "findings": []})
+    should_block_for_repair = not repair and index == 0
+    review_payload: dict[str, object] = {
+        "identity": {"run_id": run_id, "ticket_id": ticket["id"], "attempt_id": review_attempt_id,
+                     "packet_hash": review_attempt["packet_hash"], "epoch": 0},
+        "subject_fingerprint": candidate_sha,
+        "verdict": "BLOCK" if should_block_for_repair else "PASS",
+        "coverage": [{"criterion_id": "C-qualification",
+                      "outcome": "missing" if should_block_for_repair else "fulfilled",
+                      "evidence_refs": ["ev-review"]}],
+        "checks": [{"check_id": "correctness", "axis": "correctness",
+                    "outcome": "failed" if should_block_for_repair else "fulfilled",
+                    "actual": "seeded defect" if should_block_for_repair else "fixture",
+                    "evidence_ref": "ev-review"}],
+        "context_refs": ["synthetic-clean-review"],
+        "findings": ([{"axis": "correctness", "impact": "blocking", "claim": "seeded candidate defect",
+                       "expected": "correct", "actual": "defective", "evidence": "ev-review",
+                       "affected_refs": [ticket["id"]]}] if should_block_for_repair else []),
+    }
+    if repair_contract:
+        review_payload["finding_resolution"] = [{
+            "finding_ref": repair_contract["finding_ref"], "candidate_ref": f"candidate-{attempt_id}",
+            "evidence_refs": ["ev-review"],
+            "reason": "The fresh PASS review verifies the exact repaired finding on the current candidate.",
+        }]
+    write_json(review_return, review_payload)
+    if should_block_for_repair:
+        cli("ingest-return", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner",
+            "--revision", str(state["revision"]), "--attempt-id", review_attempt_id,
+            "--return-file", str(review_return), "--kind", "review")
+        return True, int(ledger.load_state(paths)[0]["revision"])
     integrity = root / f"{review_attempt_id}.integrity.json"
     write_json(integrity, {"status": "PASS", "candidate_fingerprint": candidate_sha, "ledger_hash": ledger.sha256_bytes(raw)})
     cli("integrate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--attempt-id", review_attempt_id, "--review-file", str(review_return), "--integrity-receipt", str(integrity), "--review-id", f"REV-{index:02d}" + ("-repair" if repair else ""))
@@ -222,13 +251,23 @@ def run_qualification() -> dict[str, object]:
             if blocked:
                 repair_seen = True
                 state, _ = ledger.load_state(paths)
-                issue_id = next(item["id"] for item in state["issues"] if item["type"] == "synthetic_failure")
-                next_ticket["repair"] = {"cause": "implementation", "finding_ref": issue_id, "hypothesis": "synthetic first attempt is intentionally blocked", "expected_proof": "repair return and review pass", "stopping_condition": "one changed repair succeeds", "causal_change": "use repaired synthetic path"}
+                finding_id = next(item["id"] for item in state["findings"] if next_ticket["id"] in item.get("affected_refs", []))
+                next_ticket["repair"] = {"cause": "implementation", "finding_ref": finding_id, "hypothesis": "synthetic first candidate is intentionally blocked", "expected_proof": "candidate-bound repair review passes", "stopping_condition": "one changed repair succeeds", "causal_change": "use repaired synthetic path"}
                 repair_contract = root / "qualification-repair.json"
                 write_json(repair_contract, next_ticket["repair"])
-                cli("authorize-repair", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--ticket-id", str(next_ticket["id"]), "--finding-ref", issue_id, "--authorization-id", "AUTH-qualification-repair", "--repair-contract", str(repair_contract))
+                cli("authorize-repair", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--ticket-id", str(next_ticket["id"]), "--finding-ref", finding_id, "--authorization-id", "AUTH-qualification-repair", "--repair-contract", str(repair_contract))
                 next_ticket["state"] = "READY"
-                process_ticket(control, repo, run_id, next_ticket, root, repair=True)
+                process_ticket(control, repo, run_id, next_ticket, root, repair=True, repair_authority_ref="AUTH-qualification-repair")
+                state, _ = ledger.load_state(paths)
+                if ledger.open_ticket_finding_obligations(state, str(next_ticket["id"])):
+                    raise AssertionError(f"exact reviewed repair left the ticket obligation open: {ledger.open_ticket_finding_obligations(state, str(next_ticket['id']))}")
+                active_blockers = [item for item in state.get("issues", []) if item.get("impact") == "blocking" and not item.get("invalidated_by")]
+                if active_blockers:
+                    raise AssertionError(f"exact reviewed repair left active blocker mirrors: {active_blockers}")
+                if state["lifecycle"]["control"] == "BLOCKED":
+                    cli("gate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner",
+                        "--revision", str(state["revision"]), "--phase", "EXECUTE", "--control", "ACTIVE",
+                        "--reason", "current_repair_obligation_resolved", "--next-action", "continue_execution")
             processed.append(str(next_ticket["id"]))
             authoritative, _ = ledger.load_state(paths)
             source_ticket = next(item for item in authoritative["tickets"] if item["id"] == next_ticket["id"])
@@ -248,12 +287,12 @@ def run_qualification() -> dict[str, object]:
                 cli("gate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--phase", "EXECUTE", "--control", "ACTIVE", "--next-action", "qualification-continue")
 
         state, _ = ledger.load_state(paths)
-        cli("gate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--phase", "VERIFY", "--control", "ACTIVE", "--next-action", "qualification-verify")
+        cli("gate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--phase", "VERIFY", "--control", "ACTIVE", "--gate-id", "G4", "--next-action", "qualification-verify")
         state, _ = ledger.load_state(paths)
         state = ledger.transaction(paths, "owner", int(state["revision"]), lambda current: current.setdefault("acceptance", []).append({"round": 1, "intent_revision": "v1", "candidate_fingerprint": "qualification-40", "verdict": "PASS", "transport": "automatic", "outcome_refs": []}))
-        cli("gate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--phase", "ACCEPT", "--control", "ACTIVE", "--next-action", "qualification-finalize")
+        cli("gate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--phase", "ACCEPT", "--control", "ACTIVE", "--gate-id", "G5", "--next-action", "qualification-finalize")
         state, _ = ledger.load_state(paths)
-        cli("gate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--phase", "ACCEPT", "--control", "ACCEPTED", "--next-action", "terminal-finalization")
+        cli("gate", "--control-root", str(control), "--run-id", run_id, "--owner-token", "owner", "--revision", str(state["revision"]), "--phase", "ACCEPT", "--control", "ACCEPTED", "--gate-id", "G6", "--next-action", "terminal-finalization")
 
         final, raw = ledger.load_state(paths)
         round_trip = json.loads(raw.decode("utf-8"))
