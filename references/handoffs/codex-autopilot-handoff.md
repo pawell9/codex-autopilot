@@ -1128,17 +1128,17 @@ CODEX AUTOPILOT
 
 ---
 
-# 32. Durable status: v1.1.0 hardening through Phase C
+# 32. Durable status: v1.1.0 hardening through Phase D
 
 Актуальное состояние для следующей сессии определяется Git и [`reports/v1.1.0-hardening-progress.md`](../../reports/v1.1.0-hardening-progress.md).
 
 - Ветка: `codex/v1.1.0-hardening`.
-- Phase A, Phase B и Phase C завершены.
-- Phase C implementation commit: `ee81b4d` — canonical grouped `RepairPlan`/`AttemptPlan`, shared authorize/dispatch preflight, single-use authorization lifecycle, total non-DONE attempt finalization и proof-carrying quarantine reconciliation.
-- `finalize-attempt` покрывает returned `BLOCKED`/`HANDOFF`/`FAILED` и terminated `LOST`/`INTERRUPTED`; no-change сохраняет explicit `DONE`/`CONTINUATION` candidate либо возвращает initial ticket к verified base без создания ложного candidate.
-- `reconcile-finalized-attempt` освобождает quarantine только по позднему PASS stop+cleanup proof и exact clean-baseline audit; failed proof zero-effect, replay остаётся valid после дальнейшего progress.
-- Полный suite: 159 tests, OK, skipped=1 (документированный opt-in production-checkpoint audit). Focused Phase C suite: 44/44.
-- v1.0.4 qualification: OK; isolated 40-ticket qualification: 84.814 s при лимите `<90s`, также прошла внутри final full suite.
-- `py_compile`, schema JSON parse и `git diff --check`: PASS.
+- Phase A, Phase B, Phase C и Phase D завершены.
+- Phase D implementation commit: `e92fb34` — typed effect lifecycle, applied-effect adoption/finalization, shared immutable `VerifiedCandidateProof` и strong ordinary candidate publication.
+- Candidate effect states: `prepared → applied/uncertain/abandoned`, `uncertain → applied/abandoned`, `applied → finalized`. Applied-but-unlinked candidate commit остаётся pinned и получает typed `adopt_applied_effect`; Git повторно не выполняется.
+- `candidate` и `preserve-blocked-candidate` используют один finalizer: exact run/ticket/attempt/operation receipt binding, direct parent/base/commit/tree checks, clean checkout и полный tracked/untracked/ignored/rename/type/mode/symlink audit. Receipt, audit и proof сохраняются content-addressed и связываются с attempt/candidate/finalized operation.
+- Полный suite: 170 tests in 348.744 s, OK, skipped=1 (документированный opt-in production-checkpoint audit). Focused Phase D + continuation/Wave1/model/v1.0.4 suite: 31/31; dedicated Phase D modules: 11/11.
+- v1.0.4 qualification: OK; 40-ticket qualification переведена на 40 real Git commits с полным proof audit и прошла внутри final suite под лимитом `<180s`.
+- `py_compile`, contracts/lifecycle JSON parse и `git diff --check`: PASS.
 - Live Idea Scout не открывался и не изменялся; production R58 migration остаётся только Phase F.
-- Phase D не начата. Следующий шаг в новой сессии — Phase D из master hardening plan. Push не выполнялся.
+- Phase E не начата. Следующий шаг в новой сессии — Phase E из master hardening plan. Push не выполнялся.
