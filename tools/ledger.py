@@ -1196,7 +1196,7 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
     if state["run_id"] != Path(state["repository"]["control_root"]).name and state["run_id"] == "":
         fail("run_id must be nonempty")
     ids: set[str] = set()
-    for collection in ("documents", "requirements", "criteria", "contracts", "decisions", "tickets", "candidates", "attempts", "issues", "findings", "reviews", "operations", "capabilities", "routes", "evidence", "invalidations"):
+    for collection in ("documents", "requirements", "criteria", "contracts", "decisions", "tickets", "candidates", "attempts", "issues", "findings", "reviews", "review_qualifications", "repair_waves", "operations", "capabilities", "routes", "evidence", "invalidations"):
         for item in state.get(collection, []):
             if "id" in item:
                 if item["id"] in ids:
@@ -1341,6 +1341,62 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
     attempts_by_id = {item["id"]: item for item in state.get("attempts", [])}
     candidates_by_id = {item["id"]: item for item in state.get("candidates", [])}
     operations_by_id = {item["id"]: item for item in state.get("operations", [])}
+    reviews_by_id = {item["id"]: item for item in state.get("reviews", [])}
+    qualifications_by_id = {item["id"]: item for item in state.get("review_qualifications", [])}
+    for qualification in state.get("review_qualifications", []):
+        review_refs = qualification.get("accepted_review_refs", [])
+        accepted_reviews = [reviews_by_id.get(ref) for ref in review_refs]
+        if any(item is None or item.get("accepted") is not True for item in accepted_reviews):
+            fail(f"review qualification references a missing or unaccepted review: {qualification['id']}")
+        if [item.get("return_ref") for item in accepted_reviews] != qualification.get("accepted_return_refs", []):
+            fail(f"review qualification return refs do not match accepted reviews: {qualification['id']}")
+        if [item.get("integrity_ref") for item in accepted_reviews] != qualification.get("integrity_refs", []):
+            fail(f"review qualification integrity refs do not match accepted reviews: {qualification['id']}")
+        if any(item.get("subject_fingerprint") != qualification.get("subject_fingerprint") for item in accepted_reviews):
+            fail(f"review qualification mixes subject fingerprints: {qualification['id']}")
+        accepted_attempts = [attempts_by_id.get(item.get("attempt_ref")) for item in accepted_reviews]
+        if any(
+            attempt is None
+            or attempt.get("state") != "RETURNED"
+            or attempt.get("lease", {}).get("state") != "released"
+            or attempt.get("return_ref") != review.get("return_ref")
+            or attempt.get("subject_ref") != qualification.get("subject_ref")
+            or attempt.get("review_purpose") not in (None, review.get("purpose"))
+            for review, attempt in zip(accepted_reviews, accepted_attempts)
+        ):
+            fail(f"review qualification is not bound to exact terminal review attempts: {qualification['id']}")
+        attempt_refs = [item.get("attempt_ref") for item in accepted_reviews]
+        if len(attempt_refs) != len(set(attempt_refs)):
+            fail(f"review qualification reuses one attempt for multiple accepted reviews: {qualification['id']}")
+        if any(item.get("purpose") not in qualification.get("required_purposes", []) for item in accepted_reviews):
+            fail(f"review qualification includes a review outside its required purposes: {qualification['id']}")
+        if any(item.get("intent_revision") != qualification.get("intent_revision") for item in accepted_reviews):
+            fail(f"review qualification mixes intent revisions: {qualification['id']}")
+        satisfied = sorted({item.get("purpose") for item in accepted_reviews if item.get("verdict") == "PASS"})
+        blocked = any(item.get("verdict") in ("BLOCK", "UNVERIFIABLE") for item in accepted_reviews)
+        expected_result = "BLOCK" if blocked else (
+            "PASS" if set(qualification.get("required_purposes", [])).issubset(satisfied) else "INCOMPLETE"
+        )
+        if qualification.get("satisfied_purposes") != satisfied or qualification.get("result") != expected_result:
+            fail(f"review qualification result is not derived from immutable accepted reviews: {qualification['id']}")
+    finding_ids = {item.get("id") for item in state.get("findings", [])}
+    for wave in state.get("repair_waves", []):
+        source = qualifications_by_id.get(wave.get("source_qualification_ref"))
+        if source is None or source.get("result") != "BLOCK" or source.get("required_purposes") != ["final_g5"]:
+            fail(f"repair wave source is not a BLOCK final-G5 qualification: {wave['id']}")
+        if not set(wave.get("finding_refs", [])).issubset(finding_ids):
+            fail(f"repair wave references unknown findings: {wave['id']}")
+        if wave.get("state") == "CLOSED":
+            final = qualifications_by_id.get(wave.get("final_g5_qualification_ref"))
+            if (
+                final is None or final.get("result") != "PASS"
+                or final.get("required_purposes") != ["final_g5"]
+                or final.get("subject_fingerprint") != wave.get("repaired_candidate_fingerprint")
+                or final.get("subject_fingerprint") == wave.get("source_candidate_fingerprint")
+            ):
+                fail(f"closed repair wave lacks a fresh final-G5 qualification: {wave['id']}")
+        elif wave.get("final_g5_qualification_ref") is not None or wave.get("repaired_candidate_fingerprint") is not None:
+            fail(f"open repair wave contains terminal qualification linkage: {wave['id']}")
     for candidate in state.get("candidates", []):
         ticket = next((item for item in state.get("tickets", []) if item.get("id") == candidate.get("ticket_ref")), None)
         producer = next((item for item in state.get("attempts", []) if item.get("id") == candidate.get("producer_attempt_ref")), None)
@@ -1357,6 +1413,16 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
             successor = candidates_by_id.get(candidate["superseded_by"])
             if successor is None or successor.get("parent_candidate_ref") != candidate["id"]:
                 fail(f"candidate supersession edge is not reciprocal: {candidate['id']}")
+        qualification_ref = candidate.get("qualification_ref")
+        if qualification_ref is not None:
+            qualification = qualifications_by_id.get(qualification_ref)
+            if (
+                qualification is None
+                or qualification.get("subject_ref") != candidate.get("ticket_ref")
+                or qualification.get("subject_fingerprint") != candidate.get("sha")
+                or qualification.get("result") != "PASS"
+            ):
+                fail(f"candidate qualification does not authorize this exact candidate: {candidate['id']}")
         proof_ref = candidate.get("proof_ref")
         if proof_ref is not None:
             if producer.get("candidate_proof_ref") != proof_ref:
@@ -1388,6 +1454,25 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
     if state["lifecycle"]["control"] == "ACCEPTED":
         if not any(a.get("verdict") == "PASS" for a in state.get("acceptance", [])):
             fail("ACCEPTED requires a recorded G5 PASS")
+        latest = state.get("acceptance", [])[-1] if state.get("acceptance") else None
+        if (
+            state.get("review_model_version") == "1.1"
+            and latest
+            and (latest.get("purpose") == "final_g5" or latest.get("qualification_ref") is not None)
+        ):
+            matching = [
+                item for item in state.get("review_qualifications", [])
+                if item.get("result") == "PASS"
+                and item.get("required_purposes") == ["final_g5"]
+                and latest
+                and item.get("id") == latest.get("qualification_ref")
+                and item.get("subject_fingerprint") == latest.get("candidate_fingerprint")
+                and latest.get("return_ref") in item.get("accepted_return_refs", [])
+            ]
+            if not matching:
+                fail("ACCEPTED requires the immutable current final-G5 qualification")
+            if any(item.get("state") == "OPEN" for item in state.get("repair_waves", [])):
+                fail("ACCEPTED requires every final-G5 repair wave to be closed")
     for operation in state.get("operations", []):
         if operation.get("state") == "applied" and not operation.get("receipt_ref"):
             fail(f"applied operation lacks receipt: {operation['id']}")
@@ -3324,6 +3409,8 @@ def validate_review_return_semantics(payload: dict[str, Any], packet: dict[str, 
         fail("review return requires non-empty context evidence")
     if any(item.get("outcome") != "fulfilled" for item in coverage if payload.get("verdict") == "PASS"):
         fail("review PASS contains a non-fulfilled criterion")
+    if payload.get("verdict") == "PASS" and any(item.get("outcome") != "fulfilled" for item in payload.get("checks", [])):
+        fail("review PASS contains a failed, not-run, or unverifiable required check")
     for finding in payload.get("findings", []):
         if finding.get("impact") == "blocking" and payload.get("verdict") == "PASS":
             fail("review PASS contains a blocking finding")
@@ -3348,6 +3435,88 @@ def validate_review_return_semantics(payload: dict[str, Any], packet: dict[str, 
         evidence_refs = entry.get("evidence_refs", [])
         if not evidence_refs or not set(evidence_refs).issubset(review_evidence):
             fail(f"finding resolution evidence must resolve to this review's own evidence: {finding_ref}")
+
+
+def normalize_review_purpose(value: Any, *, packet_kind: str | None = None) -> str:
+    """Normalize the Phase E review purpose without conflating it with transport."""
+    if value == "ticket_change":
+        value = "ticket_review"
+    if value is None:
+        return "final_g5" if packet_kind == "acceptance" else "ticket_review"
+    if value not in ("ticket_review", "critical_axis", "final_g5"):
+        fail("review purpose must be ticket_review, critical_axis, or final_g5")
+    return value
+
+
+def required_review_purposes(ticket: dict[str, Any] | None, purpose: str) -> list[str]:
+    if purpose == "final_g5":
+        return ["final_g5"]
+    required = ["ticket_review"]
+    if ticket and ticket.get("risk") == "critical":
+        required.append("critical_axis")
+    return required
+
+
+def validate_review_integrity(
+    receipt: dict[str, Any], current_raw: bytes, subject_fingerprint: str, *, require_stop: bool = True,
+) -> None:
+    if receipt.get("status") != "PASS":
+        fail("review integrity receipt is not PASS")
+    if receipt.get("candidate_fingerprint") != subject_fingerprint:
+        fail("review integrity receipt is not bound to the exact candidate")
+    if receipt.get("ledger_hash") != sha256_bytes(current_raw):
+        fail("review integrity receipt is not bound to the current ledger publication")
+    if require_stop and receipt.get("reviewer_stopped") is not True:
+        fail("review integrity receipt lacks explicit reviewer stop evidence")
+
+
+def append_review_qualification(
+    state: dict[str, Any], subject_ref: str, subject_fingerprint: str,
+    *, purpose: str, created_revision: int,
+) -> dict[str, Any]:
+    """Append an immutable aggregate over all accepted reviews for one exact subject."""
+    ticket = next((item for item in state.get("tickets", []) if item.get("id") == subject_ref), None)
+    required = required_review_purposes(ticket, purpose)
+    accepted = [
+        item for item in state.get("reviews", [])
+        if item.get("accepted") is True
+        and item.get("subject_fingerprint") == subject_fingerprint
+        and item.get("purpose") in required
+        and item.get("return_ref")
+        and item.get("integrity_ref")
+        and not item.get("invalidated_by")
+    ]
+    accepted.sort(key=lambda item: item.get("id", ""))
+    satisfied = sorted({item["purpose"] for item in accepted if item.get("verdict") == "PASS"})
+    blocking = any(item.get("verdict") in ("BLOCK", "UNVERIFIABLE") for item in accepted)
+    result = "BLOCK" if blocking else ("PASS" if set(required).issubset(satisfied) else "INCOMPLETE")
+    core = {
+        "subject_ref": subject_ref,
+        "subject_fingerprint": subject_fingerprint,
+        "required_purposes": required,
+        "accepted_review_refs": [item["id"] for item in accepted],
+        "accepted_return_refs": [item["return_ref"] for item in accepted],
+        "satisfied_purposes": satisfied,
+        "result": result,
+        "integrity_refs": [item["integrity_ref"] for item in accepted],
+        "intent_revision": state.get("intent", {}).get("current_revision"),
+    }
+    qualification_id = f"QUAL-{sha256_bytes(canonical_bytes(core))[:16]}"
+    prior = next((item for item in state.get("review_qualifications", []) if item.get("id") == qualification_id), None)
+    if prior is not None:
+        return prior
+    qualification = {"id": qualification_id, **core, "created_revision": created_revision}
+    state.setdefault("review_qualifications", []).append(qualification)
+    return qualification
+
+
+def qualification_by_id(state: dict[str, Any], qualification_id: str) -> dict[str, Any]:
+    qualification = next(
+        (item for item in state.get("review_qualifications", []) if item.get("id") == qualification_id), None
+    )
+    if qualification is None:
+        fail("unknown review qualification")
+    return qualification
 
 
 def ledger_record_ids(state: dict[str, Any]) -> set[str]:
@@ -3450,6 +3619,8 @@ def validate_acceptance_return_semantics(payload: dict[str, Any], required_ids: 
     if payload.get("verdict") == "PASS":
         if any(item.get("outcome") != "fulfilled" for item in outcomes):
             fail("acceptance PASS contains a non-fulfilled criterion")
+        if any(item.get("outcome") != "fulfilled" for item in payload.get("checks", [])):
+            fail("acceptance PASS contains a failed, not-run, or unverifiable required check")
         if any(item.get("impact") == "blocking" for item in payload.get("findings", [])):
             fail("acceptance PASS contains a blocking finding")
 
@@ -3562,6 +3733,7 @@ def base_state(control_root: Path, run_id: str, repo_root: Path, token: str) -> 
         "schema_version": SCHEMA_VERSION, "run_id": run_id, "revision": 0, "previous_publication_hash": None,
         "updated_at": now(), "skill_version": SKILL_VERSION, "policy_version": POLICY_VERSION,
         "candidate_model_version": "1.1", "candidates": [],
+        "review_model_version": "1.1", "review_qualifications": [], "repair_waves": [], "acceptance": [],
         "runtime_provenance": {"creation_skill_version": SKILL_VERSION, "current_schema_version": SCHEMA_VERSION, "last_mutating_skill_version": SKILL_VERSION, "compatibility_floor": COMPATIBILITY_FLOOR, "state_contract_version": STATE_CONTRACT_VERSION, "minimum_writer_version": WRITER_VERSION, "applied_migrations": []},
         "repository": {"control_root": str(control_root), "execution_root": str(repo_root), "common_dir": "", "initial_head": None, "branch": "", "checkout": str(repo_root), "inventory_ref": None, "instruction_refs": []},
         "owner": {"token": token, "epoch": 0, "observed_session": None, "handoff_ref": None, "attestation_ref": None},
@@ -4063,6 +4235,9 @@ def cmd_diagnose_legacy(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
+    integrity = read_json(Path(args.integrity_receipt), "review integrity receipt") if getattr(args, "integrity_receipt", None) else None
+    integrity_raw = canonical_bytes(integrity) if integrity is not None else None
+    qualification_ref: str | None = None
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token)
         admit_event(state, "attempt.ingest")
@@ -4082,6 +4257,14 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         payload, digest, return_raw = ingest_payload(p, state, args.attempt_id, Path(args.return_file), attempt.get("packet_hash"), args.kind)
         identity = packet_identity(payload)
         packet = validate_return_against_attempt(p, state, attempt, payload, args.kind)
+        review_purpose = normalize_review_purpose(packet.get("purpose"), packet_kind="review") if args.kind == "review" else None
+        phase_e_review = bool(args.kind == "review" and packet.get("purpose") is not None and attempt.get("mode") == "change")
+        if phase_e_review:
+            if attempt.get("review_purpose") not in (None, review_purpose):
+                fail("review return purpose does not match the registered attempt")
+            if integrity is None or integrity_raw is None:
+                fail("Phase E review acceptance requires a hash-bound integrity receipt")
+            validate_review_integrity(integrity, previous_raw, payload.get("subject_fingerprint", ""))
         if args.kind == "review" and attempt.get("mode") in ("coverage", "plan"):
             publication = current_design_publication(state)
             if attempt.get("subject_ref") != publication.get("id") or attempt.get("subject_fingerprint") != publication.get("publication_hash") or payload.get("subject_fingerprint") != publication.get("publication_hash"):
@@ -4157,9 +4340,21 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         if args.kind == "review":
             review_id = f"REV-{digest[:16]}"
             if review_id not in {item.get("id") for item in next_state.get("reviews", [])}:
-                review = {"id": review_id, "mandate": stored_payload(p, target.get("packet_ref"), "review packet").get("mandate", "review"), "subject_fingerprint": payload.get("subject_fingerprint", ""), "verdict": payload.get("verdict"), "accepted": False, "return_ref": f"objects/{digest}", "context_refs": payload.get("context_refs", []), "finding_refs": target["finding_refs"], "finding_resolution": copy.deepcopy(payload.get("finding_resolution", [])), "intent_revision": next_state.get("intent", {}).get("current_revision"), "reviewer_identity": target.get("reviewer_identity"), "reviewer_role": target.get("reviewer_role"), "review_kind": target.get("mode") if target.get("mode") in ("coverage", "plan") else None, "target_artifact_refs": target.get("target_artifact_refs", []), "target_artifact_versions": target.get("target_artifact_versions", []), "target_revision": target.get("target_revision"), "invalidated_by": []}
+                review = {"id": review_id, "attempt_ref": target.get("id"), "purpose": review_purpose if phase_e_review else None, "mandate": stored_payload(p, target.get("packet_ref"), "review packet").get("mandate", "review"), "subject_fingerprint": payload.get("subject_fingerprint", ""), "verdict": payload.get("verdict"), "accepted": phase_e_review, "return_ref": f"objects/{digest}", "integrity_ref": f"objects/{sha256_bytes(integrity_raw)}" if integrity_raw is not None and phase_e_review else None, "context_refs": payload.get("context_refs", []), "finding_refs": target["finding_refs"], "finding_resolution": copy.deepcopy(payload.get("finding_resolution", [])), "intent_revision": next_state.get("intent", {}).get("current_revision"), "reviewer_identity": target.get("reviewer_identity"), "reviewer_role": target.get("reviewer_role"), "review_kind": target.get("mode") if target.get("mode") in ("coverage", "plan") else None, "target_artifact_refs": target.get("target_artifact_refs", []), "target_artifact_versions": target.get("target_artifact_versions", []), "target_revision": target.get("target_revision"), "invalidated_by": []}
                 next_state.setdefault("reviews", []).append(review)
             current_review = next(item for item in next_state.get("reviews", []) if item.get("id") == review_id)
+            if phase_e_review:
+                qualification = append_review_qualification(
+                    next_state, target.get("subject_ref"), payload.get("subject_fingerprint", ""),
+                    purpose=review_purpose, created_revision=state["revision"] + 1,
+                )
+                qualification_ref = qualification["id"]
+                candidate = next(
+                    (item for item in next_state.get("candidates", []) if item.get("ticket_ref") == target.get("subject_ref") and item.get("sha") == payload.get("subject_fingerprint")),
+                    None,
+                )
+                if candidate is not None:
+                    candidate["review_status"] = "PASS" if qualification["result"] == "PASS" else ("BLOCK" if qualification["result"] == "BLOCK" else "PENDING")
             prior = [
                 item for item in next_state.get("reviews", [])
                 if item.get("subject_fingerprint") == current_review.get("subject_fingerprint")
@@ -4189,8 +4384,10 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         next_state["updated_at"] = now()
         validate_ledger(next_state, verify_files=False)
         object_store(p, return_raw)
+        if integrity_raw is not None and phase_e_review:
+            object_store(p, integrity_raw)
         publish(p, next_state, previous_raw)
-    return {"ingested": True, "idempotent": False, "attempt_id": args.attempt_id, "return_ref": f"objects/{digest}", "status": "BLOCKED" if write_set_violations else payload.get("status", payload.get("verdict")), "quarantined": bool(write_set_violations), "revision": next_state["revision"]}
+    return {"ingested": True, "idempotent": False, "attempt_id": args.attempt_id, "return_ref": f"objects/{digest}", "qualification_ref": qualification_ref, "status": "BLOCKED" if write_set_violations else payload.get("status", payload.get("verdict")), "quarantined": bool(write_set_violations), "revision": next_state["revision"]}
 
 
 def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
@@ -5378,6 +5575,7 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
     packet = read_json(packet_path, "review packet")
     root = schema()
     validate(packet, root["$defs"]["review_packet"], root, "$.packet")
+    purpose = normalize_review_purpose(packet.get("purpose"), packet_kind="review")
     identity = packet_identity(packet)
     if identity.get("run_id") not in (None, args.run_id) or identity.get("attempt_id") != args.review_attempt_id:
         fail("review packet identity does not match review attempt")
@@ -5389,6 +5587,8 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
         is_blocked_continuation = bool(ticket and ticket.get("state") == "BLOCKED" and state["lifecycle"].get("control") == "BLOCKED")
         if ticket is None or (ticket.get("state") not in ("CANDIDATE", "REVIEW") and not is_blocked_continuation):
             fail("review preparation requires a CANDIDATE/REVIEW ticket or a BLOCKED continuation candidate")
+        if purpose == "critical_axis" and ticket.get("risk") != "critical":
+            fail("critical-axis review requires a critical ticket")
         worker = current_candidate_producer(state, ticket)
         if worker is None or not worker.get("candidate_sha"):
             fail("review preparation requires a frozen worker candidate")
@@ -5413,7 +5613,7 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
         if any(a.get("id") == args.review_attempt_id for a in state.get("attempts", [])):
             fail("review attempt ID already exists")
         object_store(p, packet_raw)
-        attempt_record = {"id": args.review_attempt_id, "kind": "review", "mode": "change", "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": {"id": args.lease_id, "state": "active", "zone": []}, "route_ref": None, "checkout": None, "base_sha": worker.get("candidate_sha"), "candidate_sha": worker.get("candidate_sha"), "candidate_tree_sha": worker.get("candidate_tree_sha"), "return_ref": None, "finding_refs": [], "subject_fingerprint": worker.get("candidate_sha"), "packet_registration_revision": registration_revision, "packet_source_revision": identity.get("source_revision", registration_revision), "subject_revision": identity.get("subject_revision", state["revision"]), "attempt_created_revision": state["revision"] + 1, "return_source_revision": None}
+        attempt_record = {"id": args.review_attempt_id, "kind": "review", "mode": "change", "review_purpose": purpose, "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": {"id": args.lease_id, "state": "active", "zone": []}, "route_ref": None, "checkout": None, "base_sha": worker.get("candidate_sha"), "candidate_sha": worker.get("candidate_sha"), "candidate_tree_sha": worker.get("candidate_tree_sha"), "return_ref": None, "finding_refs": [], "subject_fingerprint": worker.get("candidate_sha"), "packet_registration_revision": registration_revision, "packet_source_revision": identity.get("source_revision", registration_revision), "subject_revision": identity.get("subject_revision", state["revision"]), "attempt_created_revision": state["revision"] + 1, "return_source_revision": None}
         if binding:
             attempt_record.update({"intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"]})
         state.setdefault("attempts", []).append(attempt_record)
@@ -5425,7 +5625,7 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
             ticket["state"] = "REVIEW"
             state["lifecycle"]["next_action"] = {"kind": "await_review_return", "subject_refs": [args.review_attempt_id], "preconditions": ["reviewer stopped", "integrity baseline unchanged", "strict packet/subject match"], "read_refs": ["contracts/reviewer.md", "phases/execute.md"]}
     result = transaction(p, args.owner_token, args.revision, change)
-    return {"prepared": True, "attempt_id": args.review_attempt_id, "packet_hash": packet_hash, "revision": result["revision"]}
+    return {"prepared": True, "attempt_id": args.review_attempt_id, "packet_hash": packet_hash, "purpose": purpose, "revision": result["revision"]}
 
 
 def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
@@ -5577,8 +5777,83 @@ def cmd_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
     return {"adjudicated": True, "decision_id": decision["id"], "decision": decision["decision"], "revision": state["revision"]}
 
 
-def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
+def cmd_integrate_qualification(args: argparse.Namespace) -> dict[str, Any]:
+    """Integrate one exact candidate from an immutable Phase E qualification aggregate."""
     p = paths(args.control_root, args.run_id)
+    with Lock(p["lock"]):
+        state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
+        admit_event(state, "review.integrate")
+        qualification = qualification_by_id(state, args.qualification_ref)
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == qualification.get("subject_ref")), None)
+        if ticket is None:
+            fail("review qualification is not ticket-scoped")
+        candidate = current_candidate_record(state, ticket)
+        worker = current_candidate_producer(state, ticket)
+        if candidate is None or worker is None or candidate.get("quality") != "DONE":
+            fail("qualified integration requires the explicit current DONE candidate and producer")
+        if qualification.get("subject_fingerprint") != candidate.get("sha"):
+            fail("review qualification is stale for the current candidate")
+        if qualification.get("required_purposes") != required_review_purposes(ticket, "ticket_review"):
+            fail("review qualification does not encode the current ticket risk requirements")
+        if qualification.get("result") != "PASS":
+            fail("integration requires a complete PASS review qualification")
+        if state.get("intent") and qualification.get("intent_revision") != state.get("intent", {}).get("current_revision"):
+            fail("review qualification is stale for the current intent")
+        if open_ticket_finding_obligations(state, ticket["id"]):
+            fail("integration is blocked by unresolved ticket-scoped finding obligations")
+        relevant_blockers = [
+            item for item in state.get("issues", [])
+            if item.get("impact") == "blocking" and not item.get("invalidated_by")
+            and (ticket["id"] in item.get("affected_refs", []) or candidate["id"] in item.get("affected_refs", []))
+        ]
+        if relevant_blockers:
+            fail("integration is blocked by unresolved applicable issues")
+        if any(effect_is_unresolved(item) for item in state.get("operations", [])):
+            fail("integration is blocked by an unresolved durable effect")
+        if ticket.get("state") == "INTEGRATED" and candidate.get("qualification_ref") == qualification["id"]:
+            if worker.get("lease", {}).get("state") != "released":
+                fail("idempotent integration found an unreleased producer lease")
+            return {"integrated": True, "idempotent": True, "qualification_ref": qualification["id"], "revision": state["revision"]}
+        if ticket.get("state") not in ("REVIEW", "CANDIDATE"):
+            fail("qualified integration requires a ticket awaiting review/integration")
+        if worker.get("lease", {}).get("state") not in ("active", "released"):
+            fail("qualified integration producer lease is not safely releasable")
+        next_state = copy.deepcopy(state)
+        next_ticket = next(item for item in next_state["tickets"] if item.get("id") == ticket["id"])
+        next_candidate = next(item for item in next_state.get("candidates", []) if item.get("id") == candidate["id"])
+        next_worker = attempt_by_id(next_state, worker["id"])
+        next_ticket["state"] = "INTEGRATED"
+        next_candidate["review_status"] = "PASS"
+        next_candidate["integration_status"] = "INTEGRATED"
+        next_candidate["qualification_ref"] = qualification["id"]
+        next_worker["lease"]["state"] = "released"
+        if next_state.get("lifecycle", {}).get("control") == "BLOCKED":
+            remaining = [
+                item for item in next_state.get("issues", [])
+                if item.get("impact") == "blocking" and not item.get("invalidated_by")
+            ]
+            if not remaining:
+                next_state["lifecycle"]["control"] = "ACTIVE"
+                next_state["lifecycle"]["reason"] = "qualified_review_integrated"
+        next_state["lifecycle"]["next_action"] = {
+            "kind": "continue_after_ticket_integration", "subject_refs": [ticket["id"], qualification["id"]],
+            "preconditions": ["qualification remains current", "next ticket dependencies satisfied"],
+            "read_refs": ["phases/execute.md", "references/ledger.md"],
+        }
+        next_state["revision"] += 1
+        next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        next_state["updated_at"] = now()
+        validate_ledger(next_state, verify_files=False)
+        publish(p, next_state, previous_raw)
+    return {"integrated": True, "idempotent": False, "qualification_ref": qualification["id"], "revision": next_state["revision"]}
+
+
+def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "qualification_ref", None):
+        return cmd_integrate_qualification(args)
+    p = paths(args.control_root, args.run_id)
+    if not args.integrity_receipt or not args.attempt_id or not args.review_file or not args.review_id:
+        fail("legacy integration requires attempt-id, review-file, integrity-receipt, and review-id")
     integrity = read_json(Path(args.integrity_receipt), "integrity receipt")
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
@@ -5627,6 +5902,8 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
         if attempt.get("state") not in ("PREPARED", "RETURNED"):
             fail("review attempt is not active")
         packet = stored_payload(p, attempt.get("packet_ref"), "review packet")
+        if packet.get("purpose") is not None:
+            fail("Phase E review returns must be accepted by ingest-return and integrated by qualification-ref")
         review, digest, review_raw = ingest_payload(p, state, args.attempt_id, Path(args.review_file), attempt.get("packet_hash"), "review")
         validate_return_against_attempt(p, state, attempt, review, "review")
         if review.get("verdict") != "PASS":
@@ -7277,6 +7554,32 @@ def verify_manual_inventory(receipt: dict[str, Any], handoff: dict[str, Any]) ->
             fail(f"environment inventory path is outside prepared bundle: {rel}")
 
 
+def verify_manual_inventory_exact(receipt: dict[str, Any], handoff: dict[str, Any]) -> None:
+    """Require complete candidate export and prepared bundle coverage for Phase E."""
+    bundle = Path(handoff.get("bundle_root", ""))
+    regular_directory(bundle, "handoff bundle")
+    manifest = read_json(bundle / "manifest.json", "handoff manifest")
+    expected = {
+        f"candidate-export/{item['path']}": item["sha256"]
+        for item in manifest.get("files", [])
+    }
+    for name in ("packet.json", "projection.json", "manifest.json", "operator-checklist.md"):
+        path = bundle / name
+        regular_non_symlink(path)
+        expected[f"g5-bundle/{name}"] = sha256_file(path)
+    actual: dict[str, str] = {}
+    for item in receipt.get("inventory_hashes", []):
+        rel = relative_path(item.get("path"), "receipt inventory path")
+        if rel in actual:
+            fail(f"environment inventory contains a duplicate path: {rel}")
+        actual[rel] = item.get("sha256")
+    if actual != expected:
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        changed = sorted(path for path in set(actual) & set(expected) if actual[path] != expected[path])
+        fail(f"environment inventory is not the exact prepared export: missing={missing}, extra={extra}, changed={changed}")
+
+
 def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     packet_path = Path(args.packet).expanduser().resolve()
@@ -7285,6 +7588,14 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
     projection = read_json(projection_path, "acceptance projection")
     if not isinstance(packet, dict) or packet.get("kind") not in ("review", "acceptance"):
         fail("handoff packet kind must be review or acceptance")
+    phase_e_handoff = bool(getattr(args, "purpose", None) or packet.get("purpose") is not None)
+    purpose = normalize_review_purpose(getattr(args, "purpose", None) or packet.get("purpose"), packet_kind=packet.get("kind"))
+    if purpose in ("ticket_review", "critical_axis") and packet.get("kind") != "review":
+        fail("ticket/critical review purpose requires a review packet")
+    if purpose == "final_g5" and packet.get("kind") != "acceptance":
+        fail("final_g5 purpose requires an acceptance packet")
+    if packet.get("purpose") is not None and normalize_review_purpose(packet.get("purpose"), packet_kind=packet.get("kind")) != purpose:
+        fail("declared review purpose does not match the packet purpose")
     root = schema()
     validate(packet, root["$defs"]["acceptance_packet" if packet.get("kind") == "acceptance" else "review_packet"], root, "$.packet")
     if projection.get("kind") != "acceptance_projection":
@@ -7329,6 +7640,14 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
         candidate_attempt = next((item for item in state.get("attempts", []) if item.get("id") == args.attempt_id), None)
         if candidate_attempt is None or not candidate_attempt.get("candidate_sha"):
             fail("handoff requires a frozen candidate")
+        if phase_e_handoff and (candidate_attempt.get("state") != "PREPARED" or candidate_attempt.get("return_ref")):
+            fail("handoff requires a fresh PREPARED reviewer attempt")
+        if packet_identity_value.get("attempt_id") != candidate_attempt.get("id"):
+            fail("handoff packet attempt identity does not match the registered reviewer attempt")
+        if purpose == "critical_axis":
+            ticket = next((item for item in state.get("tickets", []) if item.get("id") == candidate_attempt.get("subject_ref")), None)
+            if ticket is None or ticket.get("risk") != "critical":
+                fail("critical-axis handoff requires a critical ticket")
         if projection.get("candidate_fingerprint") != candidate_attempt.get("candidate_sha"):
             fail("handoff projection candidate does not match the frozen candidate")
         if packet.get("subject_fingerprint") not in (None, candidate_attempt.get("candidate_sha")):
@@ -7381,18 +7700,20 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
         attempt["state"] = "PREPARED"
         attempt["kind"] = "review"
         attempt["mode"] = "user_assisted"
+        if phase_e_handoff:
+            attempt["review_purpose"] = purpose
         attempt["packet_ref"] = f"objects/{packet_hash}"
         attempt["packet_hash"] = packet_hash
-        attempt["handoff"] = {"bundle_root": str(bundle), "manifest_ref": f"sha256:{manifest_hash}", "candidate_fingerprint": projection.get("candidate_fingerprint"), "intent_revision": projection.get("intent_revision"), "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"], "transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN"}
+        attempt["handoff"] = {"bundle_root": str(bundle), "manifest_ref": f"sha256:{manifest_hash}", "candidate_fingerprint": projection.get("candidate_fingerprint"), "intent_revision": projection.get("intent_revision"), "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"], "purpose": purpose, "packet_kind": packet.get("kind"), "projection_hash": sha256_bytes(canonical_bytes(projection)), "transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN"}
         add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"manual_handoffs": 1, "manual_setup": 1, "user_interventions": 1})
         state["lifecycle"]["control"] = "BLOCKED"
         state["lifecycle"]["reason"] = "manual_review_pending"
         state["lifecycle"]["next_action"] = {"kind": "import_manual_review", "subject_refs": [args.attempt_id], "preconditions": ["environment receipt", "context receipt", "exact structured return", "integrity barrier"], "read_refs": ["phases/accept.md", "references/safety.md"]}
     result = transaction(p, args.owner_token, args.revision, change)
-    return {"prepared": True, "bundle_root": str(bundle), "manifest_sha256": manifest_hash, "revision": result["revision"], "transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN"}
+    return {"prepared": True, "bundle_root": str(bundle), "manifest_sha256": manifest_hash, "purpose": purpose, "revision": result["revision"], "transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN"}
 
 
-def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
+def cmd_import_manual_legacy(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     env = read_json(Path(args.environment_receipt), "environment receipt")
     context = read_json(Path(args.context_receipt), "context receipt")
@@ -7534,6 +7855,218 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
         object_store(p, context_raw)
         publish(p, next_state, previous_raw)
     return {"imported": True, "idempotent": False, "verdict": payload.get("verdict"), "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN", "release_ready": False, "revision": next_state["revision"]}
+
+
+def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
+    """Import an explicit-purpose manual result through the Phase E review lifecycle."""
+    if not getattr(args, "purpose", None):
+        return cmd_import_manual_legacy(args)
+    purpose = normalize_review_purpose(args.purpose)
+    p = paths(args.control_root, args.run_id)
+    env = read_json(Path(args.environment_receipt), "environment receipt")
+    context = read_json(Path(args.context_receipt), "context receipt")
+    integrity = read_json(Path(args.integrity_receipt), "integrity receipt")
+    root = schema()
+    validate(env, root["$defs"]["environment_receipt"], root, "$.environment_receipt")
+    validate(context, root["$defs"]["context_receipt"], root, "$.context_receipt")
+    validate_manual_receipt(env, "environment receipt")
+    validate_manual_receipt(context, "context receipt")
+    if context.get("reviewer_stopped") is not True:
+        fail("manual review import requires explicit reviewer stop evidence")
+    return_path = Path(args.return_file).expanduser().resolve()
+    with Lock(p["lock"]):
+        state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
+        admit_event(state, "acceptance.import")
+        attempt = attempt_by_id(state, args.attempt_id)
+        if attempt.get("state") != "PREPARED" or attempt.get("return_ref"):
+            fail("manual review import requires a fresh PREPARED attempt; interrupted/lost/returned attempts are immutable")
+        if attempt.get("epoch") != state.get("owner", {}).get("epoch"):
+            fail("manual review attempt epoch is stale")
+        if attempt.get("mode") != "user_assisted" or attempt.get("kind") != "review":
+            fail("manual import requires the prepared user-assisted reviewer attempt")
+        handoff = attempt.get("handoff") or {}
+        if handoff.get("purpose") != purpose:
+            fail("manual import purpose does not match the prepared handoff")
+        if attempt.get("review_purpose") not in (None, purpose):
+            fail("manual import purpose does not match the registered attempt")
+        packet = stored_payload(p, attempt.get("packet_ref"), "manual review packet")
+        packet_kind = handoff.get("packet_kind") or packet.get("kind")
+        expected_kind = "acceptance" if purpose == "final_g5" else "review"
+        if packet_kind != expected_kind or packet.get("kind") != expected_kind:
+            fail("manual import packet type does not match its review purpose")
+        packet_purpose = packet.get("purpose")
+        if packet_purpose is not None and normalize_review_purpose(packet_purpose, packet_kind=packet_kind) != purpose:
+            fail("manual import purpose conflicts with the immutable packet")
+        binding = current_intent_binding(state)
+        if args.intent_revision != binding["revision"] or handoff.get("intent_revision") != binding["revision"]:
+            fail("manual import intent revision is stale")
+        if args.candidate_fingerprint != attempt.get("candidate_sha") or handoff.get("candidate_fingerprint") != attempt.get("candidate_sha"):
+            fail("manual import candidate is not the prepared frozen candidate")
+        if packet.get("subject_fingerprint") != attempt.get("candidate_sha"):
+            fail("manual import packet subject is not the prepared frozen candidate")
+        if context.get("packet_hash") != attempt.get("packet_hash"):
+            fail("context receipt packet hash does not match prepared handoff")
+        expected_manifest = handoff.get("manifest_ref", "").removeprefix("sha256:")
+        if context.get("export_hash") != expected_manifest:
+            fail("context receipt export hash does not match prepared handoff")
+        verify_manual_inventory_exact(env, handoff)
+        check_integrity(integrity, state, previous_raw, attempt.get("candidate_sha"))
+        return_kind = "acceptance" if packet_kind == "acceptance" else "review"
+        payload, digest, return_raw = ingest_payload(
+            p, state, args.attempt_id, return_path, attempt.get("packet_hash"), return_kind
+        )
+        identity = packet_identity(payload)
+        if identity.get("intent_revision") != args.intent_revision:
+            fail("manual return intent revision mismatch")
+        if identity.get("epoch") != attempt.get("epoch"):
+            fail("manual return epoch mismatch")
+        required = [item for item in args.required_criteria.split(",") if item]
+        packet_required = [review_criterion_id(item) for item in packet.get("criteria", [])]
+        if set(required) != set(packet_required):
+            fail("required criteria argument does not match the prepared manual packet")
+        if return_kind == "acceptance":
+            validate_acceptance_return_semantics(payload, packet_required)
+            if payload.get("candidate_fingerprint") != attempt.get("candidate_sha"):
+                fail("manual acceptance return candidate fingerprint mismatch")
+        else:
+            validate_review_return_semantics(payload, packet)
+            if payload.get("subject_fingerprint") != attempt.get("candidate_sha"):
+                fail("manual review return subject fingerprint mismatch")
+        if payload.get("verdict") in ("BLOCK", "UNVERIFIABLE") and not any(
+            item.get("impact") == "blocking" for item in payload.get("findings", [])
+        ):
+            fail("manual BLOCK/UNVERIFIABLE must materialize at least one blocking repairable finding")
+
+        next_state = copy.deepcopy(state)
+        next_attempt = attempt_by_id(next_state, args.attempt_id)
+        next_attempt["state"] = "RETURNED"
+        next_attempt["return_ref"] = f"objects/{digest}"
+        next_attempt["return_source_revision"] = identity.get("source_revision", next_attempt.get("packet_source_revision"))
+        next_attempt["review_result"] = payload.get("verdict")
+        next_attempt["lease"]["state"] = "released"
+        next_attempt["finding_refs"] = append_review_findings(
+            next_state, payload, next_attempt["id"], digest, packet=packet, subject_ref=next_attempt.get("subject_ref")
+        )
+        integrity_raw = canonical_bytes(integrity)
+        env_raw = canonical_bytes(env)
+        context_raw = canonical_bytes(context)
+        integrity_ref = f"objects/{sha256_bytes(integrity_raw)}"
+        review_id = f"REV-{digest[:16]}"
+        next_state.setdefault("reviews", []).append({
+            "id": review_id, "attempt_ref": next_attempt["id"], "purpose": purpose,
+            "mandate": packet.get("mandate", purpose),
+            "subject_fingerprint": attempt.get("candidate_sha"), "verdict": payload.get("verdict"),
+            "accepted": True, "return_ref": f"objects/{digest}", "integrity_ref": integrity_ref,
+            "context_refs": payload.get("context_refs", [context.get("receipt_id")]),
+            "finding_refs": next_attempt["finding_refs"],
+            "finding_resolution": copy.deepcopy(payload.get("finding_resolution", [])),
+            "intent_revision": binding["revision"], "reviewer_identity": context.get("receipt_id"),
+            "reviewer_role": "manual-independent-reviewer", "review_kind": None,
+            "target_artifact_refs": [], "target_artifact_versions": [], "target_revision": None,
+            "invalidated_by": [],
+        })
+        qualification = append_review_qualification(
+            next_state, next_attempt.get("subject_ref"), attempt.get("candidate_sha"),
+            purpose=purpose, created_revision=state["revision"] + 1,
+        )
+        ticket = next((item for item in next_state.get("tickets", []) if item.get("id") == next_attempt.get("subject_ref")), None)
+        finding_refs = next_attempt["finding_refs"]
+        if payload.get("verdict") in ("BLOCK", "UNVERIFIABLE"):
+            issue_id = append_issue(next_state, {
+                "type": "manual_review_verdict", "cause": "oracle", "impact": "blocking",
+                "affected_refs": [next_attempt.get("subject_ref")], "expected": "PASS",
+                "actual": payload.get("verdict"), "disposition": "repair and fresh review required",
+                "resolution_condition": "all manual findings repaired and a fresh purpose-matching review passes",
+            }, source_ref=review_id)
+            next_state["lifecycle"]["phase"] = "VERIFY" if purpose == "final_g5" else next_state["lifecycle"].get("phase")
+            next_state["lifecycle"]["control"] = "BLOCKED"
+            next_state["lifecycle"]["reason"] = "manual_review_not_pass"
+            next_state["lifecycle"]["issue_refs"] = sorted(set(next_state["lifecycle"].get("issue_refs", []) + [issue_id]))
+            next_state["lifecycle"]["next_action"] = {
+                "kind": "authorize_repair", "subject_refs": [next_attempt.get("subject_ref"), *finding_refs],
+                "preconditions": ["bind repair to each current manual finding", "fresh review required after a new candidate"],
+                "read_refs": ["phases/execute.md", "phases/accept.md"],
+            }
+            if purpose == "final_g5":
+                next_state.setdefault("repair_waves", []).append({
+                    "id": f"G5-WAVE-{digest[:16]}",
+                    "source_qualification_ref": qualification["id"],
+                    "source_candidate_fingerprint": attempt.get("candidate_sha"),
+                    "finding_refs": sorted(finding_refs), "state": "OPEN",
+                    "repaired_candidate_fingerprint": None, "final_g5_qualification_ref": None,
+                    "created_revision": state["revision"] + 1, "closed_revision": None,
+                })
+        elif purpose == "final_g5":
+            if qualification.get("result") != "PASS":
+                fail("final G5 PASS conflicts with another accepted result for this candidate; repair and use a fresh candidate")
+            if any(item.get("state") != "INTEGRATED" for item in next_state.get("tickets", []) if item.get("state") != "CANCELLED"):
+                fail("final G5 requires every current ticket to be integrated")
+            if any(effect_is_unresolved(item) for item in next_state.get("operations", [])):
+                fail("final G5 is blocked by an unresolved durable effect")
+            open_waves = [item for item in next_state.get("repair_waves", []) if item.get("state") == "OPEN"]
+            projection = finding_obligation_projection(next_state)
+            status_by_finding = {item.get("finding_ref"): item.get("status") for item in projection.get("items", [])}
+            for wave in open_waves:
+                if wave.get("source_candidate_fingerprint") == attempt.get("candidate_sha"):
+                    fail("G5 repair wave requires a fresh repaired candidate before final re-review")
+                if any(status_by_finding.get(ref) not in ("resolved", "superseded") for ref in wave.get("finding_refs", [])):
+                    fail("G5 repair wave findings are not fully resolved on the fresh candidate")
+                wave["state"] = "CLOSED"
+                wave["repaired_candidate_fingerprint"] = attempt.get("candidate_sha")
+                wave["final_g5_qualification_ref"] = qualification["id"]
+                wave["closed_revision"] = state["revision"] + 1
+            next_state["lifecycle"]["phase"] = "ACCEPT"
+            next_state["lifecycle"]["control"] = "ACTIVE"
+            next_state["lifecycle"]["reason"] = None
+            next_state["lifecycle"]["next_action"] = {
+                "kind": "g6_final_record", "subject_refs": [qualification["id"]],
+                "preconditions": ["final G5 qualification remains current", "no active leases/blockers/effects"],
+                "read_refs": ["phases/accept.md", "references/ledger.md"],
+            }
+        else:
+            next_state["lifecycle"]["control"] = "ACTIVE"
+            next_state["lifecycle"]["reason"] = f"manual_{purpose}_qualified"
+            next_state["lifecycle"]["next_action"] = {
+                "kind": "integrate_candidate" if ticket and ticket.get("state") != "INTEGRATED" else "continue_after_manual_review",
+                "subject_refs": [qualification["id"]],
+                "preconditions": ["consume only the current qualification aggregate"],
+                "read_refs": ["phases/execute.md"],
+            }
+        if purpose == "final_g5":
+            next_state.setdefault("acceptance", []).append({
+                "round": len(next_state.get("acceptance", [])) + 1,
+                "attempt_ref": next_attempt["id"], "purpose": "final_g5",
+                "intent_revision": binding["revision"], "candidate_fingerprint": attempt.get("candidate_sha"),
+                "verdict": payload.get("verdict"), "transport": "user_assisted",
+                "context_grade": "MANUAL_ATTESTED_CLEAN",
+                "setup_receipt_ref": f"objects/{sha256_bytes(env_raw)}",
+                "context_receipt_ref": f"objects/{sha256_bytes(context_raw)}",
+                "integrity_ref": integrity_ref, "return_ref": f"objects/{digest}",
+                "qualification_ref": qualification["id"], "finding_refs": finding_refs,
+                "outcome_refs": finding_refs,
+            })
+        evidence = next_state.setdefault("evidence", [])
+        evidence.append({
+            "id": f"ev-{digest[:16]}", "hash": digest, "source": "manual_review_return",
+            "scenario": purpose, "outcome": payload.get("verdict"),
+            "observer": "independent-reviewer", "subject": attempt.get("candidate_sha"),
+        })
+        add_usage(next_state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {
+            "return_bytes": len(return_raw), "manual_wait": 1,
+        })
+        next_state["revision"] += 1
+        next_state["previous_publication_hash"] = sha256_bytes(previous_raw)
+        next_state["updated_at"] = now()
+        validate_ledger(next_state, verify_files=False)
+        for raw in (return_raw, env_raw, context_raw, integrity_raw):
+            object_store(p, raw)
+        publish(p, next_state, previous_raw)
+    return {
+        "imported": True, "idempotent": False, "purpose": purpose,
+        "verdict": payload.get("verdict"), "qualification_ref": qualification["id"],
+        "acceptance_transport": "user_assisted", "context_grade": "MANUAL_ATTESTED_CLEAN",
+        "release_ready": False, "revision": next_state["revision"],
+    }
 
 
 def cmd_publish_intent(args: argparse.Namespace) -> dict[str, Any]:
@@ -8588,6 +9121,23 @@ def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
             binding = current_intent_binding(state)
             if not latest or latest.get("verdict") != "PASS" or latest.get("intent_revision") != binding["revision"] or latest.get("invalidated_by"):
                 fail("G6 cannot mark ACCEPTED without a fresh current-intent G5 PASS")
+            if (
+                state.get("review_model_version") == "1.1"
+                and (latest.get("purpose") == "final_g5" or latest.get("qualification_ref") is not None)
+            ):
+                final_qualifications = [
+                    item for item in state.get("review_qualifications", [])
+                    if item.get("result") == "PASS"
+                    and item.get("required_purposes") == ["final_g5"]
+                    and item.get("id") == latest.get("qualification_ref")
+                    and item.get("intent_revision") == binding["revision"]
+                    and item.get("subject_fingerprint") == latest.get("candidate_fingerprint")
+                    and latest.get("return_ref") in item.get("accepted_return_refs", [])
+                ]
+                if not final_qualifications:
+                    fail("G6 requires the immutable fresh final-G5 qualification for this exact acceptance return")
+                if any(item.get("state") == "OPEN" for item in state.get("repair_waves", [])):
+                    fail("G6 requires every final-G5 repair wave to be closed")
             open_obligations = [
                 item for item in finding_obligation_projection(state)["obligations"]
                 if item.get("status") != "closed"
@@ -8688,7 +9238,7 @@ def build_parser() -> argparse.ArgumentParser:
     view = sub.add_parser("render-view"); view.add_argument("--control-root", required=True); view.add_argument("--run-id", required=True); view.add_argument("--kind", choices=["status", "final-report"], default="status")
     valid = sub.add_parser("validate"); valid.add_argument("--file", required=True); valid.add_argument("--kind", default="ledger")
     state_valid = sub.add_parser("validate-return"); state_valid.add_argument("--control-root", required=True); state_valid.add_argument("--run-id", required=True); state_valid.add_argument("--attempt-id", required=True); state_valid.add_argument("--return-file", required=True); state_valid.add_argument("--kind", choices=["worker", "review", "acceptance"], required=True)
-    ingest = sub.add_parser("ingest-return"); ingest.add_argument("--control-root", required=True); ingest.add_argument("--run-id", required=True); ingest.add_argument("--owner-token", required=True); ingest.add_argument("--revision", type=int, required=True); ingest.add_argument("--attempt-id", required=True); ingest.add_argument("--return-file", required=True); ingest.add_argument("--kind", default="worker")
+    ingest = sub.add_parser("ingest-return"); ingest.add_argument("--control-root", required=True); ingest.add_argument("--run-id", required=True); ingest.add_argument("--owner-token", required=True); ingest.add_argument("--revision", type=int, required=True); ingest.add_argument("--attempt-id", required=True); ingest.add_argument("--return-file", required=True); ingest.add_argument("--kind", default="worker"); ingest.add_argument("--integrity-receipt")
     dispatch = sub.add_parser("dispatch"); dispatch.add_argument("--control-root", required=True); dispatch.add_argument("--run-id", required=True); dispatch.add_argument("--owner-token", required=True); dispatch.add_argument("--revision", type=int, required=True); dispatch.add_argument("--ticket-id", required=True); dispatch.add_argument("--attempt-id", required=True); dispatch.add_argument("--lease-id", required=True); dispatch.add_argument("--route-id", required=True); dispatch.add_argument("--packet", required=True); dispatch.add_argument("--route")
     ready = sub.add_parser("ready-ticket"); ready.add_argument("--control-root", required=True); ready.add_argument("--run-id", required=True); ready.add_argument("--owner-token", required=True); ready.add_argument("--revision", type=int, required=True); ready.add_argument("--ticket-id", required=True)
     repair = sub.add_parser("authorize-repair"); repair.add_argument("--control-root", required=True); repair.add_argument("--run-id", required=True); repair.add_argument("--owner-token", required=True); repair.add_argument("--revision", type=int, required=True); repair.add_argument("--ticket-id", required=True); repair.add_argument("--finding-ref"); repair.add_argument("--authorization-id", required=True); repair.add_argument("--repair-contract", required=True); repair.add_argument("--packet"); repair.add_argument("--route-id"); repair.add_argument("--route")
@@ -8705,9 +9255,9 @@ def build_parser() -> argparse.ArgumentParser:
     review = sub.add_parser("prepare-review"); review.add_argument("--control-root", required=True); review.add_argument("--run-id", required=True); review.add_argument("--owner-token", required=True); review.add_argument("--revision", type=int, required=True); review.add_argument("--ticket-id", required=True); review.add_argument("--review-attempt-id", required=True); review.add_argument("--lease-id", required=True); review.add_argument("--packet", required=True)
     design_review = sub.add_parser("prepare-design-review"); design_review.add_argument("--control-root", required=True); design_review.add_argument("--run-id", required=True); design_review.add_argument("--owner-token", required=True); design_review.add_argument("--revision", type=int, required=True); design_review.add_argument("--review-attempt-id", required=True); design_review.add_argument("--lease-id", required=True); design_review.add_argument("--packet", required=True); design_review.add_argument("--review-kind", choices=["coverage", "plan"], required=True); design_review.add_argument("--reviewer-identity", required=True); design_review.add_argument("--reviewer-role", required=True)
     adjudicate = sub.add_parser("adjudicate"); adjudicate.add_argument("--control-root", required=True); adjudicate.add_argument("--run-id", required=True); adjudicate.add_argument("--owner-token", required=True); adjudicate.add_argument("--revision", type=int, required=True); adjudicate.add_argument("--decision-file", required=True)
-    integrate = sub.add_parser("integrate"); integrate.add_argument("--control-root", required=True); integrate.add_argument("--run-id", required=True); integrate.add_argument("--owner-token", required=True); integrate.add_argument("--revision", type=int, required=True); integrate.add_argument("--attempt-id", required=True); integrate.add_argument("--review-file", required=True); integrate.add_argument("--integrity-receipt", required=True); integrate.add_argument("--review-id", required=True)
-    handoff = sub.add_parser("prepare-handoff"); handoff.add_argument("--control-root", required=True); handoff.add_argument("--run-id", required=True); handoff.add_argument("--owner-token", required=True); handoff.add_argument("--revision", type=int, required=True); handoff.add_argument("--attempt-id", required=True); handoff.add_argument("--packet", required=True); handoff.add_argument("--projection", required=True); handoff.add_argument("--export-root", required=True); handoff.add_argument("--bundle-root", required=True)
-    manual = sub.add_parser("import-manual"); manual.add_argument("--control-root", required=True); manual.add_argument("--run-id", required=True); manual.add_argument("--owner-token", required=True); manual.add_argument("--revision", type=int, required=True); manual.add_argument("--attempt-id", required=True); manual.add_argument("--return-file", required=True); manual.add_argument("--environment-receipt", required=True); manual.add_argument("--context-receipt", required=True); manual.add_argument("--integrity-receipt", required=True); manual.add_argument("--intent-revision", required=True); manual.add_argument("--candidate-fingerprint", required=True); manual.add_argument("--required-criteria", required=True)
+    integrate = sub.add_parser("integrate"); integrate.add_argument("--control-root", required=True); integrate.add_argument("--run-id", required=True); integrate.add_argument("--owner-token", required=True); integrate.add_argument("--revision", type=int, required=True); integrate.add_argument("--qualification-ref"); integrate.add_argument("--attempt-id"); integrate.add_argument("--review-file"); integrate.add_argument("--integrity-receipt"); integrate.add_argument("--review-id")
+    handoff = sub.add_parser("prepare-handoff"); handoff.add_argument("--control-root", required=True); handoff.add_argument("--run-id", required=True); handoff.add_argument("--owner-token", required=True); handoff.add_argument("--revision", type=int, required=True); handoff.add_argument("--attempt-id", required=True); handoff.add_argument("--packet", required=True); handoff.add_argument("--projection", required=True); handoff.add_argument("--export-root", required=True); handoff.add_argument("--bundle-root", required=True); handoff.add_argument("--purpose", choices=["ticket_change", "ticket_review", "critical_axis", "final_g5"])
+    manual = sub.add_parser("import-manual"); manual.add_argument("--control-root", required=True); manual.add_argument("--run-id", required=True); manual.add_argument("--owner-token", required=True); manual.add_argument("--revision", type=int, required=True); manual.add_argument("--attempt-id", required=True); manual.add_argument("--return-file", required=True); manual.add_argument("--environment-receipt", required=True); manual.add_argument("--context-receipt", required=True); manual.add_argument("--integrity-receipt", required=True); manual.add_argument("--intent-revision", required=True); manual.add_argument("--candidate-fingerprint", required=True); manual.add_argument("--required-criteria", required=True); manual.add_argument("--purpose", choices=["ticket_change", "ticket_review", "critical_axis", "final_g5"])
     audit = sub.add_parser("audit-write-set"); audit.add_argument("--root", required=True); audit.add_argument("--baseline", required=True); audit.add_argument("--declared", required=True); audit.add_argument("--zone", required=True)
     gate = sub.add_parser("gate"); gate.add_argument("--control-root", required=True); gate.add_argument("--run-id", required=True); gate.add_argument("--owner-token", required=True); gate.add_argument("--revision", type=int, required=True); gate.add_argument("--phase"); gate.add_argument("--control"); gate.add_argument("--gate-id", choices=[f"G{i}" for i in range(7)]); gate.add_argument("--reason", default=None); gate.add_argument("--next-action", default="inspect"); gate.add_argument("--subject-refs", default=""); gate.add_argument("--preconditions", default=""); gate.add_argument("--read-refs", default="")
     cancel = sub.add_parser("cancel"); cancel.add_argument("--control-root", required=True); cancel.add_argument("--run-id", required=True); cancel.add_argument("--owner-token", required=True); cancel.add_argument("--revision", type=int, required=True); cancel.add_argument("--reason", default="user_cancelled"); cancel.add_argument("--stop-target", default=None); cancel.add_argument("--finalize", action="store_true"); cancel.add_argument("--stop-evidence")

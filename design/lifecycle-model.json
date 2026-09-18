@@ -1,5 +1,5 @@
 {
-  "model_version": "1.0.11",
+  "model_version": "1.1.0",
   "initial": "PREFLIGHT/ACTIVE",
   "success_terminal": "ACCEPT/ACCEPTED",
   "failure_terminals": [
@@ -12,9 +12,13 @@
     {"id": "REQ", "from": "DESIGN/BLOCKED", "to": "DESIGN/ACTIVE", "guard": "requirements/criteria publication is bound to current intent"},
     {"id": "G2", "from": "DESIGN/ACTIVE", "to": "PLAN/ACTIVE", "guard": "current design publication has coverage PASS and no current blockers"},
     {"id": "G3", "from": "PLAN/ACTIVE", "to": "EXECUTE/ACTIVE", "guard": "coverage and plan PASS apply to current publication; tickets PLANNED or READY"},
-    {"id": "G4", "from": "EXECUTE/ACTIVE", "to": "VERIFY/ACTIVE", "guard": "all current tickets INTEGRATED; leases/effects closed; no current blockers"},
-    {"id": "G5", "from": "VERIFY/ACTIVE", "to": "ACCEPT/ACTIVE", "guard": "fresh current-intent acceptance PASS on exact candidate"},
-    {"id": "G6", "from": "ACCEPT/ACTIVE", "to": "ACCEPT/ACCEPTED", "guard": "G5 remains current; no blockers, leases, or unresolved effects"},
+    {"id": "TICKET_QUALIFY", "from": "EXECUTE/ACTIVE", "to": "EXECUTE/ACTIVE", "guard": "immutable accepted review returns satisfy the exact current candidate purposes; critical tickets require distinct ticket_review and critical_axis attempts"},
+    {"id": "TICKET_INTEGRATE", "from": "EXECUTE/ACTIVE", "to": "EXECUTE/ACTIVE", "guard": "a current PASS ReviewQualification ref is supplied; no return file is re-ingested and no current blocker or finding obligation remains"},
+    {"id": "G4", "from": "EXECUTE/ACTIVE", "to": "VERIFY/ACTIVE", "guard": "all current tickets are integrated from current PASS qualifications; leases/effects closed; no current blockers"},
+    {"id": "G5", "from": "VERIFY/ACTIVE", "to": "ACCEPT/ACTIVE", "guard": "fresh current-intent final_g5 PASS qualification on the exact candidate"},
+    {"id": "G5_BLOCK", "from": "VERIFY/ACTIVE", "to": "VERIFY/BLOCKED", "guard": "immutable final_g5 BLOCK qualification publishes durable findings and an OPEN candidate-bound repair wave"},
+    {"id": "G5_REPAIR", "from": "VERIFY/BLOCKED", "to": "EXECUTE/ACTIVE", "guard": "repair is authorized from the exact open-wave findings; historical final_g5 PASS cannot close the wave"},
+    {"id": "G6", "from": "ACCEPT/ACTIVE", "to": "ACCEPT/ACCEPTED", "guard": "the exact acceptance return has a fresh current-candidate final_g5 PASS qualification; repair waves are closed; no blockers, leases, or unresolved effects"},
     {"id": "DESIGN_REPAIR", "from": "PLAN/BLOCKED", "to": "DESIGN/ACTIVE", "guard": "current publication requires revision and publication leases are closed"},
     {"id": "EXECUTION_REPAIR_VERIFY", "from": "VERIFY/BLOCKED", "to": "EXECUTE/ACTIVE", "guard": "finding is classified as implementation repair"},
     {"id": "BLOCKED_CONTINUATION_CANDIDATE", "from": "EXECUTE/BLOCKED", "to": "EXECUTE/BLOCKED", "guard": "owner authorization, external/out-of-scope blocker, passing focused checks, exact same-ticket lease/provenance, and complete non-empty write-set audit; candidate remains continuation-only"},
@@ -73,6 +77,16 @@
       "initial": "PENDING",
       "terminal": ["PASS", "BLOCK", "UNVERIFIABLE"],
       "transitions": [["PENDING", "PASS"], ["PENDING", "BLOCK"], ["PENDING", "UNVERIFIABLE"]]
+    },
+    "review_qualification": {
+      "initial": "INCOMPLETE",
+      "terminal": ["PASS", "BLOCK"],
+      "transitions": [["INCOMPLETE", "PASS"], ["INCOMPLETE", "BLOCK"]]
+    },
+    "repair_wave": {
+      "initial": "OPEN",
+      "terminal": ["CLOSED"],
+      "transitions": [["OPEN", "CLOSED"]]
     }
   },
   "required_success_edges": ["G0", "G1", "REQ", "G2", "G3", "G4", "G5", "G6"]
