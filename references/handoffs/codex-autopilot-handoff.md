@@ -1158,3 +1158,19 @@ CODEX AUTOPILOT
 - Focused evidence: dedicated Phase E modules `11/11`; Phase E + state-machine/legacy G6 `16/16`; isolated v1.0.4 + Phase E compatibility `12/12`. `py_compile`, оба JSON parse и `git diff --check` — PASS.
 - Live Idea Scout не открывался и не изменялся. Production R58 migration/recovery остаётся исключительно Phase F.
 - Следующая сессия начинает только Phase F из master hardening plan. Push не выполнялся.
+
+# 34. Durable status: v1.1.0 hardening through Phase F
+
+Актуальное состояние после завершения Phase F:
+
+- Ветка: `codex/v1.1.0-hardening`.
+- Phases A–F завершены; Phase G не начата.
+- Phase F implementation commit: `92b7bed` — dry-run binding assessment, append-only normalization, exact Review05 finding recovery, current/history/carry-forward projection и read-only R58 rehearsal.
+- Новые публичные команды: `assess-legacy-bindings`, `migrate-legacy-bindings`, `reconcile-finding-bindings`, `rehearse-legacy-recovery`. Mutating-команды owner/CAS-fenced, хранят exact manifest content-addressed и допускают только source/applied/current revision для idempotent replay.
+- Raw ticket/contract refs, original Review05 return/findings/issues и frozen publication bytes не переписываются. Effective overlay классифицирует только доказанные metadata-only self-input пары как `specification_only`; остальные contract inputs требуют отдельного availability evidence или допустимого producer path. `active` status сам по себе availability не доказывает.
+- Exact R58 rehearsal подтверждает 13 self-input intersections, 3 current Review05 findings, 7 historical T02 carry-forward findings, 11 historical design findings, continuation candidate `ef8da4ff49cc7f8014d90f463acf8319ad7c1335` и активный external blocker `issue-62c0073109c9529a`. Derived next action — bounded grouped repair authorization, а не stale await.
+- Semantic ledger validation отвергает duplicate/overlapping normalization records, malformed reconciliation links, drifted manifest refs/hashes, stale issue mirrors и неверные ticket/candidate/review/finding bindings.
+- Dedicated Phase F suite: `5/5`; focused Phase B/F + design/effect compatibility: `51/51`; isolated 40-ticket qualification: `138.529s` при guard `<180s`; v1.0.4 qualification и Wave1: PASS.
+- Финальный suite: `186 tests in 414.030s, OK, skipped=1`. Skip — прежний документированный opt-in production-checkpoint audit. `py_compile`, contracts/lifecycle JSON parse, CLI parser smoke check и `git diff --check` — PASS.
+- Live Idea Scout не открывался и не изменялся; production R58 recovery не выполнялся. Все mutating rehearsal/regression paths работали только на complete disposable copies.
+- Следующая сессия начинает только Phase G из master hardening plan. Phase G в этой сессии не начата. Push не выполнялся.
