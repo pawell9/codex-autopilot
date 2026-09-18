@@ -247,13 +247,18 @@ class DesignPublicationTests(unittest.TestCase):
             final, _ = ledger.load_state(paths)
             self.assertEqual("PREPARED", next(item for item in final["attempts"] if item["id"] == "A-recovered")["state"])
 
-    def test_legacy_ledger_without_publication_metadata_remains_valid(self) -> None:
+    def test_legacy_ledger_without_publication_metadata_remains_readable_but_recovery_is_fenced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); control, _, _ = self.setup_g1(root); paths = ledger.paths(control, "design-run")
             state, _ = ledger.load_state(paths); state["skill_version"] = "1.0.1"; state.pop("runtime_provenance", None); state.pop("design_publication", None); ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
             run("validate", "--file", str(paths["ledger"]), "--kind", "ledger")
-            resumed = run("recover", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]))
-            self.assertIn('"recovering": true', resumed.stdout)
+            original = paths["ledger"].read_bytes()
+            diagnostic = json.loads(run("diagnose", "--control-root", str(control), "--run-id", "design-run").stdout)
+            self.assertTrue(diagnostic["readable"])
+            self.assertFalse(diagnostic["mutation_eligible"])
+            resumed = run("recover", "--control-root", str(control), "--run-id", "design-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), expect=2)
+            self.assertIn("mutation is read-only", resumed.stderr)
+            self.assertEqual(original, paths["ledger"].read_bytes())
 
     def test_mixed_review_kinds_are_not_disagreement_and_state_preflight_matches_ingest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

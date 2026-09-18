@@ -64,7 +64,7 @@ class InitialIntentTests(unittest.TestCase):
             state, raw = ledger.load_state(paths)
             ledger.validate_ledger(state)
             run("validate", "--file", str(paths["ledger"]), "--kind", "ledger")
-            self.assertEqual("1.0.11", state["skill_version"])
+            self.assertEqual("1.1.0", state["skill_version"])
             self.assertEqual(1, state["revision"])
             self.assertEqual(ledger.sha256_bytes(initial_raw), state["previous_publication_hash"])
             self.assertEqual(initial_raw, paths["prev"].read_bytes())
@@ -106,7 +106,7 @@ class InitialIntentTests(unittest.TestCase):
             self.assertEqual("intent-v1", final["invalidations"][0]["previous_intent_revision"])
             self.assertEqual("g1_recheck", final["lifecycle"]["next_action"]["kind"])
 
-    def test_blocked_preflight_and_legacy_ledger_can_publish_initial_intent(self) -> None:
+    def test_legacy_ledger_is_readable_but_requires_explicit_migration_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             control, _ = self.init_run(root)
@@ -116,7 +116,12 @@ class InitialIntentTests(unittest.TestCase):
             legacy.pop("runtime_provenance", None)
             legacy.pop("run_settings")
             ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(legacy))
-            run(
+            original = paths["ledger"].read_bytes()
+            diagnostic = json.loads(run("diagnose", "--control-root", str(control), "--run-id", "run-bootstrap").stdout)
+            self.assertTrue(diagnostic["readable"])
+            self.assertFalse(diagnostic["mutation_eligible"])
+            self.assertIn("append-only migration", diagnostic["reason"])
+            rejected_gate = run(
                 "gate",
                 "--control-root", str(control),
                 "--run-id", "run-bootstrap",
@@ -125,17 +130,16 @@ class InitialIntentTests(unittest.TestCase):
                 "--control", "BLOCKED",
                 "--reason", "missing_initial_intent",
                 "--next-action", "publish-initial-intent",
+                expect=2,
             )
+            self.assertIn("mutation is read-only", rejected_gate.stderr)
             source = root / "intent.md"
             source.write_text("# Recovered initial intent\n", encoding="utf-8")
 
-            published = json.loads(self.publish(control, source, revision=1).stdout)
-            self.assertEqual(2, published["revision"])
-            self.assertEqual("ACTIVE", published["control"])
-            state, _ = ledger.load_state(paths)
-            self.assertEqual("1.0.0", state["skill_version"])
-            self.assertNotIn("run_settings", state)
-            self.assertEqual(ledger.DEFAULT_RUN_SETTINGS, ledger.resolved_run_settings(state))
+            rejected_intent = self.publish(control, source, revision=0, expect=2)
+            self.assertIn("append-only migration", rejected_intent.stderr)
+            self.assertEqual(original, paths["ledger"].read_bytes())
+            self.assertFalse(paths["docs"].exists())
 
     def test_invalid_bootstrap_inputs_leave_ledger_and_docs_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

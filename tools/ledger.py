@@ -27,13 +27,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.0.11"
+SKILL_VERSION = "1.1.0"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
+STATE_CONTRACT_VERSION = "1.1"
+WRITER_VERSION = SKILL_VERSION
 COMPATIBILITY_FLOOR = "1.0.0"
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 PHASES = ("PREFLIGHT", "INTENT", "DESIGN", "PLAN", "EXECUTE", "VERIFY", "ACCEPT")
 CONTROLS = ("ACTIVE", "QUIESCING", "PAUSED", "BLOCKED", "RECOVERING", "ACCEPTED", "FAILED", "CANCELLED")
 CAUSES = ("implementation", "contract", "oracle", "environment", "permission", "ownership", "orchestration", "user_intent", "unknown")
@@ -164,6 +167,60 @@ def ensure_runtime_provenance(state: dict[str, Any]) -> dict[str, Any]:
     provenance.setdefault("compatibility_floor", COMPATIBILITY_FLOOR)
     provenance.setdefault("applied_migrations", [])
     return provenance
+
+
+def semver_tuple(value: Any) -> tuple[int, int, int] | None:
+    """Parse strict numeric semantic versions; malformed floors fail closed."""
+    if not isinstance(value, str):
+        return None
+    match = SEMVER_RE.fullmatch(value)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def mutation_ineligibility(state: dict[str, Any]) -> str | None:
+    """Return the read-only reason, or None when this writer may mutate state."""
+    if state.get("schema_version") != SCHEMA_VERSION:
+        return f"unsupported shape schema {state.get('schema_version')!r}; upgrade with a helper that supports it"
+    provenance = state.get("runtime_provenance")
+    if not isinstance(provenance, dict):
+        return (
+            "legacy state has no v1.1 semantic writer metadata; read-only until an "
+            "explicit owner-authorized append-only migration to state contract 1.1"
+        )
+    contract = provenance.get("state_contract_version")
+    minimum = provenance.get("minimum_writer_version")
+    if contract is None or minimum is None:
+        return (
+            "legacy state lacks v1.1 semantic contract/minimum writer metadata; read-only until an "
+            "explicit owner-authorized append-only migration to state contract 1.1"
+        )
+    if contract != STATE_CONTRACT_VERSION:
+        return (
+            f"state contract {contract!r} is not recognized by writer {WRITER_VERSION}; "
+            "diagnose read-only and use a compatible upgrade/migration"
+        )
+    floor = semver_tuple(minimum)
+    writer = semver_tuple(WRITER_VERSION)
+    if floor is None:
+        return f"malformed minimum_writer_version {minimum!r}; mutation is forbidden"
+    if writer is None:
+        return f"helper writer version {WRITER_VERSION!r} is malformed; mutation is forbidden"
+    if writer < floor:
+        return f"state requires writer {minimum} or newer; current writer is {WRITER_VERSION}"
+    if provenance.get("current_schema_version") != state.get("schema_version"):
+        return (
+            "runtime provenance current_schema_version does not match ledger schema_version; "
+            "repair through an explicit owner-authorized migration"
+        )
+    return None
+
+
+def require_mutation_eligible(state: dict[str, Any]) -> None:
+    reason = mutation_ineligibility(state)
+    if reason is not None:
+        fail(f"mutation is read-only: {reason}")
 
 
 def resolved_run_settings(state: dict[str, Any]) -> dict[str, str]:
@@ -641,6 +698,23 @@ def load_state(p: dict[str, Path]) -> tuple[dict[str, Any], bytes]:
     return state, raw
 
 
+def load_mutation_state(
+    p: dict[str, Path],
+    owner_token: str,
+    expected_revision: int | None = None,
+    *,
+    verified: tuple[dict[str, Any], bytes] | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Load or admit a verified publication under owner, revision, and writer fences."""
+    state, raw = verified if verified is not None else load_state(p)
+    if state["owner"]["token"] != owner_token:
+        fail("owner token mismatch; stale orchestrator is fenced")
+    if expected_revision is not None and state["revision"] != expected_revision:
+        fail(f"revision mismatch: expected {expected_revision}, current {state['revision']}")
+    require_mutation_eligible(state)
+    return state, raw
+
+
 def verified_state_file(path: Path, expected_run_id: str) -> tuple[dict[str, Any], bytes] | None:
     """Return only a canonical, schema-valid publication suitable for recovery."""
     try:
@@ -717,6 +791,9 @@ def prune_snapshots(p: dict[str, Path]) -> None:
 
 
 def publish(p: dict[str, Path], state: dict[str, Any], previous_raw: bytes | None, snapshot_kind: str | None = None) -> None:
+    # Final fence for every publication path, including commands that retain
+    # their own lock/publish flow instead of using transaction().
+    require_mutation_eligible(state)
     ensure_runtime_provenance(state)
     validate_ledger(state)
     if previous_raw is not None:
@@ -748,10 +825,17 @@ def transaction(
             fail("owner token mismatch; stale orchestrator is fenced")
         if expected_revision is not None and state["revision"] != expected_revision:
             if retry_reconcile is not None and state["revision"] == expected_revision + 1:
+                # Retry reconciliation is allowed to repair publication
+                # artifacts (for example, a missing snapshot), so it is a
+                # mutation path and must observe the semantic writer floor.
+                require_mutation_eligible(state)
                 reconciled = retry_reconcile(state)
                 if reconciled is not None:
                     raise IdempotentResult(reconciled)
             fail(f"revision mismatch: expected {expected_revision}, current {state['revision']}")
+        state, previous_raw = load_mutation_state(
+            p, token, expected_revision, verified=(state, previous_raw)
+        )
         next_state = copy.deepcopy(state)
         builder = WritePlanBuilder()
         plan_context = _ACTIVE_WRITE_PLAN.set(builder)
@@ -1864,7 +1948,7 @@ def base_state(control_root: Path, run_id: str, repo_root: Path, token: str) -> 
     return {
         "schema_version": SCHEMA_VERSION, "run_id": run_id, "revision": 0, "previous_publication_hash": None,
         "updated_at": now(), "skill_version": SKILL_VERSION, "policy_version": POLICY_VERSION,
-        "runtime_provenance": {"creation_skill_version": SKILL_VERSION, "current_schema_version": SCHEMA_VERSION, "last_mutating_skill_version": SKILL_VERSION, "compatibility_floor": COMPATIBILITY_FLOOR, "applied_migrations": []},
+        "runtime_provenance": {"creation_skill_version": SKILL_VERSION, "current_schema_version": SCHEMA_VERSION, "last_mutating_skill_version": SKILL_VERSION, "compatibility_floor": COMPATIBILITY_FLOOR, "state_contract_version": STATE_CONTRACT_VERSION, "minimum_writer_version": WRITER_VERSION, "applied_migrations": []},
         "repository": {"control_root": str(control_root), "execution_root": str(repo_root), "common_dir": "", "initial_head": None, "branch": "", "checkout": str(repo_root), "inventory_ref": None, "instruction_refs": []},
         "owner": {"token": token, "epoch": 0, "observed_session": None, "handoff_ref": None, "attestation_ref": None},
         "run_settings": dict(DEFAULT_RUN_SETTINGS),
@@ -1930,11 +2014,7 @@ def cmd_publish_usage(args: argparse.Namespace) -> dict[str, Any]:
     event_hash = sha256_bytes(raw)
     event_ref = f"objects/{event_hash}"
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
-        if state["owner"]["token"] != args.owner_token:
-            fail("owner token mismatch; stale orchestrator is fenced")
-        if state["revision"] != args.revision:
-            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
         usage = state.setdefault("usage", default_usage())
         usage.setdefault("counters", zero_usage()); usage.setdefault("trace", []); usage.setdefault("shared_setup", zero_usage()); usage.setdefault("gate_costs", {f"G{i}": zero_usage() for i in range(7)})
         if event["id"] in {item.get("id") for item in usage["trace"]}:
@@ -2005,35 +2085,60 @@ def cmd_validate(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_diagnose(args: argparse.Namespace) -> dict[str, Any]:
-    """Read-only header/hash diagnostic that never upgrades unknown schemas."""
+    """Read-only shape and semantic-writer diagnostic; never upgrades state."""
     p = paths(args.control_root, args.run_id)
     regular_non_symlink(p["ledger"])
     raw = p["ledger"].read_bytes()
     try:
         state = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
-        return {"read_only": True, "supported": False, "reason": f"corrupt ledger: {exc}", "ledger_hash": sha256_bytes(raw)}
+        return {"read_only": True, "supported": False, "shape_supported": False, "readable": False, "valid": False, "mutation_eligible": False, "reason": f"corrupt ledger: {exc}", "required_action": "recover from a verified previous publication or snapshot", "ledger_hash": sha256_bytes(raw)}
     schema_version = state.get("schema_version")
     supported = schema_version == SCHEMA_VERSION
-    result = {"read_only": True, "supported": supported, "schema_version": schema_version, "supported_schema_version": SCHEMA_VERSION, "run_id": state.get("run_id"), "revision": state.get("revision"), "creation_skill_version": state.get("skill_version"), "runtime_provenance": state.get("runtime_provenance"), "ledger_hash": sha256_bytes(raw)}
+    result = {
+        "read_only": True,
+        "supported": supported,
+        "shape_supported": supported,
+        "readable": False,
+        "valid": False,
+        "mutation_eligible": False,
+        "schema_version": schema_version,
+        "supported_schema_version": SCHEMA_VERSION,
+        "state_contract_version": (state.get("runtime_provenance") or {}).get("state_contract_version") if isinstance(state.get("runtime_provenance"), dict) else None,
+        "minimum_writer_version": (state.get("runtime_provenance") or {}).get("minimum_writer_version") if isinstance(state.get("runtime_provenance"), dict) else None,
+        "current_writer_version": WRITER_VERSION,
+        "run_id": state.get("run_id"),
+        "revision": state.get("revision"),
+        "creation_skill_version": state.get("skill_version"),
+        "runtime_provenance": state.get("runtime_provenance"),
+        "ledger_hash": sha256_bytes(raw),
+    }
     if not supported:
-        result["reason"] = "unknown schema; mutation is forbidden"
+        result["reason"] = "unknown shape schema; use a helper that supports it; mutation is forbidden"
+        result["required_action"] = "upgrade to a helper that supports this shape schema"
         return result
     try:
         validate_ledger(state)
         result["valid"] = True
+        result["readable"] = True
     except LedgerError as exc:
         result["valid"] = False
         result["reason"] = str(exc)
+        result["required_action"] = "repair or migrate the invalid ledger before mutation"
+        return result
+    reason = mutation_ineligibility(state)
+    if reason is None:
+        result["mutation_eligible"] = True
+    else:
+        result["reason"] = reason
+        result["required_action"] = reason
     return result
 
 
 def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
-        if state["owner"]["token"] != args.owner_token:
-            fail("owner token mismatch; stale orchestrator is fenced")
+        state, previous_raw = load_mutation_state(p, args.owner_token)
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
             fail("terminal run is immutable; start a successor run")
         attempt = attempt_by_id(state, args.attempt_id)
@@ -2181,7 +2286,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         validate_route_eligibility(route)
         if route.get("id") not in (None, args.route_id):
             fail("route ID does not match dispatch route-id")
-    observed, _ = load_state(p)
+    observed, _ = load_mutation_state(p, args.owner_token)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
     existing_attempt = next((item for item in observed.get("attempts", []) if item.get("id") == args.attempt_id), None)
@@ -2415,7 +2520,7 @@ def cmd_candidate(args: argparse.Namespace) -> dict[str, Any]:
     receipt = read_json(Path(args.commit_receipt), "Git candidate receipt")
     if receipt.get("status") != "PASS" or not GIT_SHA_RE.fullmatch(receipt.get("commit_sha", "")) or not GIT_SHA_RE.fullmatch(receipt.get("tree_sha", "")):
         fail("candidate requires PASS receipt with commit_sha and tree_sha")
-    observed, _ = load_state(p)
+    observed, _ = load_mutation_state(p, args.owner_token)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
     observed_attempt = attempt_by_id(observed, args.attempt_id)
@@ -2568,7 +2673,7 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
         or not GIT_SHA_RE.fullmatch(commit_receipt.get("tree_sha", ""))
     ):
         fail("continuation candidate requires a PASS receipt with commit_sha and tree_sha")
-    observed, _ = load_state(p)
+    observed, _ = load_mutation_state(p, args.owner_token)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
     observed_attempt = attempt_by_id(observed, args.attempt_id)
@@ -2777,7 +2882,7 @@ def cmd_preserve_blocked_candidate(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_prepare_effect(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
-    observed, _ = load_state(p)
+    observed, _ = load_mutation_state(p, args.owner_token)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
     existing = next((item for item in observed.get("operations", []) if item.get("id") == args.operation_id), None)
@@ -2806,7 +2911,7 @@ def cmd_reconcile_effect(args: argparse.Namespace) -> dict[str, Any]:
         receipt = read_json(receipt_path, "effect receipt")
         receipt_raw = receipt_path.read_bytes()
         receipt_ref = f"objects/{sha256_bytes(receipt_raw)}"
-    observed, _ = load_state(p)
+    observed, _ = load_mutation_state(p, args.owner_token)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
     observed_operation = next((item for item in observed.get("operations", []) if item.get("id") == args.operation_id), None)
@@ -2986,7 +3091,7 @@ def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
         add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": packet_path.stat().st_size, "spawn_calls": 1})
         state["lifecycle"]["next_action"] = {"kind": "await_design_review_return", "subject_refs": [args.review_attempt_id, publication["id"]], "preconditions": ["reviewer identity/role registered", "reviewer stopped", "exact bundle fingerprint and revision"], "read_refs": ["contracts/reviewer.md", "phases/design.md", "references/ledger.md"]}
 
-    observed, _ = load_state(p)
+    observed, _ = load_mutation_state(p, args.owner_token)
     if observed["owner"]["token"] != args.owner_token:
         fail("owner token mismatch; stale orchestrator is fenced")
     observed_attempt = next((item for item in observed.get("attempts", []) if item.get("id") == args.review_attempt_id), None)
@@ -3011,11 +3116,7 @@ def cmd_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
     if not decision.get("reason") or not decision.get("evidence_refs"):
         fail("adjudication requires a reason and evidence references")
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
-        if state["owner"]["token"] != args.owner_token:
-            fail("owner token mismatch; stale orchestrator is fenced")
-        if state["revision"] != args.revision:
-            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
         if decision["id"] in {item.get("id") for item in state.get("decisions", [])}:
             fail("decision ID already exists")
         review_ids = set(decision.get("supersedes", []))
@@ -3055,11 +3156,7 @@ def cmd_integrate(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     integrity = read_json(Path(args.integrity_receipt), "integrity receipt")
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
-        if state["owner"]["token"] != args.owner_token:
-            fail("owner token mismatch; stale orchestrator is fenced")
-        if state["revision"] != args.revision:
-            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
         attempt = attempt_by_id(state, args.attempt_id)
         if attempt.get("kind") != "review" or attempt.get("mode") == "user_assisted":
             fail("integration requires a separate immutable reviewer attempt")
@@ -3366,7 +3463,7 @@ def cmd_close_blocked_attempt(args: argparse.Namespace) -> dict[str, Any]:
     closure_id = safe_id(f"blocked-close-{attempt_id}", "blocked closure ID")
 
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
+        state, previous_raw = load_mutation_state(p, args.owner_token)
         if state["owner"]["token"] != args.owner_token:
             fail("owner token mismatch; stale orchestrator is fenced")
         attempt = attempt_by_id(state, attempt_id)
@@ -3595,7 +3692,7 @@ def cmd_reconcile_quarantined_attempt(args: argparse.Namespace) -> dict[str, Any
     }
 
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
+        state, previous_raw = load_mutation_state(p, args.owner_token)
         if state["owner"]["token"] != args.owner_token:
             fail("owner token mismatch; stale orchestrator is fenced")
         attempt = attempt_by_id(state, attempt_id)
@@ -4020,11 +4117,7 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
     if leaked:
         fail(f"projection leaks forbidden history/self-rating fields: {sorted(leaked)}")
     with Lock(p["lock"]):
-        state, _ = load_state(p)
-        if state["owner"]["token"] != args.owner_token:
-            fail("owner token mismatch; stale orchestrator is fenced")
-        if state["revision"] != args.revision:
-            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        state, _ = load_mutation_state(p, args.owner_token, args.revision)
         binding = current_intent_binding(state)
         if projection.get("intent_revision") != binding["revision"]:
             fail("acceptance projection is not the current intent revision")
@@ -4125,9 +4218,7 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
     baseline_path = Path(args.integrity_receipt).expanduser().resolve()
     baseline = read_json(baseline_path, "integrity receipt")
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
-        if state["owner"]["token"] != args.owner_token:
-            fail("owner token mismatch; stale orchestrator is fenced")
+        state, previous_raw = load_mutation_state(p, args.owner_token)
         attempt = attempt_by_id(state, args.attempt_id)
         proposed_path = inbox_file(p, args.attempt_id, return_path)
         proposed_ref = f"objects/{sha256_file(proposed_path)}"
@@ -4250,11 +4341,7 @@ def cmd_publish_intent(args: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
 
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
-        if state["owner"]["token"] != args.owner_token:
-            fail("owner token mismatch; stale orchestrator is fenced")
-        if state["revision"] != args.revision:
-            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
         if state.get("intent") is not None:
             fail("initial intent already exists; use amend for a new intent revision")
         if any(document.get("kind") == "intent" for document in state.get("documents", [])):
@@ -4372,7 +4459,7 @@ def cmd_adopt_requirements(args: argparse.Namespace) -> dict[str, Any]:
                 fail(f"requirement/criterion binding is not bidirectional: {criterion['id']}")
 
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
+        state, previous_raw = load_mutation_state(p, args.owner_token)
         if state["owner"]["token"] != args.owner_token:
             fail("owner token mismatch; stale orchestrator is fenced")
         existing_publication = next((item for item in state.get("requirements_publications", []) if item.get("id") == manifest["publication_id"]), None)
@@ -4738,11 +4825,7 @@ def cmd_migrate_review_currentness(args: argparse.Namespace) -> dict[str, Any]:
     """Fence provably historical legacy review findings without rewriting them."""
     p = paths(args.control_root, args.run_id)
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
-        if state["owner"]["token"] != args.owner_token:
-            fail("owner token mismatch; stale orchestrator is fenced")
-        if state["revision"] != args.revision:
-            fail(f"revision mismatch: expected {args.revision}, current {state['revision']}")
+        state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
             fail("terminal run is immutable; start a successor run")
         publication = current_design_publication(state)
@@ -4908,7 +4991,7 @@ def cmd_publish_design_bundle(args: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
 
     with Lock(p["lock"]):
-        state, previous_raw = load_state(p)
+        state, previous_raw = load_mutation_state(p, args.owner_token)
         if state["owner"]["token"] != args.owner_token:
             fail("owner token mismatch; stale orchestrator is fenced")
         existing = state.get("design_publication")
@@ -5289,6 +5372,7 @@ def cmd_recover(args: argparse.Namespace) -> dict[str, Any]:
             fail("owner token mismatch; stale orchestrator is fenced")
         if not args.takeover and args.revision not in (state["revision"], state["revision"] + 1):
             fail(f"recovery revision does not match verified checkpoint: {args.revision}")
+        require_mutation_eligible(state)
         if args.takeover:
             if not args.new_owner_token:
                 fail("takeover requires a new owner token")

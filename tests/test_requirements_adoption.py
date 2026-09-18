@@ -31,7 +31,7 @@ class RequirementsAdoptionTests(unittest.TestCase):
         paths = ledger.paths(control, "adopt-run")
         state, _ = ledger.load_state(paths)
         state["skill_version"] = legacy_version
-        state.pop("runtime_provenance", None)
+        state["runtime_provenance"]["creation_skill_version"] = legacy_version
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
         intent = root / "intent.md"; intent.write_text("# Intent\n\nExplicit R-1 / C-1.\n", encoding="utf-8")
         run("publish-intent", "--control-root", str(control), "--run-id", "adopt-run", "--owner-token", "owner-a", "--revision", "0", "--intent-file", str(intent), "--doc-id", "D-intent", "--doc-version", "v1", "--intent-revision", "v1")
@@ -71,7 +71,7 @@ class RequirementsAdoptionTests(unittest.TestCase):
             paths = ledger.paths(control, "adopt-run")
             state, _ = ledger.load_state(paths)
             self.assertEqual("1.0.0", state["skill_version"])
-            self.assertEqual("1.0.11", state["runtime_provenance"]["last_mutating_skill_version"])
+            self.assertEqual("1.1.0", state["runtime_provenance"]["last_mutating_skill_version"])
             self.assertEqual("adopt-requirements-RP-1", state["runtime_provenance"]["applied_migrations"][0]["id"])
             bundle = self.bundle(root, control)
             run("publish-design-bundle", "--control-root", str(control), "--run-id", "adopt-run", "--owner-token", "owner-a", "--revision", "3", "--bundle", str(bundle))
@@ -151,7 +151,7 @@ class RequirementsAdoptionTests(unittest.TestCase):
                 migrated, _ = ledger.load_state(paths)
                 self.assertEqual(version, migrated["skill_version"])
                 self.assertEqual(version, migrated["runtime_provenance"]["creation_skill_version"])
-                self.assertEqual("1.0.11", migrated["runtime_provenance"]["last_mutating_skill_version"])
+                self.assertEqual("1.1.0", migrated["runtime_provenance"]["last_mutating_skill_version"])
                 ledger.validate_ledger(migrated)
 
     def test_reviewer_loss_closes_attempt_and_lease_atomically(self) -> None:

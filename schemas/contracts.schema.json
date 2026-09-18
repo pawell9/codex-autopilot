@@ -91,7 +91,7 @@
     "runtime_provenance": {
       "type": "object", "additionalProperties": false,
       "required": ["creation_skill_version", "current_schema_version", "last_mutating_skill_version", "compatibility_floor", "applied_migrations"],
-      "properties": {"creation_skill_version": {"type": "string"}, "current_schema_version": {"type": "string"}, "last_mutating_skill_version": {"type": "string"}, "compatibility_floor": {"type": "string"}, "applied_migrations": {"type": "array", "items": {"$ref": "#/$defs/migration_record"}}}
+      "properties": {"creation_skill_version": {"type": "string"}, "current_schema_version": {"type": "string"}, "last_mutating_skill_version": {"type": "string"}, "compatibility_floor": {"type": "string"}, "state_contract_version": {"type": "string"}, "minimum_writer_version": {"type": "string"}, "applied_migrations": {"type": "array", "items": {"$ref": "#/$defs/migration_record"}}}
     },
     "requirements_manifest": {
       "type": "object", "additionalProperties": false,
