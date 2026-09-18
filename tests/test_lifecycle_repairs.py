@@ -11,6 +11,7 @@ from tests.test_phase_g_execution_binding_v110 import (
     install_current_execution_authority,
     publish_fixture_route,
 )
+from tests.test_phase_g_runtime_observations_v110 import record_runtime_event
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -309,12 +310,18 @@ class LifecycleRepairTests(unittest.TestCase):
         state["revision"] = 2
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
         self.publish_candidate_history(state)
+        ledger.initialize_attempt_runtime("repair-run", ledger.attempt_by_id(state, "A-repair"))
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        record_runtime_event(
+            control, "repair-run", "owner-a", paths, "A-repair", "stop",
+            "OBS-A-repair-STOP", instance="runtime-A-repair", descendant_writers="included",
+        )
         return control, repo, paths, baseline, candidate
 
     def reconcile_legacy(self, control: Path, baseline: Path | None, candidate: str, *, expect: int = 0, base: str | None = None) -> subprocess.CompletedProcess[str]:
-        args = ["reconcile-quarantined-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--attempt-id", "A-repair", "--prior-attempt-id", "A-create", "--finding-ref", "F-1", "--candidate-sha", candidate, "--base-sha", base or candidate, "--reconciliation-id", "QR-1", "--actor", "test-operator"]
+        state, _ = ledger.load_state(ledger.paths(control, "repair-run"))
+        args = ["reconcile-quarantined-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--ticket-id", "T-1", "--attempt-id", "A-repair", "--prior-attempt-id", "A-create", "--finding-ref", "F-1", "--candidate-sha", candidate, "--base-sha", base or candidate, "--reconciliation-id", "QR-1", "--actor", "test-operator"]
         if baseline is not None:
             args.extend(["--baseline", str(baseline)])
         return run(*args, expect=expect)
@@ -359,8 +366,13 @@ class LifecycleRepairTests(unittest.TestCase):
         state["revision"] = 2
         state["previous_publication_hash"] = ledger.sha256_bytes(previous)
         self.publish_candidate_history(state)
+        ledger.initialize_attempt_runtime("repair-run", ledger.attempt_by_id(state, "A-blocked"))
         ledger.validate_ledger(state)
         ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        record_runtime_event(
+            control, "repair-run", "owner-a", paths, "A-blocked", "stop",
+            "OBS-A-blocked-STOP", instance="runtime-A-blocked", descendant_writers="included",
+        )
         return control, repo, paths, old_candidate, candidate
 
     def test_dispatch_return_ingest_is_internal_and_advances_without_checkpoint(self) -> None:
@@ -387,7 +399,7 @@ class LifecycleRepairTests(unittest.TestCase):
             control, _, paths, _, candidate = self.seed_blocked_no_write_repair(root)
             before, _ = ledger.load_state(paths)
             before_attempt_ids = [item["id"] for item in before["attempts"]]
-            result = json.loads(run("close-blocked-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--attempt-id", "A-blocked").stdout)
+            result = json.loads(run("close-blocked-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", str(before["revision"]), "--ticket-id", "T-1", "--attempt-id", "A-blocked").stdout)
             self.assertFalse(result["idempotent"])
             self.assertEqual("A-current", result["restored_attempt_id"])
             self.assertEqual(candidate, result["candidate_sha"])
@@ -404,15 +416,17 @@ class LifecycleRepairTests(unittest.TestCase):
             self.assertEqual("A-current", receipt["restored_attempt_ref"])
             self.assertTrue(any(item["type"] == "blocked_attempt_closure" for item in state["decisions"]))
 
-            repeated = json.loads(run("restore-last-validated-candidate", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--attempt-id", "A-blocked").stdout)
+            repeated = json.loads(run("restore-last-validated-candidate", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", str(before["revision"]), "--ticket-id", "T-1", "--attempt-id", "A-blocked").stdout)
             self.assertTrue(repeated["idempotent"])
             self.assertEqual(state["revision"], ledger.load_state(paths)[0]["revision"])
 
             repair = {"cause": "ownership", "finding_ref": "ISS-blocked", "hypothesis": "scope omitted one required fixture", "expected_proof": "changed packet covers the fixture", "stopping_condition": "focused regression and suite pass", "causal_change": "expand the replacement packet", "source_attempt_ref": "A-current"}
             repair_path = root / "replacement-repair.json"; write_json(repair_path, repair)
-            run("authorize-repair", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "3", "--ticket-id", "T-1", "--finding-ref", "ISS-blocked", "--authorization-id", "AUTH-replacement", "--repair-contract", str(repair_path))
+            closed_state, _ = ledger.load_state(paths)
+            run("authorize-repair", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", str(closed_state["revision"]), "--ticket-id", "T-1", "--finding-ref", "ISS-blocked", "--authorization-id", "AUTH-replacement", "--repair-contract", str(repair_path))
             packet = self.worker_packet(root, "A-replacement", mode="repair", base=candidate, repair=repair)
-            self.dispatch(control, packet, "A-replacement", 4)
+            authorized_state, _ = ledger.load_state(paths)
+            self.dispatch(control, packet, "A-replacement", authorized_state["revision"])
             cycled, _ = ledger.load_state(paths)
             self.assertEqual("A-replacement", cycled["tickets"][0]["current_attempt"])
             self.assertEqual("RUNNING", cycled["tickets"][0]["state"])
@@ -429,14 +443,15 @@ class LifecycleRepairTests(unittest.TestCase):
             with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory); control, repo, paths, old, candidate = self.seed_blocked_no_write_repair(root)
                 state, _ = ledger.load_state(paths); mutate(state, repo, paths, old, candidate); ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
-                rejected = run("close-blocked-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--attempt-id", "A-blocked", expect=2)
+                rejected = run("close-blocked-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--ticket-id", "T-1", "--attempt-id", "A-blocked", expect=2)
                 self.assertIn(expected, rejected.stderr)
                 unchanged, _ = ledger.load_state(paths)
                 self.assertEqual("A-blocked", unchanged["tickets"][0]["current_attempt"])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); control, repo, paths, _, _ = self.seed_blocked_no_write_repair(root)
             (repo / "app.txt").write_text("dirty\n", encoding="utf-8")
-            rejected = run("close-blocked-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", "2", "--ticket-id", "T-1", "--attempt-id", "A-blocked", expect=2)
+            state, _ = ledger.load_state(paths)
+            rejected = run("close-blocked-attempt", "--control-root", str(control), "--run-id", "repair-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--ticket-id", "T-1", "--attempt-id", "A-blocked", expect=2)
             self.assertIn("checkout is not unchanged", rejected.stderr)
             state, _ = ledger.load_state(paths)
             self.assertEqual("active", ledger.attempt_by_id(state, "A-blocked")["lease"]["state"])
