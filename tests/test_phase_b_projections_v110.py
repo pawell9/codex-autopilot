@@ -63,16 +63,78 @@ def seed_ready_ticket(paths: dict[str, Path], repo: Path) -> None:
     ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
 
 
+def install_execution_design(paths: dict[str, Path], repo: Path) -> None:
+    """Upgrade a focused synthetic dispatch fixture to a current published mandate."""
+    state, previous = ledger.load_state(paths)
+    intent_path = paths["run"] / "fixture-intent.md"
+    design_path = paths["run"] / "fixture-design.md"
+    intent_path.write_text("# Fixture intent\n", encoding="utf-8")
+    design_path.write_text("# Fixture design\n", encoding="utf-8")
+    intent_hash = ledger.sha256_file(intent_path)
+    design_hash = ledger.sha256_file(design_path)
+    state["documents"] = [
+        {"id": "D-intent", "version": "v1", "path": str(intent_path), "hash": intent_hash, "kind": "intent", "section_anchors": []},
+        {"id": "D-design", "version": "v1", "path": str(design_path), "hash": design_hash, "kind": "design", "section_anchors": []},
+    ]
+    state["intent"] = {"current_revision": "intent-v1", "document_ref": "D-intent", "document_hash": intent_hash, "approved_amendments": []}
+    state["requirements"] = [{"id": "R-1", "version": "v1", "status": "active", "provenance_refs": ["D-intent"], "criterion_refs": ["C-1"]}]
+    state["criteria"] = [{"id": "C-1", "version": "v1", "requirement_refs": ["R-1"], "oracle": "fixture oracle", "status": "active", "source_ref": "D-intent"}]
+    for ticket in state.get("tickets", []):
+        ticket["criterion_refs"] = ["C-1"]
+    state["repository"]["initial_head"] = "a" * 40
+    bundle_raw = ledger.canonical_bytes({"fixture": "Phase B execution binding", "intent_hash": intent_hash, "design_hash": design_hash})
+    bundle_hash = ledger.sha256_bytes(bundle_raw)
+    ledger.object_store(paths, bundle_raw)
+    publication = {
+        "id": "B-execution-binding", "version": "v1", "status": "PUBLISHED",
+        "owner_epoch": state["owner"]["epoch"], "intent_revision": "intent-v1",
+        "intent_document_ref": "D-intent", "intent_document_hash": intent_hash,
+        "publication_hash": bundle_hash, "bundle_ref": f"objects/{bundle_hash}",
+        "published_revision": state["revision"], "document_refs": ["D-design"],
+        "requirement_refs": ["R-1"], "criterion_refs": ["C-1"],
+        "requirements_publication_ref": None, "contract_refs": [],
+        "ticket_refs": [item["id"] for item in state.get("tickets", [])], "route_refs": [],
+        "invalidated_by": [],
+    }
+    state["design_publication"] = publication
+    state["design_publication_history"] = [copy.deepcopy(publication)]
+    state["previous_publication_hash"] = ledger.sha256_bytes(previous)
+    ledger.validate_ledger(state)
+    ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+
+
 def worker_packet(root: Path, repo: Path, attempt_id: str = "A-1") -> Path:
+    paths = ledger.paths(root / "control", RUN_ID)
+    state, _ = ledger.load_state(paths)
+    ticket = next(item for item in state["tickets"] if item["id"] == TICKET_ID)
+    base = ledger.current_candidate_record(state, ticket)
+    base_sha = base["sha"] if base is not None else state["repository"].get("initial_head")
+    identity = {"run_id": RUN_ID, "ticket_id": TICKET_ID, "attempt_id": attempt_id, "epoch": 0}
+    intent_fields: dict[str, str] = {}
+    if state.get("design_publication"):
+        intent = ledger.current_intent_binding(state)
+        publication = state["design_publication"]
+        identity.update({
+            "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+            "intent_document_hash": intent["document_hash"],
+            "design_publication_ref": publication["id"], "design_publication_hash": publication["publication_hash"],
+            "design_publication_revision": publication["published_revision"],
+            "contract_refs": sorted(ticket.get("contract_refs", [])),
+        })
+        intent_fields = {
+            "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+            "intent_document_hash": intent["document_hash"],
+        }
     packet = {
-        "identity": {"run_id": RUN_ID, "ticket_id": TICKET_ID, "attempt_id": attempt_id, "epoch": 0},
+        "identity": identity,
         "kind": "worker", "mode": "implement", "goal": "phase B transition regression",
         "acceptance": [{"criterion_id": "C-1"}],
-        "workspace": {"root": str(repo), "expected_base": None},
+        "workspace": {"root": str(repo), "expected_base": base_sha},
         "write": {"allow": [{"path": "app.txt", "operations": ["modify"]}]},
         "verification": [{"check_id": "oracle", "required": True}],
         "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}],
         "return_target": {"path": "return.json"},
+        **intent_fields,
     }
     path = root / f"{attempt_id}.json"
     write_json(path, packet)
@@ -203,6 +265,7 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
                 root = Path(directory)
                 control, repo, paths = init_run(root)
                 seed_ready_ticket(paths, repo)
+                install_execution_design(paths, repo)
                 state, _ = ledger.load_state(paths)
                 ticket = state["tickets"][0]
                 prior = attempt_record("W-PRIOR", kind="worker", candidate_sha="4" * 40)
@@ -222,8 +285,8 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
                 dispatched, _ = ledger.load_state(paths)
                 dispatched_attempt = ledger.attempt_by_id(dispatched, f"A-{outcome}")
                 returned = {
-                    "identity": {"run_id": RUN_ID, "ticket_id": TICKET_ID, "attempt_id": f"A-{outcome}",
-                                 "packet_hash": dispatched_attempt["packet_hash"], "epoch": 0},
+                    "identity": {**copy.deepcopy(json.loads(packet.read_text(encoding="utf-8"))["identity"]),
+                                 "packet_hash": dispatched_attempt["packet_hash"]},
                     "status": outcome, "result": f"{outcome} without a new candidate", "files": [],
                     "checks": [{"check_id": "oracle", "outcome": "fail", "actual": "no candidate",
                                 "evidence_ref": f"EV-{outcome}"}],
@@ -599,6 +662,8 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
                 root = Path(directory)
                 control, repo, paths = init_run(root)
                 seed_ready_ticket(paths, repo)
+                if obstruction in ("active_attempt", "quarantined_attempt"):
+                    install_execution_design(paths, repo)
                 state, _ = ledger.load_state(paths)
                 if obstruction in ("active_attempt", "quarantined_attempt"):
                     packet = worker_packet(root, repo, attempt_id="A-RECOVER")
@@ -644,6 +709,7 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
             root = Path(directory)
             control, repo, paths = init_run(root)
             seed_ready_ticket(paths, repo)
+            install_execution_design(paths, repo)
             state, _ = ledger.load_state(paths)
             run(
                 "prepare-effect", "--control-root", str(control), "--run-id", RUN_ID,
@@ -1127,6 +1193,7 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
             root = Path(directory)
             control, repo, paths = init_run(root)
             seed_ready_ticket(paths, repo)
+            install_execution_design(paths, repo)
             state, _ = ledger.load_state(paths)
             self.assertIn("worker.dispatch", ledger.allowed_events(state))
             self.assertIsNone(ledger.admit_event(state, "worker.dispatch"))

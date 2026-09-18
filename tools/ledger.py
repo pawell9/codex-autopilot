@@ -2726,6 +2726,204 @@ def packet_write_zone(packet: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"path": path, "operations": sorted(operations)} for path, operations in sorted(merged.items())]
 
 
+def validate_execution_binding(
+    p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], packet: dict[str, Any], *,
+    kind: str, attempt_id: str, packet_hash: str, route_id: str,
+    route: dict[str, Any] | None = None, attempt: dict[str, Any] | None = None,
+    return_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate and derive the one authoritative binding for a worker attempt.
+
+    New worker dispatches and their returns share this projection. Historical
+    attempts remain readable because the execution-binding fields are optional
+    in the ledger schema, but a new dispatch cannot omit any current authority.
+    """
+    if kind != "worker" or packet.get("kind") != kind:
+        fail("execution binding kind does not match the registered worker packet")
+    if packet.get("mode") not in ("implement", "repair"):
+        fail("execution binding requires an implement or repair worker packet")
+    identity = packet_identity(packet)
+    if (
+        identity.get("run_id") != state.get("run_id")
+        or identity.get("ticket_id") != ticket.get("id")
+        or identity.get("attempt_id") != attempt_id
+    ):
+        fail("execution binding must name the exact current run, ticket, and attempt")
+    epoch = state.get("owner", {}).get("epoch")
+    if identity.get("epoch") != epoch:
+        fail("execution binding epoch does not match the current owner")
+
+    publication = current_design_publication(state)
+    if ticket.get("id") not in publication.get("ticket_refs", []):
+        fail("execution binding ticket is not part of the current design publication")
+    intent = current_intent_binding(state)
+    publication_intent = (
+        publication.get("intent_revision"), publication.get("intent_document_ref"),
+        publication.get("intent_document_hash"),
+    )
+    if publication_intent != (intent["revision"], intent["document_ref"], intent["document_hash"]):
+        fail("execution binding design publication is not bound to the current intent")
+    expected_publication = {
+        "design_publication_ref": publication.get("id"),
+        "design_publication_hash": publication.get("publication_hash"),
+        "design_publication_revision": publication.get("published_revision"),
+    }
+    expected_intent = {
+        "intent_revision": intent["revision"],
+        "intent_document_ref": intent["document_ref"],
+        "intent_document_hash": intent["document_hash"],
+    }
+    for field, expected in {**expected_publication, **expected_intent}.items():
+        if identity.get(field) != expected:
+            fail(f"execution binding identity {field} is missing or stale")
+    for field, expected in expected_intent.items():
+        if packet.get(field) != expected:
+            fail(f"worker packet {field} is missing or stale")
+
+    ticket_criteria = ticket.get("criterion_refs", [])
+    active_criteria = {
+        item.get("id") for item in state.get("criteria", [])
+        if item.get("status") == "active" and not item.get("invalidated_by")
+    }
+    if (
+        not ticket_criteria or len(ticket_criteria) != len(set(ticket_criteria))
+        or not set(ticket_criteria).issubset(active_criteria)
+    ):
+        fail("execution binding requires a non-empty current authoritative ticket criterion set")
+    if not set(ticket_criteria).issubset(set(publication.get("criterion_refs", []))):
+        fail("current design publication does not cover the full authoritative ticket criteria")
+    packet_criteria = [item.get("criterion_id") for item in packet.get("acceptance", [])]
+    if len(packet_criteria) != len(set(packet_criteria)) or set(packet_criteria) != set(ticket_criteria):
+        fail("worker packet acceptance must cover the full authoritative ticket criteria")
+
+    contract_refs = ticket.get("contract_refs", [])
+    if len(contract_refs) != len(set(contract_refs)):
+        fail("execution binding ticket contract refs must be unique")
+    if not set(contract_refs).issubset(set(publication.get("contract_refs", []))):
+        fail("current design publication does not cover the full authoritative ticket contracts")
+    supplied_contract_refs = identity.get("contract_refs")
+    if not isinstance(supplied_contract_refs, list) or len(supplied_contract_refs) != len(set(supplied_contract_refs)) or set(supplied_contract_refs) != set(contract_refs):
+        fail("worker packet contract_refs must exactly cover the authoritative ticket contracts")
+    validate_effective_ticket_contract_bindings(
+        state, [ticket], "worker execution binding", require_availability=True,
+    )
+    effective = effective_ticket_contract_bindings(state, ticket)
+    roles = {
+        **{ref: "implementation_input" for ref in effective["implementation_input_refs"]},
+        **{ref: "specification" for ref in effective["specification_refs"]},
+    }
+    contracts = {item.get("id"): item for item in state.get("contracts", [])}
+    contract_bindings = []
+    for ref in sorted(contract_refs):
+        contract = contracts.get(ref)
+        if contract is None:
+            fail(f"execution binding references an unknown contract: {ref}")
+        contract_bindings.append({
+            "ref": ref,
+            "version": contract.get("version"),
+            "role": roles.get(ref),
+            "implementation_availability": contract.get("implementation_availability", "unknown"),
+            "evidence_refs": sorted(contract.get("implementation_availability_evidence_refs", [])),
+        })
+
+    candidate = current_candidate_record(state, ticket)
+    expected_base = candidate.get("sha") if candidate is not None else state.get("repository", {}).get("initial_head")
+    packet_base = packet.get("workspace", {}).get("expected_base")
+    if not expected_base or packet_base != expected_base:
+        fail("worker packet base SHA does not match the exact current ticket candidate/base")
+    execution_root = state.get("repository", {}).get("execution_root")
+    packet_root = packet.get("workspace", {}).get("root")
+    try:
+        if not execution_root or Path(packet_root).expanduser().resolve() != Path(execution_root).expanduser().resolve():
+            fail("worker packet workspace root does not match the registered execution root")
+    except (OSError, TypeError, ValueError):
+        fail("worker packet workspace root is invalid")
+
+    if packet.get("risk", {}).get("level") != ticket.get("risk"):
+        fail("worker packet risk does not match the authoritative ticket risk")
+    allow = packet_write_zone(packet)
+    deny = sorted({relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])})
+    for entry in allow:
+        for denied_path in deny:
+            if entry["path"] == denied_path or entry["path"].startswith(denied_path + "/") or denied_path.startswith(entry["path"] + "/"):
+                fail(f"packet write allow/deny overlap: {entry['path']} conflicts with {denied_path}")
+
+    published_routes = [item for item in state.get("routes", []) if item.get("id") == route_id]
+    if route is not None:
+        supplied_route = copy.deepcopy(route)
+        supplied_route.setdefault("id", route_id)
+        if len(published_routes) > 1 or (published_routes and supplied_route != published_routes[0]):
+            fail("supplied route differs from the exact route in the current design publication")
+        route = supplied_route
+    elif len(published_routes) == 1:
+        route = published_routes[0]
+    elif len(published_routes) > 1:
+        fail("execution binding route is ambiguous in the current ledger")
+    else:
+        route = None
+    if route is not None:
+        validate_route_eligibility(route)
+        route_hash = sha256_bytes(canonical_bytes(route))
+    else:
+        route_hash = None
+
+    binding = {
+        "version": 1,
+        "run_id": state["run_id"],
+        "ticket_id": ticket["id"],
+        "attempt_id": attempt_id,
+        "kind": kind,
+        "mode": packet["mode"],
+        "epoch": epoch,
+        "packet_hash": packet_hash,
+        "design_publication_ref": publication["id"],
+        "design_publication_hash": publication["publication_hash"],
+        "design_publication_revision": publication["published_revision"],
+        "intent_revision": intent["revision"],
+        "intent_document_ref": intent["document_ref"],
+        "intent_document_hash": intent["document_hash"],
+        "base_sha": expected_base,
+        "criterion_refs": sorted(ticket_criteria),
+        "contract_bindings": contract_bindings,
+        "allow": allow,
+        "deny": deny,
+        "risk": copy.deepcopy(packet.get("risk")),
+        "route_id": route_id,
+        "route_hash": route_hash,
+    }
+    root_schema = schema()
+    validate(binding, root_schema["$defs"]["execution_binding"], root_schema, "$.execution_binding")
+    binding_hash = sha256_bytes(canonical_bytes(binding))
+
+    if return_identity is not None:
+        expected_return_identity = {
+            "run_id": binding["run_id"], "ticket_id": binding["ticket_id"],
+            "attempt_id": binding["attempt_id"], "epoch": binding["epoch"],
+            "packet_hash": binding["packet_hash"],
+            "intent_revision": binding["intent_revision"],
+            "intent_document_ref": binding["intent_document_ref"],
+            "intent_document_hash": binding["intent_document_hash"],
+            "design_publication_ref": binding["design_publication_ref"],
+            "design_publication_hash": binding["design_publication_hash"],
+            "design_publication_revision": binding["design_publication_revision"],
+            "contract_refs": sorted(contract_refs),
+        }
+        if any(return_identity.get(field) != expected for field, expected in expected_return_identity.items()):
+            fail("worker return identity does not exactly match its execution binding")
+
+    if attempt is not None:
+        if (
+            attempt.get("kind") != kind or attempt.get("mode") != packet.get("mode")
+            or attempt.get("subject_ref") != ticket.get("id")
+            or attempt.get("epoch") != epoch or attempt.get("packet_hash") != packet_hash
+            or attempt.get("base_sha") != expected_base or attempt.get("route_ref") != route_id
+        ):
+            fail("registered attempt identity or scope differs from its execution binding")
+        if attempt.get("execution_binding") != binding or attempt.get("execution_binding_hash") != binding_hash:
+            fail("registered execution binding is missing, stale, or altered")
+    return binding
+
+
 def active_repair_authorization(state: dict[str, Any], ticket_id: str, finding_ref: str) -> dict[str, Any] | None:
     matches = [
         item for item in state.get("decisions", [])
@@ -2881,9 +3079,19 @@ def normalize_repair_contract(
 
 def build_attempt_plan(
     state: dict[str, Any], ticket: dict[str, Any], packet: dict[str, Any], route_id: str,
-    route: dict[str, Any] | None, packet_hash: str,
+    route: dict[str, Any] | None, packet_hash: str, p: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
     """Freeze the packet fields which define dispatch feasibility and identity."""
+    if p is None:
+        control_root = state.get("repository", {}).get("control_root")
+        if not control_root:
+            fail("attempt plan requires the registered control root for execution binding")
+        p = paths(control_root, state["run_id"])
+    execution_binding = validate_execution_binding(
+        p, state, ticket, packet, kind="worker",
+        attempt_id=packet_identity(packet).get("attempt_id"), packet_hash=packet_hash,
+        route_id=route_id, route=route,
+    )
     identity = packet_identity(packet)
     if identity.get("run_id") != state.get("run_id") or identity.get("ticket_id") != ticket.get("id"):
         fail("attempt plan packet must bind the current run and exact ticket")
@@ -2928,6 +3136,7 @@ def build_attempt_plan(
         "epoch": identity.get("epoch"),
         "intent_revision": binding["revision"] if binding else None,
         "intent_document_hash": binding["document_hash"] if binding else None,
+        "execution_binding_hash": sha256_bytes(canonical_bytes(execution_binding)),
         "allow": allow,
         "deny": deny,
         "risk": copy.deepcopy(packet.get("risk")),
@@ -3049,7 +3258,7 @@ def repair_preflight(
             authorization_override=authorization,
         )
         return canonical, repair_plan, None, lease_result
-    attempt_plan = build_attempt_plan(state, ticket, packet, route_id, route, packet_hash)
+    attempt_plan = build_attempt_plan(state, ticket, packet, route_id, route, packet_hash, p)
     normalized_packet = copy.deepcopy(packet)
     normalized_packet["repair"] = canonical
     lease_result = effective_worker_lease(
@@ -4641,6 +4850,8 @@ def validate_return_against_attempt(p: dict[str, Path], state: dict[str, Any], a
     definition = {"worker": "worker_return", "review": "review_return", "acceptance": "acceptance_return"}.get(kind)
     if definition is None:
         fail(f"unsupported return kind: {kind}")
+    if attempt.get("kind") != kind:
+        fail("supplied return kind does not match the registered attempt kind")
     root = schema()
     validate(payload, root["$defs"][definition], root, "$.return")
     validate_standalone_contract(payload, definition)
@@ -4656,8 +4867,14 @@ def validate_return_against_attempt(p: dict[str, Path], state: dict[str, Any], a
     packet = stored_payload(p, attempt.get("packet_ref"), f"{kind} packet")
     packet_id = packet_identity(packet)
     if kind == "worker":
-        if packet_id.get("ticket_id") != attempt.get("subject_ref"):
-            fail("registered worker packet ticket_id does not match the attempt subject")
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == attempt.get("subject_ref")), None)
+        if ticket is None:
+            fail("registered worker attempt references a missing ticket")
+        validate_execution_binding(
+            p, state, ticket, packet, kind=kind, attempt_id=attempt["id"],
+            packet_hash=attempt.get("packet_hash"), route_id=attempt.get("route_ref"),
+            attempt=attempt, return_identity=identity,
+        )
         validate_worker_return_semantics(payload, packet)
     elif kind == "review":
         validate_review_return_semantics(payload, packet)
@@ -5348,10 +5565,14 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         if state["lifecycle"]["control"] in ("ACCEPTED", "FAILED", "CANCELLED"):
             fail("terminal run is immutable; start a successor run")
         attempt = attempt_by_id(state, args.attempt_id)
+        if args.kind != attempt.get("kind"):
+            fail("supplied return kind does not match the registered attempt kind")
         return_path = inbox_file(p, args.attempt_id, Path(args.return_file))
         proposed_digest = sha256_file(return_path)
         if attempt.get("state") == "RETURNED":
             if attempt.get("return_ref") == f"objects/{proposed_digest}":
+                payload = read_json(return_path, "return")
+                validate_return_against_attempt(p, state, attempt, payload, args.kind)
                 return {"ingested": True, "idempotent": True, "attempt_id": args.attempt_id, "return_ref": attempt["return_ref"], "status": attempt.get("review_result", "RETURNED"), "revision": state["revision"]}
             fail("conflicting duplicate return for a terminal attempt")
         if attempt.get("state") in ("LOST", "INTERRUPTED"):
@@ -5538,12 +5759,11 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
     existing_attempt = next((item for item in observed.get("attempts", []) if item.get("id") == args.attempt_id), None)
     if existing_attempt:
         if existing_attempt.get("packet_hash") == packet_hash and existing_attempt.get("subject_ref") == args.ticket_id and existing_attempt.get("route_ref") == args.route_id:
-            # Deny is an admission predicate, including exact replay. Validate its path syntax and overlap before returning.
-            packet_write_zone(packet)
-            denied_paths = [relative_path(item, "packet write deny path").rstrip("/") for item in packet.get("write", {}).get("deny", [])]
-            for entry in packet_write_zone(packet):
-                if any(entry["path"] == path or entry["path"].startswith(path + "/") or path.startswith(entry["path"] + "/") for path in denied_paths):
-                    fail(f"packet write allow/deny overlap: {entry['path']}")
+            validate_execution_binding(
+                p, observed, observed_ticket, packet, kind=packet_kind,
+                attempt_id=args.attempt_id, packet_hash=packet_hash,
+                route_id=args.route_id, route=route, attempt=existing_attempt,
+            )
             return {"prepared": True, "idempotent": True, "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": observed["revision"]}
         fail("attempt ID already exists with conflicting dispatch")
     def change(state: dict[str, Any]) -> None:
@@ -5566,6 +5786,11 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             fail("attempt ID already exists")
         if any(t.get("state") in ("RUNNING", "CANDIDATE", "REVIEW") and t.get("id") != args.ticket_id for t in state.get("tickets", [])):
             fail("serial V1 product writer already active")
+        execution_binding = validate_execution_binding(
+            p, state, ticket, packet, kind=packet_kind,
+            attempt_id=args.attempt_id, packet_hash=packet_hash,
+            route_id=args.route_id, route=route,
+        )
         repair = packet.get("repair")
         repair_plan = None
         attempt_plan = None
@@ -5597,13 +5822,6 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             repair = canonical_repair
             lease_zone, repair_lease_provenance = lease_result
         else:
-            packet_intent = packet.get("intent_revision") or identity.get("intent_revision")
-            packet_hash_value = packet.get("intent_document_hash") or identity.get("intent_document_hash")
-            if binding and (
-                packet_intent is not None and packet_intent != binding["revision"]
-                or packet_hash_value is not None and packet_hash_value != binding["document_hash"]
-            ):
-                fail("dispatch packet intent revision/hash is stale")
             lease_zone, repair_lease_provenance = effective_worker_lease(p, state, ticket, packet)
         for dependency in ticket.get("dependency_refs", []):
             dep = next(t for t in state.get("tickets", []) if t["id"] == dependency)
@@ -5614,6 +5832,8 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         object_store(p, packet_raw)
         lease = {"id": args.lease_id, "state": "active", "zone": lease_zone}
         attempt_record = {"id": args.attempt_id, "kind": packet.get("kind", "worker"), "mode": packet.get("mode", "implement"), "subject_ref": args.ticket_id, "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash, "epoch": state["owner"]["epoch"], "state": "PREPARED", "lease": lease, "route_ref": args.route_id, "checkout": packet.get("workspace", {}).get("root"), "base_sha": packet.get("workspace", {}).get("expected_base"), "candidate_sha": None, "candidate_tree_sha": None, "return_ref": None, "finding_refs": []}
+        attempt_record["execution_binding"] = execution_binding
+        attempt_record["execution_binding_hash"] = sha256_bytes(canonical_bytes(execution_binding))
         if binding:
             attempt_record.update({"intent_revision": binding["revision"], "intent_document_ref": binding["document_ref"], "intent_document_hash": binding["document_hash"]})
         if repair:
@@ -5639,7 +5859,11 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         if route:
             route_record = dict(route)
             route_record.setdefault("id", args.route_id)
-            state.setdefault("routes", []).append(route_record)
+            existing_route = next((item for item in state.get("routes", []) if item.get("id") == args.route_id), None)
+            if existing_route is None:
+                state.setdefault("routes", []).append(route_record)
+            elif existing_route != route_record:
+                fail("dispatch route differs from the current published route")
         state["lifecycle"]["next_action"] = {"kind": "await_worker_return", "subject_refs": [args.attempt_id], "preconditions": ["internal orchestration wait; not a user checkpoint", "native child started", "bounded no-progress waits", "return matches packet"], "read_refs": ["contracts/worker.md", "phases/execute.md", "phases/recover.md"]}
     result = transaction(p, args.owner_token, args.revision, change)
     return {"prepared": True, "idempotent": False, "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": result["revision"]}

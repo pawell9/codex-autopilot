@@ -29,6 +29,43 @@ def write_json(path: Path, value: Any) -> None:
     ledger.atomic_write(path, ledger.canonical_bytes(value))
 
 
+def bind_test_design(state: dict[str, Any], paths: dict[str, Path], root: Path) -> None:
+    """Give synthetic repair fixtures the same current intent/design mandate as a real run."""
+    intent_path = root / "intent.md"
+    design_path = root / "design.md"
+    intent_path.write_text("# Fixture intent\n", encoding="utf-8")
+    design_path.write_text("# Fixture design\n", encoding="utf-8")
+    intent_hash = ledger.sha256_file(intent_path)
+    design_hash = ledger.sha256_file(design_path)
+    state["documents"] = [
+        {"id": "D-intent", "version": "v1", "path": str(intent_path), "hash": intent_hash, "kind": "intent", "section_anchors": []},
+        {"id": "D-design", "version": "v1", "path": str(design_path), "hash": design_hash, "kind": "design", "section_anchors": []},
+    ]
+    state["intent"] = {"current_revision": "intent-v1", "document_ref": "D-intent", "document_hash": intent_hash, "approved_amendments": []}
+    state["requirements"] = [{"id": "R-1", "version": "v1", "status": "active", "provenance_refs": ["D-intent"], "criterion_refs": ["C-1"]}]
+    state["criteria"] = [{"id": "C-1", "version": "v1", "requirement_refs": ["R-1"], "oracle": "fixture oracle", "status": "active", "source_ref": "D-intent"}]
+    for ticket in state.get("tickets", []):
+        ticket["criterion_refs"] = ["C-1"]
+    state["repository"]["initial_head"] = BASE_SHA
+    bundle = {"fixture": "Phase G execution binding", "intent_hash": intent_hash, "design_hash": design_hash}
+    bundle_raw = ledger.canonical_bytes(bundle)
+    bundle_hash = ledger.sha256_bytes(bundle_raw)
+    ledger.object_store(paths, bundle_raw)
+    publication = {
+        "id": "B-execution-binding", "version": "v1", "status": "PUBLISHED",
+        "owner_epoch": state["owner"]["epoch"], "intent_revision": "intent-v1",
+        "intent_document_ref": "D-intent", "intent_document_hash": intent_hash,
+        "publication_hash": bundle_hash, "bundle_ref": f"objects/{bundle_hash}",
+        "published_revision": state["revision"], "document_refs": ["D-design"],
+        "requirement_refs": ["R-1"], "criterion_refs": ["C-1"],
+        "requirements_publication_ref": None, "contract_refs": [],
+        "ticket_refs": [item["id"] for item in state.get("tickets", [])], "route_refs": [],
+        "invalidated_by": [],
+    }
+    state["design_publication"] = publication
+    state["design_publication_history"] = [copy.deepcopy(publication)]
+
+
 def seed_repair_fixture(
     root: Path,
     findings: list[tuple[str, str, str]],
@@ -132,6 +169,7 @@ def seed_repair_fixture(
         "issue_refs": [], "stop_target": None,
         "next_action": {"kind": "triage_or_repair", "subject_refs": ["T-1"], "preconditions": [], "read_refs": []},
     }
+    bind_test_design(state, paths, root)
     state["revision"] = 2
     state["previous_publication_hash"] = ledger.sha256_bytes(previous)
     ledger.validate_ledger(state)
@@ -158,10 +196,23 @@ def repair_packet(
     root: Path, repo: Path, ticket_id: str, attempt_id: str, candidate_sha: str,
     plan: dict[str, Any], *, deny: list[str] | None = None, allow: list[dict[str, Any]] | None = None,
 ) -> Path:
+    state, _ = ledger.load_state(ledger.paths(root / "control", RUN_ID))
+    intent = ledger.current_intent_binding(state)
+    publication = state["design_publication"]
+    ticket = next(item for item in state["tickets"] if item["id"] == ticket_id)
     packet = {
-        "identity": {"run_id": RUN_ID, "ticket_id": ticket_id, "attempt_id": attempt_id, "epoch": 0},
+        "identity": {
+            "run_id": RUN_ID, "ticket_id": ticket_id, "attempt_id": attempt_id, "epoch": 0,
+            "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+            "intent_document_hash": intent["document_hash"],
+            "design_publication_ref": publication["id"], "design_publication_hash": publication["publication_hash"],
+            "design_publication_revision": publication["published_revision"],
+            "contract_refs": sorted(ticket.get("contract_refs", [])),
+        },
         "kind": "worker", "mode": "repair", "goal": "bounded Phase C repair regression",
         "acceptance": [{"criterion_id": "C-1"}],
+        "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+        "intent_document_hash": intent["document_hash"],
         "workspace": {"root": str(repo), "expected_base": candidate_sha},
         "write": {
             "allow": allow or [{"path": "app.txt", "operations": ["modify"]}],
