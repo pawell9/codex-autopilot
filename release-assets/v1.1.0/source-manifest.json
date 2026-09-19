@@ -126,8 +126,8 @@
     {
       "source": "tools/ledger.py",
       "install": "tools/ledger.py",
-      "bytes": 726160,
-      "sha256": "2b92afbf7ea80b76f80a7b56ccb2898f547aa7c1e329afa9c70b35e5a61cce9c"
+      "bytes": 736361,
+      "sha256": "33db5ac2974a02e47eafba098bbfd9c3ae218d0f79da32ee7a9086e482371624"
     }
   ]
 }
