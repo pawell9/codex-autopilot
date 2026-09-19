@@ -1,0 +1,23 @@
+{
+  "schema_version": "1",
+  "release": "v1.1.0",
+  "runtime": {
+    "python": {"executable": "python3", "minimum": [3, 10], "stdlib_only": true},
+    "git": {"executable": "git", "minimum_major": 2},
+    "network": "not_required",
+    "filesystem": "local_writable_checkout"
+  },
+  "tested_platforms": ["darwin", "linux"],
+  "unsupported_platforms": ["win32", "cygwin", "msys"],
+  "environment_inputs": [
+    {"name": "CODEX_HOME", "required": false, "effect": "selects install destination only"},
+    {"name": "HOME", "required": true, "effect": "fallback install destination"},
+    {"name": "PATH", "required": true, "effect": "resolves python3 and git"}
+  ],
+  "reproducibility": {
+    "locale": "not_semantic",
+    "clock": "not_semantic_for_hashes",
+    "randomness": "not_used_by_qualification",
+    "network": "offline"
+  }
+}

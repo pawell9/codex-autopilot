@@ -1,0 +1,28 @@
+{
+  "schema_version": "1",
+  "release": "v1.1.0",
+  "install_root_name": "codex-autopilot",
+  "files": [
+    {"source": "SKILL.md", "install": "SKILL.md", "bytes": 12965, "sha256": "21dabdfd45fbebcc25792e7da0c825765918ad012b8a63cd32cf5e0d45649b96"},
+    {"source": "agents/openai.yaml", "install": "agents/openai.yaml", "bytes": 273, "sha256": "666b5caf6d184a479843363aca1a5a2b23aa5ef17adff64ea15584f6a4db4d99"},
+    {"source": "contracts/reviewer.md", "install": "contracts/reviewer.md", "bytes": 3849, "sha256": "62d6b2eb47f24fb98de665cc389fd3274715f02b79031e0beb740d6559014d33"},
+    {"source": "contracts/worker.md", "install": "contracts/worker.md", "bytes": 3592, "sha256": "ba0b4ae0b8ef38c117c644cf6d4d1a3356c06c64856d475b0e24219365835c62"},
+    {"source": "dashboard/index.html", "install": "dashboard/index.html", "bytes": 10465, "sha256": "a32f430d4044b8968069cb3066a050557c2723607ff1f9a421a697cb6170a440"},
+    {"source": "migration-manifests/idea-scout-v2-requirements-v2.json", "install": "migration-manifests/idea-scout-v2-requirements-v2.json", "bytes": 6863, "sha256": "a400d95c895023e429d48c447a0630fa6214e728eaf008946217ac0a1e17b692"},
+    {"source": "phases/accept.md", "install": "phases/accept.md", "bytes": 4973, "sha256": "d69a993fe477bc7b32b7f29b45bf3eb5487556b6472c77c437fff5aa70c19dce"},
+    {"source": "phases/design.md", "install": "phases/design.md", "bytes": 5335, "sha256": "5a917692abc673aa2ee645ab0d6ca5b59a284d869a143b37afd9ad72377590ea"},
+    {"source": "phases/execute.md", "install": "phases/execute.md", "bytes": 11005, "sha256": "5c41314cb07b3a3624d5be04db2728b4fbcc6ac2c5ef5dbed40a28d72c72eb12"},
+    {"source": "phases/intent.md", "install": "phases/intent.md", "bytes": 3299, "sha256": "009e703efef449aa2b08f95b88d8363a704830ad793e57841ad4c98865d51dc9"},
+    {"source": "phases/plan.md", "install": "phases/plan.md", "bytes": 3163, "sha256": "746d87bdab1bc084ad38298d29a208edd1c89f0320229cc9a384d551e9be5c7e"},
+    {"source": "phases/recover.md", "install": "phases/recover.md", "bytes": 5960, "sha256": "016e3c489bdb449cbc0ea90ac978e5c896409ad0f0cd31c29528510480dc0dc3"},
+    {"source": "phases/start.md", "install": "phases/start.md", "bytes": 4903, "sha256": "78422c3563e89dcb6620d80099851a0d950a53c928ed5dbbaf6350d68a14bc40"},
+    {"source": "references/ledger.md", "install": "references/ledger.md", "bytes": 23308, "sha256": "2261618a181b06f8eebefcd9b6a1c6d80e6611310c2486c71f739fb9de260d53"},
+    {"source": "references/routing.md", "install": "references/routing.md", "bytes": 4787, "sha256": "04f749978e93ea2863e4de723afad2dce596dc21fb0672222a5e4b1c93249c26"},
+    {"source": "references/safety.md", "install": "references/safety.md", "bytes": 7933, "sha256": "6620c5a479373d2b74c92872be7aee48422a6d85647f60ade5b410f6b8a9dc78"},
+    {"source": "release-assets/v1.0.4/idea-scout-v5-g2-packet.json", "install": "release-assets/v1.0.4/idea-scout-v5-g2-packet.json", "bytes": 1290, "sha256": "144c0e0ced423ff025c6ee5146eaa3cc060dda7726d3b3b8094f40c5112b00b2"},
+    {"source": "release-assets/v1.0.4/idea-scout-v5-g3-packet.json", "install": "release-assets/v1.0.4/idea-scout-v5-g3-packet.json", "bytes": 1237, "sha256": "1d6052dcea611ab49f154c0d4d97c9a14725d4cc09656a6bdf1c503f9ebab496"},
+    {"source": "schemas/contracts.schema.json", "install": "schemas/contracts.schema.json", "bytes": 79494, "sha256": "eea09d605f18ba73ab47a447b74fa508ff5239f8426f57ff31a897ff6991cc4c"},
+    {"source": "tools/dashboard.py", "install": "tools/dashboard.py", "bytes": 21230, "sha256": "6f63f78f7de8eab258e311fed09c125da03e464023ea052e0cf60ffa9f582030"},
+    {"source": "tools/ledger.py", "install": "tools/ledger.py", "bytes": 724974, "sha256": "5dc6fe93d65697ef3b8cf0cf90c32893be5ff40059e64a0a890d326c00a62a65"}
+  ]
+}
