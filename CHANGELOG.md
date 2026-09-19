@@ -1,5 +1,26 @@
 # Changelog
 
+## [v1.1.0] — 2026-09-19
+
+Durable lifecycle hardening and qualification release.
+
+- Added immutable storage publication, a semantic writer floor, canonical
+  candidate/finding/action projections, shared transition admission, bounded
+  repair plans, generalized attempt finalization, typed effects, and shared
+  hash-bound candidate proofs.
+- Unified accepted review facts and qualification-ref integration, including
+  critical/manual purpose separation and fresh final-G5 repair waves.
+- Added append-only legacy R58 assessment, normalization, Review05 recovery,
+  and copy-only rehearsal without touching live Idea Scout state.
+- Separated runtime registration, reservation, and liveness; added immutable
+  runtime observations plus exclusive repository/successor ownership.
+- Implemented and passed the canonical Q01–Q42 matrix, durable-boundary fault
+  injection, same-byte/conflicting replay coverage, reproducible source/test/
+  fixture parity, and an independent final reliability review.
+- Native process supervision remains explicitly `UNSUPPORTED` and
+  adapter-bound; the qualified fake-runtime protocol cannot stand in for a
+  native observation receipt.
+
 ## [v1.0.11] — 2026-09-17
 
 Audited BLOCKED/HANDOFF continuation candidate patch release.

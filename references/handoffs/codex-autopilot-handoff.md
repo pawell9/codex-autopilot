@@ -1187,3 +1187,20 @@ CODEX AUTOPILOT
 - Receipt verification is a bookkeeping boundary: the system checks exact identity, immutable bytes, references and reported coverage, but still trusts the external observer's truthfulness/completeness. Native runtime conformance is Phase H, not claimed complete here.
 - Live Idea Scout не открывался и не изменялся; production R58 recovery не выполнялся. Final static/CLI checks: `py_compile` for `tools/ledger.py`, `tools/dashboard.py`, `experiments/v104_lifecycle_qualification.py`, `experiments/v1_40_ticket_qualification.py` — PASS; JSON parse for `schemas/contracts.schema.json` and `design/lifecycle-model.json` — PASS; `observe-runtime --help` and `init-successor --help` — PASS; `git diff --check 131d930..HEAD` — PASS. Worktree was clean before this final documentation edit; this doc patch also passes `git diff --check`.
 - Phase H не начинать; push не выполнять. На момент этого handoff локальные commits не отправлялись.
+
+# 36. Durable status: v1.1.0 hardening through Phase H
+
+Актуальное состояние после полного завершения Phase H определяется Git,
+[`reports/v1.1.0-hardening-progress.md`](../../reports/v1.1.0-hardening-progress.md)
+и независимым отчётом
+[`reports/v1.1.0-phase-h-independent-review.md`](../../reports/v1.1.0-phase-h-independent-review.md).
+
+- Ветка: `codex/v1.1.0-hardening`. Phases A–H завершены; v1.1.0 локально квалифицирован и release-ready. Push и tag не выполнялись.
+- Q01–Q24 прошли `24/24`; Q25–Q42 boundary module прошёл `20/20`. Q03 доказывает continuous multi-path provenance через untouched sentinel и две repair-попытки; Q35 доказывает public review → repair → BLOCKED preserve и persisted provenance без bespoke post-bootstrap ledger edits.
+- Durable-boundary fault injection, same-byte no-op replay, conflicting replay rejection, immutable review/qualification binding и fail-closed negative cases прошли.
+- Release package воспроизводим: 21 runtime source/install file, 110 content files, 74 fixtures, 33 test modules и 3 qualification scripts; parity `9/9`, release script PASS, установленная версия `1.1.0`.
+- Native process start, descendant enumeration, supervision и physical stop остаются явно `UNSUPPORTED` и adapter-bound. Fake runtime квалифицирует protocol semantics, но не подменяет native observation evidence.
+- Финальный независимый reliability review: **PASS**, commit `240ba37`. H-01–H-07 закрыты; архитектурных или release-blocking findings не осталось.
+- Финальный полный suite: `260 tests in 1106.828s, OK, skipped=1`. Skip — прежний документированный opt-in production-checkpoint audit. R58 copy-only suite: `5/5`; live Idea Scout не открывался и не изменялся.
+- Возврат в Idea Scout V2 готов только как controlled recovery: сначала повторно сверить live revision `58`, owner/epoch, intent/publication, candidate `ef8da4ff49cc7f8014d90f463acf8319ad7c1335`, external blocker и Git anchors; затем установить проверенный v1.1.0, выполнить dry-run assessment/rehearsal и только после этого owner/CAS-fenced append-only migration. Обычный blind resume не разрешён.
+- На этом Phase H завершена. Следующий рабочий контекст может возвращаться к Idea Scout V2 по указанной recovery-последовательности; дальнейшее hardening в этой сессии не начинать.

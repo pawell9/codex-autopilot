@@ -35,6 +35,11 @@ observations remain `UNKNOWN`; only an exact external adapter receipt can
 establish the runtime facts consumed by the ledger. No R58 production recovery
 or live Idea Scout access is implied by this release artifact.
 
-The package check is one Phase H gate. A v1.1.0 release/resume decision still
-requires the complete Q01-Q42 suite, durable-boundary fault-injection results,
-legacy read-only rehearsal, and independent final review.
+All Phase H release gates are now closed locally: Q01–Q42 pass, durable
+boundary and replay qualification passes, the legacy R58 rehearsal remains
+read-only/copy-only, source/runtime package parity passes, and the independent
+diff/state-machine review is PASS. The final repository discovery run completed
+`260 tests in 1106.828s, OK, skipped=1`; the one skip is the documented opt-in
+production-checkpoint audit. This is release readiness for the committed local
+candidate, not evidence that a tag was created, a push occurred, or live R58
+state was resumed.
