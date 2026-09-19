@@ -158,6 +158,163 @@ class PhaseHQualificationMatrixTests(unittest.TestCase):
         finding = next((item for item in reversed(final.get("findings", [])) if item.get("source_ref") == review_id), None)
         return {"state": final, "candidate": candidate, "review": reviews[-1] if reviews else None, "qualification": qualification, "finding": finding}
 
+    def _v104_handoff_preserve(self, q: V104Qualification, *, ticket_id: str, repair: dict[str, str] | None, attempt_id: str) -> dict[str, Any]:
+        """Run one HANDOFF→preserve hop through the public CLI.
+
+        V104's normal worker fixture only emits DONE.  Q03 needs the actual
+        blocked-candidate protocol in the same run, so this is the one small
+        adapter that emits a schema-valid HANDOFF and then uses the public
+        dispatch/ingest/effect/preserve transitions.
+        """
+        state, _ = q.state()
+        ticket = next(item for item in state["tickets"] if item["id"] == ticket_id)
+        prior = ledger.current_candidate_record(state, ticket)
+        base_sha = prior["sha"] if prior is not None else state["repository"]["initial_head"]
+        intent = ledger.current_intent_binding(state)
+        publication = state["design_publication"]
+        continuation_auth_id = f"AUTH-{attempt_id}-CONT"
+        operation_id = f"OP-{attempt_id}"
+        q.call_git("switch", "--create", f"qualification-{attempt_id}", str(base_sha))
+        identity = {
+            "run_id": q.run_id, "ticket_id": ticket_id, "attempt_id": attempt_id, "epoch": 0,
+            "source_revision": q.expected_revision, "intent_revision": intent["revision"],
+            "intent_document_ref": intent["document_ref"], "intent_document_hash": intent["document_hash"],
+            "design_publication_ref": publication["id"], "design_publication_hash": publication["publication_hash"],
+            "design_publication_revision": publication["published_revision"], "contract_refs": sorted(ticket.get("contract_refs", [])),
+        }
+        packet = {
+            "identity": identity, "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+            "intent_document_hash": intent["document_hash"], "kind": "worker", "mode": "repair" if repair else "implement",
+            "goal": f"repair {ticket_id} with a bounded continuation hop", "acceptance": [{"criterion_id": "C-1"}],
+            "workspace": {"root": str(q.repo), "expected_base": base_sha},
+            "write": {"allow": [{"path": "app-one.txt", "operations": ["create", "modify"]}]},
+            "verification": [
+                {"check_id": "TICKET-FOCUSED", "required": True, "scenario": "focused ticket regressions"},
+                {"check_id": "OFFLINE-SUITE", "required": True, "scenario": "complete offline suite"},
+                {"check_id": "TICKET-LINT", "required": True, "scenario": "ticket lint"},
+            ],
+            "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}],
+            "return_target": {"path": "return.json"},
+        }
+        if repair:
+            packet["repair"] = repair
+        packet_path = q.root / f"{attempt_id}-packet.json"
+        write_json(packet_path, packet)
+        # The effect is reserved while the run is ACTIVE.  Once the HANDOFF
+        # return is ingested the lifecycle is BLOCKED and the public effect
+        # guard correctly requires the repair authorization; this reservation
+        # therefore carries the later continuation authorization from the
+        # outset and remains the exact operation adopted by preserve.
+        q.mutate(f"prepare-effect-{attempt_id}", "prepare-effect", "--control-root", str(q.control), "--run-id", q.run_id,
+                 "--owner-token", q.token, "--revision", str(q.expected_revision), "--operation-id", operation_id,
+                 "--kind", "candidate_commit", "--target", str(q.repo), "--expected-before", base_sha,
+                 "--authority-ref", continuation_auth_id)
+        q.mutate(f"dispatch-{attempt_id}", "dispatch", "--control-root", str(q.control), "--run-id", q.run_id, "--owner-token", q.token,
+                 "--revision", str(q.expected_revision), "--ticket-id", ticket_id, "--attempt-id", attempt_id,
+                 "--lease-id", f"L-{attempt_id}", "--route-id", "ROUTE-v3", "--packet", str(packet_path))
+        q.observe_runtime(attempt_id, "start", f"OBS-{attempt_id}-START", instance=f"runtime-{attempt_id}")
+        (q.repo / "app-one.txt").write_text("partial continuation\n", encoding="utf-8")
+        q.observe_runtime(attempt_id, "stop", f"OBS-{attempt_id}-STOP", instance=f"runtime-{attempt_id}")
+        write_operation = "modify" if prior is not None else "create"
+        attempt = ledger.attempt_by_id(q.state()[0], attempt_id)
+        worker_return = {
+            "identity": {**identity, "packet_hash": attempt["packet_hash"]}, "status": "HANDOFF",
+            "result": "focused work complete; authoritative offline suite is externally unavailable",
+            "files": [{"path": "app-one.txt", "operation": write_operation}],
+            "checks": [
+                {"check_id": "TICKET-FOCUSED", "outcome": "pass", "actual": "focused checks pass", "evidence_ref": f"EV-{attempt_id}-FOCUSED"},
+                {"check_id": "OFFLINE-SUITE", "outcome": "fail", "actual": "external suite resources unavailable", "evidence_ref": f"EV-{attempt_id}-SUITE"},
+                {"check_id": "TICKET-LINT", "outcome": "pass", "actual": "lint passes", "evidence_ref": f"EV-{attempt_id}-LINT"},
+            ],
+            "criteria": [{"criterion_id": "C-1", "outcome": "unsatisfied", "evidence_refs": [f"EV-{attempt_id}-SUITE"]}],
+            "issues": [{"type": "external_test_fixture_blocker", "cause": "environment", "impact": "blocking",
+                        "affected_refs": [ticket_id, "OFFLINE-SUITE"], "expected": "complete offline suite passes",
+                        "actual": "authoritative external suite resources are unavailable outside this lease",
+                        "disposition": "preserve in-scope work; do not widen the lease",
+                        "resolution_condition": "fresh qualified environment or exact external evidence"}],
+            "handoff": {"safe_partial_fingerprint": {"app-one.txt": ledger.sha256_file(q.repo / "app-one.txt")},
+                        "completed": ["focused ticket work"], "remaining": ["authoritative offline suite"]},
+        }
+        inbox = q.paths["scratch"] / attempt_id / "return.json"
+        write_json(inbox, worker_return)
+        q.call("validate-return", "--control-root", str(q.control), "--run-id", q.run_id, "--attempt-id", attempt_id,
+                "--return-file", str(inbox), "--kind", "worker")
+        q.mutate(f"ingest-{attempt_id}", "ingest-return", "--control-root", str(q.control), "--run-id", q.run_id,
+                 "--owner-token", q.token, "--revision", str(q.expected_revision), "--attempt-id", attempt_id,
+                 "--return-file", str(inbox), "--kind", "worker")
+        state, _ = q.state()
+        attempt = ledger.attempt_by_id(state, attempt_id)
+        blocker = next(item for item in state["issues"] if item.get("source_ref") == attempt_id and item.get("type") == "external_test_fixture_blocker")
+        authorization = {
+            "id": continuation_auth_id, "type": "continuation_candidate_authorization", "status": "authorized",
+            "decision": "PRESERVE_CONTINUATION", "reason": "The authoritative suite blocker is external to the ticket lease.",
+            "evidence_refs": [blocker["id"], attempt["return_ref"]], "affected_refs": [ticket_id, attempt_id],
+            "blocker_ref": blocker["id"], "blocker_scope": "external", "external_check_ids": ["OFFLINE-SUITE"],
+            "external_criterion_ids": ["C-1"],
+        }
+        auth_path = q.root / f"{attempt_id}-authorization.json"
+        write_json(auth_path, authorization)
+        q.call_git("add", "app-one.txt")
+        q.call_git("-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid", "commit", "-qm", f"handoff {attempt_id}")
+        commit = q.call_git("rev-parse", "HEAD")
+        tree = q.call_git("rev-parse", "HEAD^{tree}")
+        receipt_path = q.root / f"{attempt_id}-receipt.json"
+        write_json(receipt_path, {"status": "PASS", "run_id": q.run_id, "ticket_id": ticket_id, "attempt_id": attempt_id,
+                                  "operation_id": operation_id, "kind": "candidate_commit", "target": str(q.repo),
+                                  "checkout": str(q.repo), "expected_before": base_sha, "base_sha": base_sha,
+                                  "intended_after": commit, "commit_sha": commit, "tree_sha": tree,
+                                  "authority_ref": continuation_auth_id})
+        result = q.mutate(f"preserve-{attempt_id}", "preserve-blocked-candidate", "--control-root", str(q.control),
+                          "--run-id", q.run_id, "--owner-token", q.token, "--revision", str(q.expected_revision),
+                          "--ticket-id", ticket_id, "--attempt-id", attempt_id, "--authorization-file", str(auth_path),
+                          "--commit-receipt", str(receipt_path), "--operation-id", operation_id)
+        final, _ = q.state()
+        preserved = ledger.attempt_by_id(final, attempt_id)
+        self.assertEqual(commit, preserved["candidate_sha"])
+        self.assertEqual("CONTINUATION", ledger.current_candidate_record(final, next(item for item in final["tickets"] if item["id"] == ticket_id))["quality"])
+        self.assertEqual("BLOCKED", final["lifecycle"]["control"])
+        self.assertEqual(continuation_auth_id, preserved["continuation_authorization_ref"])
+        self.assertEqual("applied", next(item for item in final["decisions"] if item["id"] == continuation_auth_id)["status"])
+        return {"attempt": preserved, "prior": prior, "blocker": blocker, "authorization": authorization,
+                "authorization_path": auth_path, "receipt_path": receipt_path, "candidate_sha": commit,
+                "continuation_ref": preserved["continuation_ref"], "result": result}
+
+    def _v104_ticket_qualification(self, q: V104Qualification, *, ticket_id: str, candidate_sha: str, review_id: str, resolutions: list[dict[str, Any]]) -> dict[str, Any]:
+        """Publish a fresh Phase-E ticket_review PASS and return its qualification."""
+        state, _ = q.state()
+        intent = ledger.current_intent_binding(state)
+        packet = {"identity": {"run_id": q.run_id, "ticket_id": ticket_id, "attempt_id": review_id, "epoch": 0,
+                                "source_revision": q.expected_revision, "registration_revision": q.expected_revision,
+                                "subject_revision": q.expected_revision, "intent_revision": intent["revision"],
+                                "intent_document_ref": intent["document_ref"], "intent_document_hash": intent["document_hash"]},
+                  "kind": "review", "purpose": "ticket_review", "mandate": "fresh candidate-bound Q03 ticket review",
+                  "subject_fingerprint": candidate_sha, "criteria": [{"criterion_id": "C-1"}], "axes": ["correctness"],
+                  "return_target": {"path": "return.json"}}
+        packet_path = q.root / f"{review_id}-packet.json"
+        write_json(packet_path, packet)
+        q.mutate(f"prepare-{review_id}", "prepare-review", "--control-root", str(q.control), "--run-id", q.run_id,
+                 "--owner-token", q.token, "--revision", str(q.expected_revision), "--ticket-id", ticket_id,
+                 "--review-attempt-id", review_id, "--lease-id", f"L-{review_id}", "--packet", str(packet_path))
+        attempt = ledger.attempt_by_id(q.state()[0], review_id)
+        q.observe_runtime(review_id, "start", f"OBS-{review_id}-START", instance=f"runtime-{review_id}")
+        q.observe_runtime(review_id, "stop", f"OBS-{review_id}-STOP", instance=f"runtime-{review_id}")
+        returned = {"identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]}, "subject_fingerprint": candidate_sha,
+                    "verdict": "PASS", "coverage": [{"criterion_id": "C-1", "outcome": "fulfilled", "evidence_refs": [f"EV-{review_id}"]}],
+                    "checks": [{"check_id": check_id, "axis": "correctness", "outcome": "fulfilled", "actual": "DONE", "evidence_ref": f"EV-{review_id}"} for check_id in ("correctness", "TICKET-FOCUSED", "OFFLINE-SUITE", "TICKET-LINT")],
+                    "context_refs": [f"CTX-{review_id}"], "findings": [], "finding_resolution": resolutions}
+        return_path = q.paths["scratch"] / review_id / "return.json"
+        write_json(return_path, returned)
+        integrity_path = q.root / f"{review_id}-integrity.json"
+        write_json(integrity_path, {"status": "PASS", "candidate_fingerprint": candidate_sha, "ledger_hash": ledger.sha256_bytes(q.paths["ledger"].read_bytes()), "reviewer_stopped": True})
+        q.mutate(f"ingest-{review_id}", "ingest-return", "--control-root", str(q.control), "--run-id", q.run_id,
+                 "--owner-token", q.token, "--revision", str(q.expected_revision), "--attempt-id", review_id,
+                 "--return-file", str(return_path), "--kind", "review", "--integrity-receipt", str(integrity_path))
+        final, _ = q.state()
+        qualification = max((item for item in final.get("review_qualifications", []) if item.get("subject_fingerprint") == candidate_sha),
+                            key=lambda item: item.get("created_revision", 0))
+        self.assertEqual("PASS", qualification["result"])
+        return {"state": final, "qualification": qualification, "return": returned, "attempt": ledger.attempt_by_id(final, review_id)}
+
     def test_q01_happy_path_ticket(self) -> None:
         with tempfile.TemporaryDirectory(prefix="phase-h-q01-") as directory:
             q, _ = self._v104(Path(directory))
@@ -198,22 +355,104 @@ class PhaseHQualificationMatrixTests(unittest.TestCase):
     def test_q03_several_repairs_preserve_lineage(self) -> None:
         with tempfile.TemporaryDirectory(prefix="phase-h-q03-") as directory:
             q, _ = self._v104(Path(directory))
-            # The qualification flow performs a blocked candidate, a
-            # candidate-bound repair, fresh review, and integration.  Its
-            # returned immutable objects provide the transitive lineage that
-            # this case asserts without fabricating ledger records.
-            q.execute()
+            ticket_id = "T-1-v3"
+            # One continuous chain: initial DONE candidate → first BLOCK and
+            # repair authorization → repair HANDOFF preserved as CONTINUATION
+            # → second BLOCK and authorization → final DONE candidate → fresh
+            # Phase-E qualification and qualified integration.
+            q.mutate("ready-q03-ticket", "ready-ticket", "--control-root", str(q.control), "--run-id", q.run_id,
+                     "--owner-token", q.token, "--revision", str(q.expected_revision), "--ticket-id", ticket_id)
+            preserved = self._v104_handoff_preserve(q, ticket_id=ticket_id, repair=None, attempt_id="Q03-W1")
+            finding1 = q.change_review(ticket_id, "C-1", "Q03-W1", "Q03-R1", "BLOCK")
+            self.assertIsNotNone(finding1)
+            repair1 = {"cause": "implementation", "finding_ref": finding1, "hypothesis": "repair the first reviewed defect",
+                       "expected_proof": "a bounded continuation preserves the in-scope work", "stopping_condition": "fresh review of the changed candidate",
+                       "causal_change": "modify only app-one.txt"}
+            repair1_path = Path(directory) / "q03-repair-1.json"
+            write_json(repair1_path, repair1)
+            q.mutate("authorize-q03-repair-1", "authorize-repair", "--control-root", str(q.control), "--run-id", q.run_id,
+                     "--owner-token", q.token, "--revision", str(q.expected_revision), "--ticket-id", ticket_id,
+                     "--finding-ref", finding1, "--authorization-id", "Q03-AUTH-1", "--repair-contract", str(repair1_path))
+            # The external blocker remains durable; authorize-repair is the
+            # public transition that permits the first changed repair.
+            q.worker_candidate(ticket_id, "C-1", "Q03-W2", "app-one.txt", "STILL_BROKEN\n", repair=repair1, ready=False)
             state, _ = q.state()
-            ticket = next(item for item in state["tickets"] if item["id"] == "T-1-v3")
+            self.assertEqual("Q03-W2", next(item for item in state["tickets"] if item["id"] == ticket_id)["current_attempt"])
+            continuation = ledger.stored_payload(q.paths, preserved["continuation_ref"], "Q03 continuation receipt")
+            self.assertEqual("HANDOFF", continuation["return_status"])
+            self.assertTrue(continuation["write_set_audit"]["pass"])
+            self.assertEqual(["app-one.txt"], continuation["write_set_audit"]["changed_paths"])
+            self.assertEqual("Q03-W1", ledger.attempt_by_id(state, "Q03-W1")["id"])
+
+            finding2 = q.change_review(ticket_id, "C-1", "Q03-W2", "Q03-R2", "BLOCK")
+            self.assertIsNotNone(finding2)
+            repair2 = {"cause": "implementation", "finding_ref": finding2, "hypothesis": "finish the candidate-bound repair after the preserve hop",
+                       "expected_proof": "DONE candidate passes a fresh ticket review", "stopping_condition": "fresh qualified PASS review",
+                       "causal_change": "replace the partial implementation with the final behavior"}
+            repair2_path = Path(directory) / "q03-repair-2.json"
+            write_json(repair2_path, repair2)
+            q.mutate("authorize-q03-repair-2", "authorize-repair", "--control-root", str(q.control), "--run-id", q.run_id,
+                     "--owner-token", q.token, "--revision", str(q.expected_revision), "--ticket-id", ticket_id,
+                     "--finding-ref", finding2, "--authorization-id", "Q03-AUTH-2", "--repair-contract", str(repair2_path))
+            final_sha = q.worker_candidate(ticket_id, "C-1", "Q03-W3", "app-one.txt", "FIXED\n", repair=repair2, ready=False)
+            state, _ = q.state()
+            ticket = next(item for item in state["tickets"] if item["id"] == ticket_id)
+            done = ledger.current_candidate_record(state, ticket)
+            self.assertEqual("DONE", done["quality"])
+            self.assertEqual(final_sha, done["sha"])
+            self.assertEqual("candidate-Q03-W2", done["parent_candidate_ref"])
+            self.assertEqual("Q03-AUTH-2", ledger.attempt_by_id(state, "Q03-W3")["repair_authorization_ref"])
+
+            candidate_chain = [item for item in state["candidates"] if item.get("ticket_ref") == ticket_id]
+            self.assertGreaterEqual(len(candidate_chain), 3)
+            self.assertEqual(["Q03-W1", "Q03-W2", "Q03-W3"], [item["producer_attempt_ref"] for item in candidate_chain[-3:]])
+            self.assertEqual("Q03-W1", candidate_chain[-3]["producer_attempt_ref"])
+            self.assertEqual("CONTINUATION", candidate_chain[-3]["quality"])
+            auths = [item for item in state["decisions"] if item.get("type") == "repair_authorization" and item.get("id") in {"Q03-AUTH-1", "Q03-AUTH-2"}]
+            self.assertEqual({"Q03-AUTH-1", "Q03-AUTH-2"}, {item["id"] for item in auths})
+            self.assertTrue(all(item["status"] == "consumed" for item in auths))
+            self.assertEqual({"Q03-W2", "Q03-W3"}, {item.get("consumed_by") for item in auths})
+            self.assertTrue(all(attempt.get("lease", {}).get("state") == "released" for attempt in state["attempts"] if attempt.get("id") in {"Q03-W1", "Q03-W2"}))
+            self.assertIn(ledger.attempt_by_id(state, "Q03-W3")["lease"]["state"], {"active", "released"})
+            self.assertIn(preserved["blocker"]["id"], state["lifecycle"]["issue_refs"])
+
+            blocker_ref = preserved["blocker"]["id"]
+            fresh = self._v104_ticket_qualification(q, ticket_id=ticket_id, candidate_sha=final_sha, review_id="Q03-R3-FRESH", resolutions=[
+                {"finding_ref": finding1, "candidate_ref": "candidate-Q03-W3", "evidence_refs": ["EV-Q03-R3-FRESH"], "reason": "fresh review closes the first historical repair obligation"},
+                {"finding_ref": finding2, "candidate_ref": "candidate-Q03-W3", "evidence_refs": ["EV-Q03-R3-FRESH"], "reason": "fresh review verifies the repaired candidate"},
+                {"finding_ref": blocker_ref, "candidate_ref": "candidate-Q03-W3", "evidence_refs": ["EV-Q03-R3-FRESH"], "reason": "fresh review verifies the external continuation blocker is resolved on the DONE candidate"},
+            ])
+            qualification = fresh["qualification"]
+            integration = q.mutate("integrate-q03-qualified", "integrate", "--control-root", str(q.control), "--run-id", q.run_id,
+                                    "--owner-token", q.token, "--revision", str(q.expected_revision), "--qualification-ref", qualification["id"])
+            state, _ = q.state()
+            ticket = next(item for item in state["tickets"] if item["id"] == ticket_id)
             self.assertEqual("INTEGRATED", ticket["state"])
-            candidates = [c for c in state["candidates"] if c.get("ticket_ref") == "T-1-v3"]
-            self.assertGreaterEqual(len(candidates), 2)
-            self.assertEqual("A-T1-2", ledger.current_candidate_record(state, ticket)["producer_attempt_ref"])
-            self.assertTrue(any(d.get("status") == "consumed" for d in state["decisions"] if d.get("type") == "repair_authorization"))
-            # Exercise the preserve/repair provenance hop as a real public
-            # transition as well; it must retain path origin while the main
-            # chain above reaches integration.
-            phase_c_plan_helpers.PhaseCRepairPlanTests().test_review_source_is_normalized_to_current_worker_and_candidate()
+            self.assertEqual("DONE", ledger.current_candidate_record(state, ticket)["quality"])
+            self.assertEqual(qualification["id"], ledger.current_candidate_record(state, ticket)["qualification_ref"])
+            self.assertEqual("Q03-W3", ticket["current_attempt"])
+            self.assertEqual("ACTIVE", state["lifecycle"]["control"])
+            self.assertIn(state["lifecycle"]["next_action"]["kind"], {"continue_after_ticket_integration", "mark_ticket_ready"})
+            self.assertTrue(all(attempt.get("lease", {}).get("state") == "released" for attempt in state["attempts"] if attempt.get("subject_ref") == ticket_id))
+            self.assertFalse(ledger.open_ticket_finding_obligations(state, ticket_id))
+            projection = ledger.finding_obligation_projection(state)
+            for finding_ref in (finding1, finding2):
+                projected = next(item for item in projection["items"] if item["finding_ref"] == finding_ref)
+                self.assertEqual("resolved", projected["status"])
+                self.assertEqual("closed", projected["verification_obligation"]["status"])
+                self.assertTrue(projected["resolved_by_refs"])
+            self.assertFalse([item for item in state["issues"] if item.get("impact") == "blocking" and not item.get("invalidated_by") and ticket_id in item.get("affected_refs", [])])
+            blocker = next(item for item in state["issues"] if item["id"] == blocker_ref)
+            self.assertEqual("advisory", blocker["impact"])
+            self.assertTrue(blocker.get("invalidated_by"))
+            self.assertTrue(any(item.get("type") == "external_blocker_resolution" and blocker_ref in item.get("affected_refs", []) for item in state["decisions"]))
+            self.assertEqual("AUTH-Q03-W1-CONT", continuation["authorization_ref"])
+            self.assertIsNone(continuation["repair_lease_provenance"])
+            repair_attempt = ledger.attempt_by_id(state, "Q03-W2")
+            repair_packet = ledger.stored_payload(q.paths, repair_attempt["packet_ref"], "Q03 repair packet")
+            self.assertEqual(repair1["finding_ref"], repair_packet["repair"]["finding_ref"])
+            self.assertEqual(preserved["candidate_sha"], repair_packet["workspace"]["expected_base"])
+            self.assertEqual("Q03-AUTH-2", ledger.attempt_by_id(state, "Q03-W3")["repair_authorization_ref"])
 
     def test_q04_grouped_three_findings(self) -> None:
         # The phase-C fixture is an executable public authorize→dispatch chain,
