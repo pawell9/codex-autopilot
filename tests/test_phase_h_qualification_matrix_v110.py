@@ -100,6 +100,64 @@ class PhaseHQualificationMatrixTests(unittest.TestCase):
             result = {}
         return qualification, result
 
+    def _continuation_review(self, case: dict[str, Any], root: Path, review_id: str, verdict: str) -> dict[str, Any]:
+        """Prepare/observe/ingest one review against the current continuation.
+
+        This helper deliberately uses only the public review transitions after
+        ``prepare_case``/``preserve``.  It returns the resulting immutable
+        qualification and, for BLOCK, the candidate-bound finding needed by a
+        subsequent repair authorization.
+        """
+        state, _ = load(case["paths"])
+        ticket = next(item for item in state["tickets"] if item["id"] == "T-1")
+        candidate = ledger.current_candidate_record(state, ticket)
+        self.assertIsNotNone(candidate)
+        packet = {
+            "identity": {"run_id": "continuation-run", "ticket_id": "T-1", "attempt_id": review_id, "epoch": 0},
+            "kind": "review", "purpose": "ticket_review", "mandate": f"Phase H continuation {verdict} review",
+            "subject_fingerprint": candidate["sha"], "criteria": [{"criterion_id": "C-1"}],
+            "axes": ["correctness"], "return_target": {"path": "return.json"},
+        }
+        packet_path = root / f"{review_id}.packet.json"
+        write_json(packet_path, packet)
+        run("prepare-review", "--control-root", str(case["control"]), "--run-id", "continuation-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--ticket-id", "T-1", "--review-attempt-id", review_id, "--lease-id", f"L-{review_id}", "--packet", str(packet_path))
+        state, _ = load(case["paths"])
+        attempt = ledger.attempt_by_id(state, review_id)
+        for event, event_id, descendants in (("start", f"OBS-{review_id}-START", "not_applicable"), ("stop", f"OBS-{review_id}-STOP", "included")):
+            observation = {
+                "kind": "runtime_observation", "event_id": event_id, "event": event,
+                "run_id": "continuation-run", "attempt_id": review_id, "epoch": attempt["epoch"],
+                "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"],
+                "runtime_instance_id": f"runtime-{review_id}", "observed_at": "2026-09-18T12:00:00Z",
+                "observer": "phase-h", "runtime_build": "fixture-1", "return_hash": None,
+                "coverage": {"scope": "test process tree", "descendant_writers": descendants},
+            }
+            observation_path = root / f"{event_id}.json"
+            write_json(observation_path, observation)
+            run("observe-runtime", "--control-root", str(case["control"]), "--run-id", "continuation-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--attempt-id", review_id, "--event", event, "--event-id", event_id, "--event-file", str(observation_path))
+            state, _ = load(case["paths"])
+            attempt = ledger.attempt_by_id(state, review_id)
+        finding_payload = []
+        if verdict == "BLOCK":
+            finding_payload = [{"axis": "correctness", "impact": "blocking", "claim": "continuation remains incomplete", "expected": "bounded repair", "actual": "external blocker remains", "evidence": f"EV-{review_id}", "affected_refs": ["T-1"]}]
+        payload = {
+            "identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]},
+            "subject_fingerprint": candidate["sha"], "verdict": verdict,
+            "coverage": [{"criterion_id": "C-1", "outcome": "fulfilled" if verdict == "PASS" else "partial", "evidence_refs": [f"EV-{review_id}"]}],
+            "checks": [{"check_id": "correctness", "axis": "correctness", "outcome": "fulfilled" if verdict == "PASS" else "failed", "actual": verdict, "evidence_ref": f"EV-{review_id}"}],
+            "context_refs": [f"CTX-{review_id}"], "findings": finding_payload,
+        }
+        return_path = case["paths"]["scratch"] / review_id / "return.json"
+        write_json(return_path, payload)
+        integrity_path = root / f"{review_id}.integrity.json"
+        write_json(integrity_path, {"status": "PASS", "candidate_fingerprint": candidate["sha"], "ledger_hash": ledger.sha256_bytes(case["paths"]["ledger"].read_bytes()), "reviewer_stopped": True})
+        run("ingest-return", "--control-root", str(case["control"]), "--run-id", "continuation-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--attempt-id", review_id, "--return-file", str(return_path), "--kind", "review", "--integrity-receipt", str(integrity_path))
+        final, _ = load(case["paths"])
+        reviews = [item for item in final.get("reviews", []) if item.get("attempt_ref") == review_id]
+        qualification = max((item for item in final.get("review_qualifications", []) if item.get("subject_fingerprint") == candidate["sha"]), key=lambda item: item.get("created_revision", 0), default=None)
+        finding = next((item for item in reversed(final.get("findings", [])) if item.get("source_ref") == review_id), None)
+        return {"state": final, "candidate": candidate, "review": reviews[-1] if reviews else None, "qualification": qualification, "finding": finding}
+
     def test_q01_happy_path_ticket(self) -> None:
         with tempfile.TemporaryDirectory(prefix="phase-h-q01-") as directory:
             q, _ = self._v104(Path(directory))
@@ -265,7 +323,75 @@ class PhaseHQualificationMatrixTests(unittest.TestCase):
         phase_e_manual_helpers.PhaseEManualLifecycleTests().test_interrupted_manual_attempt_cannot_be_imported_as_authoritative()
 
     def test_q19_continuation_repair_no_change_retains_prior_candidate(self) -> None:
-        phase_c_attempt_helpers.PhaseCAttemptFinalizationTests().test_no_change_repair_restores_done_or_continuation_candidate_for_all_return_outcomes()
+        from tests.test_continuation_candidates import BlockedContinuationCandidateTests
+
+        with tempfile.TemporaryDirectory(prefix="phase-h-q19-") as directory:
+            root = Path(directory)
+            helper = BlockedContinuationCandidateTests()
+            case = helper.prepare_case(root)
+            helper.preserve(case)
+            initial, _ = load(case["paths"])
+            ticket = next(item for item in initial["tickets"] if item["id"] == "T-1")
+            prior = ledger.current_candidate_record(initial, ticket)
+            self.assertEqual("CONTINUATION", prior["quality"])
+            review = self._continuation_review(case, root, "Q19-REVIEW-BLOCK", "BLOCK")
+            finding = review["finding"]
+            self.assertIsNotNone(finding)
+            repair = {"cause": "implementation", "finding_ref": finding["id"], "hypothesis": "continuation repair must make progress", "expected_proof": "a changed candidate is required", "stopping_condition": "stop when the scoped regression passes", "causal_change": "repair only the candidate-bound defect"}
+            repair_path = root / "q19-repair.json"
+            write_json(repair_path, repair)
+            state, _ = load(case["paths"])
+            run("authorize-repair", "--control-root", str(case["control"]), "--run-id", "continuation-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--ticket-id", "T-1", "--finding-ref", finding["id"], "--authorization-id", "AUTH-Q19", "--repair-contract", str(repair_path))
+            state, _ = load(case["paths"])
+            repair_attempt = "Q19-REPAIR-NOCHANGE"
+            packet = copy.deepcopy(case["packet"])
+            packet["identity"] = {**packet["identity"], "attempt_id": repair_attempt}
+            packet["mode"] = "repair"
+            packet["repair"] = repair
+            packet["workspace"] = {"root": str(case["repo"]), "expected_base": prior["sha"]}
+            packet_path = root / "q19-repair.packet.json"
+            write_json(packet_path, packet)
+            run("dispatch", "--control-root", str(case["control"]), "--run-id", "continuation-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--ticket-id", "T-1", "--attempt-id", repair_attempt, "--lease-id", "L-Q19", "--route-id", "route-q19", "--packet", str(packet_path))
+            state, _ = load(case["paths"])
+            attempt = ledger.attempt_by_id(state, repair_attempt)
+            for event, event_id, descendants in (("start", "OBS-Q19-START", "not_applicable"), ("stop", "OBS-Q19-STOP", "included")):
+                observation = {"kind": "runtime_observation", "event_id": event_id, "event": event, "run_id": "continuation-run", "attempt_id": repair_attempt, "epoch": attempt["epoch"], "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"], "runtime_instance_id": "runtime-q19", "observed_at": "2026-09-18T12:00:00Z", "observer": "phase-h", "runtime_build": "fixture-1", "return_hash": None, "coverage": {"scope": "test process tree", "descendant_writers": descendants}}
+                observation_path = root / f"{event_id}.json"
+                write_json(observation_path, observation)
+                run("observe-runtime", "--control-root", str(case["control"]), "--run-id", "continuation-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--attempt-id", repair_attempt, "--event", event, "--event-id", event_id, "--event-file", str(observation_path))
+                state, _ = load(case["paths"])
+                attempt = ledger.attempt_by_id(state, repair_attempt)
+            no_change = {"identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]}, "status": "BLOCKED", "result": "no in-scope change was made", "files": [], "checks": [{"check_id": check_id, "outcome": "pass", "actual": "no change", "evidence_ref": f"EV-Q19-{check_id}"} for check_id in ("TICKET-FOCUSED", "OFFLINE-SUITE", "TICKET-LINT")], "criteria": [{"criterion_id": "C-1", "outcome": "unsatisfied", "evidence_refs": ["EV-Q19-OFFLINE-SUITE"]}], "issues": [{"type": "repair_no_change", "cause": "implementation", "impact": "blocking", "affected_refs": ["T-1", repair_attempt], "expected": "repair changes the candidate", "actual": "repair produced no files", "disposition": "retain continuation and require a changed repair", "resolution_condition": "new candidate-bound repair with causal change"}]}
+            return_path = case["paths"]["scratch"] / repair_attempt / "return.json"
+            write_json(return_path, no_change)
+            state, _ = load(case["paths"])
+            run("ingest-return", "--control-root", str(case["control"]), "--run-id", "continuation-run", "--owner-token", "owner-a", "--revision", str(state["revision"]), "--attempt-id", repair_attempt, "--return-file", str(return_path), "--kind", "worker")
+            before_finalize, raw_before = load(case["paths"])
+            result = run("finalize-attempt", "--control-root", str(case["control"]), "--run-id", "continuation-run", "--owner-token", "owner-a", "--revision", str(before_finalize["revision"]), "--ticket-id", "T-1", "--attempt-id", repair_attempt)
+            closed = json.loads(result.stdout)
+            self.assertTrue(closed["closed"])
+            final, _ = load(case["paths"])
+            final_ticket = next(item for item in final["tickets"] if item["id"] == "T-1")
+            final_attempt = ledger.attempt_by_id(final, repair_attempt)
+            self.assertEqual(prior["id"], final_ticket["current_candidate"])
+            self.assertEqual(prior["sha"], ledger.current_candidate_record(final, final_ticket)["sha"])
+            self.assertEqual("CONTINUATION", ledger.current_candidate_record(final, final_ticket)["quality"])
+            self.assertEqual("RETURNED", final_attempt["state"])
+            self.assertEqual("released", final_attempt["lease"]["state"])
+            self.assertIsNotNone(final_attempt.get("finalization_ref"))
+            self.assertIn(case["blocker"]["id"], final["lifecycle"]["issue_refs"])
+            repair_issues = [item for item in final.get("issues", []) if item.get("source_ref") == repair_attempt]
+            self.assertTrue(repair_issues, "no durable repair no-change obligation was retained")
+            self.assertTrue(any(item["id"] in final["lifecycle"]["issue_refs"] for item in repair_issues))
+            action = final["lifecycle"]["next_action"]
+            self.assertNotIn(action["kind"], {"await_worker_return", "await_review_return"})
+            self.assertFalse(action.get("terminal_wait", False))
+            replay = run("finalize-attempt", "--control-root", str(case["control"]), "--run-id", "continuation-run", "--owner-token", "owner-a", "--revision", str(final["revision"]), "--ticket-id", "T-1", "--attempt-id", repair_attempt)
+            self.assertTrue(json.loads(replay.stdout).get("idempotent"))
+            raw_after_finalize = case["paths"]["ledger"].read_bytes()
+            self.assertNotEqual(raw_before, raw_after_finalize)
+            self.assertEqual(final["revision"], load(case["paths"])[0]["revision"])
+            self.assertEqual(raw_after_finalize, case["paths"]["ledger"].read_bytes())
 
     def test_q20_continuation_repair_done_requires_fresh_candidate_review(self) -> None:
         with tempfile.TemporaryDirectory(prefix="phase-h-q20-") as directory:
@@ -378,7 +504,46 @@ class PhaseHQualificationMatrixTests(unittest.TestCase):
 
     def test_q21_review_after_continuation_never_directly_integrates(self) -> None:
         from tests.test_continuation_candidates import BlockedContinuationCandidateTests
-        BlockedContinuationCandidateTests().test_preserves_exact_blocked_write_set_and_allows_review_and_repair()
+
+        # Exercise both immutable review outcomes on the same continuation
+        # shape.  Neither PASS nor BLOCK is an integration authorization: the
+        # candidate is still a continuation and the external blocker remains
+        # current in both branches.
+        for verdict in ("PASS", "BLOCK"):
+            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory(prefix=f"phase-h-q21-{verdict.lower()}-") as directory:
+                root = Path(directory)
+                helper = BlockedContinuationCandidateTests()
+                case = helper.prepare_case(root)
+                helper.preserve(case)
+                before, _ = load(case["paths"])
+                ticket = next(item for item in before["tickets"] if item["id"] == "T-1")
+                continuation = ledger.current_candidate_record(before, ticket)
+                self.assertEqual("CONTINUATION", continuation["quality"])
+                result = self._continuation_review(case, root, f"Q21-REVIEW-{verdict}", verdict)
+                final = result["state"]
+                current_ticket = next(item for item in final["tickets"] if item["id"] == "T-1")
+                current = ledger.current_candidate_record(final, current_ticket)
+                self.assertEqual(continuation["id"], current_ticket["current_candidate"])
+                self.assertEqual(continuation["sha"], current["sha"])
+                self.assertEqual("CONTINUATION", current["quality"])
+                self.assertEqual("BLOCKED", current_ticket["state"])
+                self.assertIn(case["blocker"]["id"], final["lifecycle"]["issue_refs"])
+                action = final["lifecycle"]["next_action"]
+                self.assertNotIn(action["kind"], {"await_worker_return", "await_review_return"})
+                self.assertFalse(action.get("terminal_wait", False))
+                qualification = result["qualification"]
+                self.assertIsNotNone(qualification)
+                self.assertEqual(verdict, qualification["result"])
+                if verdict == "BLOCK":
+                    self.assertIsNotNone(result["finding"])
+                    self.assertTrue(any(ref.startswith("review-") for ref in final["lifecycle"]["issue_refs"]))
+                else:
+                    self.assertIsNone(result["finding"])
+                raw_before_integration = case["paths"]["ledger"].read_bytes()
+                integrate = invoke("integrate", "--control-root", str(case["control"]), "--run-id", "continuation-run", "--owner-token", "owner-a", "--revision", str(final["revision"]), "--qualification-ref", qualification["id"])
+                self.assertEqual(2, integrate.returncode, integrate.stderr)
+                self.assertRegex(integrate.stderr.lower(), r"continuation|block|candidate")
+                assert_no_publication(self, case["paths"], raw_before_integration)
 
     def test_q22_critical_axis_barrier_requires_independent_qualification(self) -> None:
         phase_e_review_helpers.PhaseEReviewQualificationTests().test_critical_ticket_requires_both_ticket_and_critical_qualifications_then_integrates_by_ref()
