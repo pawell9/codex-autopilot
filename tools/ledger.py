@@ -5553,8 +5553,14 @@ def append_review_findings(state: dict[str, Any], payload: dict[str, Any], sourc
     for index, finding in enumerate(payload.get("findings", [])):
         finding_id = f"finding-{digest[:12]}-{index + 1}"
         reported_refs = finding.get("affected_refs", [])
-        canonical_refs = [ref for ref in reported_refs if ref in known]
-        if any(ref in packet_local and ref not in known for ref in reported_refs) and subject_ref:
+        # Criteria, axes, and check IDs can themselves be durable ledger
+        # records.  They are nevertheless *reported* evidence, not a finding
+        # subject binding.  Keep the raw refs immutable while deriving the
+        # canonical subject from the attempt packet atomically.  Otherwise a
+        # criterion-only finding becomes an unaddressable finding whose
+        # ``affected_refs`` contains only ``C-1`` (or a check ID).
+        canonical_refs = [ref for ref in reported_refs if ref in known and (ref not in packet_local or ref == subject_ref)]
+        if any(ref in packet_local for ref in reported_refs) and subject_ref:
             canonical_refs.append(subject_ref)
         canonical_refs = sorted(set(canonical_refs or ([subject_ref] if subject_ref else [])))
         record = {"id": finding_id, "axis": finding.get("axis", "unknown"), "impact": finding.get("impact", "advisory"), "claim": finding.get("claim", "ingested finding"), "expected": finding.get("expected", ""), "actual": finding.get("actual", ""), "evidence": finding.get("evidence", "return evidence"), "affected_refs": canonical_refs, "reported_affected_refs": reported_refs, "source_ref": source_ref, "intent_revision": state.get("intent", {}).get("current_revision"), "repair_contract_ref": None, "invalidated_by": []}
@@ -6352,7 +6358,16 @@ def cmd_ingest(args: argparse.Namespace) -> dict[str, Any]:
         if attempt.get("state") == "RETURNED":
             if attempt.get("return_ref") == f"objects/{proposed_digest}":
                 payload = read_json(return_path, "return")
-                validate_return_against_attempt(p, state, attempt, payload, args.kind)
+                # The terminal return was already validated and durably
+                # accepted.  Exact replay must be a zero-effect operation even
+                # after a later candidate/current-pointer transition; running
+                # the dynamic current-candidate validator here would turn a
+                # valid retry into a stale-base rejection.  The content hash,
+                # immutable stored object, and terminal attempt identity are
+                # sufficient to prove this is the same completed event.
+                stored_return = stored_payload(p, attempt["return_ref"], "stored terminal return")
+                if canonical_bytes(stored_return) != canonical_bytes(payload):
+                    fail("terminal return object does not match its immutable return_ref")
                 return {"ingested": True, "idempotent": True, "attempt_id": args.attempt_id, "return_ref": attempt["return_ref"], "status": attempt.get("review_result", "RETURNED"), "revision": state["revision"]}
             fail("conflicting duplicate return for a terminal attempt")
         if attempt.get("state") in ("LOST", "INTERRUPTED"):
