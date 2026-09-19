@@ -289,87 +289,214 @@ class PhaseHBoundaryQualificationTests(unittest.TestCase):
             self.assertIsNone(next(item for item in state["tickets"] if item["id"] == "T-1")["current_worker_attempt"])
 
     def test_Q28_integration_consumes_one_immutable_qualification_ref(self) -> None:
-        """Q28: two candidate-bound repairs and final immutable qualification share one chain."""
-        helper = phase_e_reviews.PhaseEReviewQualificationTests()
+        """Q28: one preserve hop, two bound repairs, then fresh qualification integration."""
+        helper = continuation_candidates.BlockedContinuationCandidateTests()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            case = helper.prepare_candidate(root)
-
-            def repair_once(parent: dict[str, Any], number: int) -> dict[str, Any]:
-                review = helper.prepare_review(case, "ticket_review", attempt_id=f"RV-Q28-{number}")
-                blocked_path = helper.review_return(case, review, verdict="BLOCK")
-                blocked = json.loads(blocked_path.read_text(encoding="utf-8"))
-                blocked["findings"] = [{"axis": "correctness", "impact": "blocking", "claim": f"repair {number} required", "expected": "candidate fixed", "actual": "candidate defect", "evidence": f"EV-Q28-{number}", "affected_refs": [phase_e_reviews.TICKET_ID]}]
-                write_json(blocked_path, blocked)
-                helper.ingest_review(case, review, blocked_path)
-                state, _ = ledger.load_state(case["paths"])
-                finding = next(item for item in reversed(state["findings"]) if item.get("source_ref") == review["attempt_id"])
-                contract = {"cause": "implementation", "finding_ref": finding["id"], "hypothesis": f"candidate-bound repair {number}", "expected_proof": "fresh DONE candidate", "stopping_condition": "focused check passes", "causal_change": f"change only app.txt for repair {number}"}
-                contract_path = root / f"q28-repair-{number}.json"
-                write_json(contract_path, contract)
-                run("authorize-repair", "--control-root", str(case["control"]), "--run-id", phase_e_reviews.RUN_ID, "--owner-token", phase_e_reviews.OWNER, "--revision", str(state["revision"]), "--ticket-id", phase_e_reviews.TICKET_ID, "--finding-ref", finding["id"], "--authorization-id", f"AUTH-Q28-{number}", "--repair-contract", str(contract_path))
-                state, _ = ledger.load_state(case["paths"])
-                producer = ledger.current_candidate_producer(state, state["tickets"][0])
-                source_packet = ledger.stored_payload(case["paths"], producer["packet_ref"], "source worker packet")
-                packet = copy.deepcopy(source_packet)
-                attempt_id = f"A-Q28-{number}"
-                packet["identity"] = {**source_packet["identity"], "attempt_id": attempt_id}
-                packet["mode"] = "repair"
-                packet["repair"] = contract
-                packet["workspace"] = {"root": str(case["repo"]), "expected_base": parent["sha"]}
-                packet_path = root / f"q28-repair-{number}.packet.json"
-                write_json(packet_path, packet)
-                run("dispatch", "--control-root", str(case["control"]), "--run-id", phase_e_reviews.RUN_ID, "--owner-token", phase_e_reviews.OWNER, "--revision", str(state["revision"]), "--ticket-id", phase_e_reviews.TICKET_ID, "--attempt-id", attempt_id, "--lease-id", f"L-Q28-{number}", "--route-id", f"route-q28-{number}", "--packet", str(packet_path))
-                state, _ = ledger.load_state(case["paths"])
-                attempt = ledger.attempt_by_id(state, attempt_id)
-                for event, event_id, descendants in (("start", f"OBS-Q28-{number}-START", "not_applicable"), ("stop", f"OBS-Q28-{number}-STOP", "included")):
-                    obs = {"kind": "runtime_observation", "event_id": event_id, "event": event, "run_id": phase_e_reviews.RUN_ID, "attempt_id": attempt_id, "epoch": attempt["epoch"], "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"], "runtime_instance_id": f"runtime-q28-{number}", "observed_at": "2026-09-18T12:00:00Z", "observer": "q28", "runtime_build": "fixture-1", "return_hash": None, "coverage": {"scope": "test process tree", "descendant_writers": descendants}}
-                    obs_path = root / f"{event_id}.json"
-                    write_json(obs_path, obs)
-                    run("observe-runtime", "--control-root", str(case["control"]), "--run-id", phase_e_reviews.RUN_ID, "--owner-token", phase_e_reviews.OWNER, "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--event", event, "--event-id", event_id, "--event-file", str(obs_path))
-                    state, _ = ledger.load_state(case["paths"])
-                    attempt = ledger.attempt_by_id(state, attempt_id)
-                (case["repo"] / "app.txt").write_text(f"q28-repair-{number}\n", encoding="utf-8")
-                subprocess.run(["git", "-C", str(case["repo"]), "add", "app.txt"], check=True)
-                subprocess.run(["git", "-C", str(case["repo"]), "-c", "user.name=PhaseH", "-c", "user.email=phase-h@example.invalid", "commit", "-qm", f"q28 repair {number}"], check=True)
-                commit_sha = subprocess.run(["git", "-C", str(case["repo"]), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
-                tree_sha = subprocess.run(["git", "-C", str(case["repo"]), "rev-parse", "HEAD^{tree}"], text=True, capture_output=True, check=True).stdout.strip()
-                returned = {"identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]}, "status": "DONE", "result": f"repair {number} complete", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": item["check_id"], "outcome": "pass", "actual": "pass", "evidence_ref": f"EV-Q28-{number}"} for item in packet["verification"]], "criteria": [{"criterion_id": item["criterion_id"], "outcome": "satisfied", "evidence_refs": [f"EV-Q28-{number}"]} for item in packet["acceptance"]]}
-                return_path = case["paths"]["scratch"] / attempt_id / "return.json"
-                write_json(return_path, returned)
-                run("ingest-return", "--control-root", str(case["control"]), "--run-id", phase_e_reviews.RUN_ID, "--owner-token", phase_e_reviews.OWNER, "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--return-file", str(return_path), "--kind", "worker")
-                state, _ = ledger.load_state(case["paths"])
-                operation_id = f"OP-Q28-{number}"
-                run("prepare-effect", "--control-root", str(case["control"]), "--run-id", phase_e_reviews.RUN_ID, "--owner-token", phase_e_reviews.OWNER, "--revision", str(state["revision"]), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(case["repo"]), "--expected-before", parent["sha"], "--authority-ref", f"AUTH-Q28-{number}")
-                receipt_path = root / f"q28-receipt-{number}.json"
-                write_json(receipt_path, {"status": "PASS", "run_id": phase_e_reviews.RUN_ID, "ticket_id": phase_e_reviews.TICKET_ID, "attempt_id": attempt_id, "operation_id": operation_id, "kind": "candidate_commit", "target": str(case["repo"]), "checkout": str(case["repo"]), "expected_before": parent["sha"], "base_sha": parent["sha"], "intended_after": commit_sha, "commit_sha": commit_sha, "tree_sha": tree_sha, "authority_ref": f"AUTH-Q28-{number}"})
-                state, _ = ledger.load_state(case["paths"])
-                run("candidate", "--control-root", str(case["control"]), "--run-id", phase_e_reviews.RUN_ID, "--owner-token", phase_e_reviews.OWNER, "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--commit-receipt", str(receipt_path), "--operation-id", operation_id)
-                final, _ = ledger.load_state(case["paths"])
-                child = ledger.current_candidate_record(final, final["tickets"][0])
-                self.assertEqual(parent["id"], child["parent_candidate_ref"])
-                self.assertIn(finding["id"], ledger.repair_finding_refs(ledger.attempt_by_id(final, attempt_id)["repair_contract"]))
-                self.assertEqual(f"AUTH-Q28-{number}", ledger.attempt_by_id(final, attempt_id)["repair_authorization_ref"])
-                return child
-
+            case = helper.prepare_case(root)
+            preserved = json.loads(helper.preserve(case).stdout)
             state, _ = ledger.load_state(case["paths"])
             parent = ledger.current_candidate_record(state, state["tickets"][0])
-            first = repair_once(parent, 1)
-            second = repair_once(first, 2)
-            fresh = helper.prepare_review(case, "ticket_review", attempt_id="RV-Q28-FINAL")
-            helper.ingest_review(case, fresh, helper.review_return(case, fresh, verdict="PASS"))
+            self.assertEqual("CONTINUATION", parent["quality"])
+            self.assertEqual(preserved["candidate"], parent["sha"])
+            source_attempt = ledger.attempt_by_id(state, continuation_candidates.ATTEMPT_ID)
+            continuation = ledger.stored_payload(case["paths"], source_attempt["continuation_ref"], "Q28 continuation")
+            self.assertEqual(parent["sha"], continuation["candidate_sha"])
+            self.assertEqual(case["blocker"]["id"], continuation["blocker_ref"])
+
+            # Fresh review of the preserved candidate creates the candidate-bound finding.
+            review_id = "RV-Q28-CONT"
+            review_packet = {"identity": {"run_id": continuation_candidates.RUN_ID, "ticket_id": continuation_candidates.TICKET_ID, "attempt_id": review_id, "epoch": 0}, "kind": "review", "purpose": "ticket_review", "mandate": "Q28 continuation repair review", "subject_fingerprint": parent["sha"], "criteria": [{"criterion_id": "C-1"}], "axes": ["correctness"], "return_target": {"path": "return.json"}}
+            review_packet_path = root / "q28-review.packet.json"
+            write_json(review_packet_path, review_packet)
+            run("prepare-review", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--ticket-id", "T-1", "--review-attempt-id", review_id, "--lease-id", "L-Q28-R", "--packet", str(review_packet_path))
             state, _ = ledger.load_state(case["paths"])
-            qualification = helper.qualification(state, second["sha"])
+            review_attempt = ledger.attempt_by_id(state, review_id)
+            for event, event_id, descendants in (("start", "OBS-Q28-R-START", "not_applicable"), ("stop", "OBS-Q28-R-STOP", "included")):
+                observation = {"kind": "runtime_observation", "event_id": event_id, "event": event, "run_id": continuation_candidates.RUN_ID, "attempt_id": review_id, "epoch": review_attempt["epoch"], "packet_hash": review_attempt["packet_hash"], "spawn_request_id": review_attempt["runtime"]["spawn_request_id"], "runtime_instance_id": "runtime-q28-review", "observed_at": "2026-09-18T12:00:00Z", "observer": "q28", "runtime_build": "fixture-1", "return_hash": None, "coverage": {"scope": "test process tree", "descendant_writers": descendants}}
+                observation_path = root / f"{event_id}.json"
+                write_json(observation_path, observation)
+                run("observe-runtime", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", review_id, "--event", event, "--event-id", event_id, "--event-file", str(observation_path))
+                state, _ = ledger.load_state(case["paths"])
+                review_attempt = ledger.attempt_by_id(state, review_id)
+            review_return = {"identity": {**review_packet["identity"], "packet_hash": review_attempt["packet_hash"]}, "subject_fingerprint": parent["sha"], "verdict": "BLOCK", "coverage": [{"criterion_id": "C-1", "outcome": "partial", "evidence_refs": ["EV-Q28-R"]}], "checks": [{"check_id": "correctness", "axis": "correctness", "outcome": "failed", "actual": "repair required", "evidence_ref": "EV-Q28-R"}], "context_refs": ["CTX-Q28-R"], "findings": [{"axis": "correctness", "impact": "blocking", "claim": "continuation needs repair", "expected": "fresh DONE candidate", "actual": "CONTINUATION", "evidence": "EV-Q28-R", "affected_refs": ["T-1"]}]}
+            review_return_path = case["paths"]["scratch"] / review_id / "return.json"
+            write_json(review_return_path, review_return)
+            integrity_path = root / "q28-review.integrity.json"
+            write_json(integrity_path, {"status": "PASS", "candidate_fingerprint": parent["sha"], "ledger_hash": ledger.sha256_bytes(case["paths"]["ledger"].read_bytes()), "reviewer_stopped": True})
+            run("ingest-return", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", review_id, "--return-file", str(review_return_path), "--kind", "review", "--integrity-receipt", str(integrity_path))
+            state, _ = ledger.load_state(case["paths"])
+            finding = next(item for item in reversed(state["findings"]) if item.get("source_ref") == review_id)
+            repair = {"cause": "implementation", "finding_ref": finding["id"], "hypothesis": "promote continuation to DONE", "expected_proof": "fresh candidate", "stopping_condition": "focused check passes", "causal_change": "complete app.txt"}
+            repair_path = root / "q28-repair.json"
+            write_json(repair_path, repair)
+            run("authorize-repair", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--ticket-id", "T-1", "--finding-ref", finding["id"], "--authorization-id", "AUTH-Q28-REPAIR", "--repair-contract", str(repair_path))
+            state, _ = ledger.load_state(case["paths"])
+            source_packet = ledger.stored_payload(case["paths"], source_attempt["packet_ref"], "source packet")
+            packet = copy.deepcopy(source_packet)
+            attempt_id = "A-Q28-REPAIR"
+            packet["identity"] = {**source_packet["identity"], "attempt_id": attempt_id}
+            packet["mode"] = "repair"
+            packet["repair"] = repair
+            packet["workspace"] = {"root": str(case["repo"]), "expected_base": parent["sha"]}
+            packet_path = root / "q28-repair.packet.json"
+            write_json(packet_path, packet)
+            run("dispatch", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--ticket-id", "T-1", "--attempt-id", attempt_id, "--lease-id", "L-Q28-REPAIR", "--route-id", "route-q28-repair", "--packet", str(packet_path))
+            state, _ = ledger.load_state(case["paths"])
+            attempt = ledger.attempt_by_id(state, attempt_id)
+            for event, event_id, descendants in (("start", "OBS-Q28-W-START", "not_applicable"), ("stop", "OBS-Q28-W-STOP", "included")):
+                observation = {"kind": "runtime_observation", "event_id": event_id, "event": event, "run_id": continuation_candidates.RUN_ID, "attempt_id": attempt_id, "epoch": attempt["epoch"], "packet_hash": attempt["packet_hash"], "spawn_request_id": attempt["runtime"]["spawn_request_id"], "runtime_instance_id": "runtime-q28-worker", "observed_at": "2026-09-18T12:00:00Z", "observer": "q28", "runtime_build": "fixture-1", "return_hash": None, "coverage": {"scope": "test process tree", "descendant_writers": descendants}}
+                observation_path = root / f"{event_id}.json"
+                write_json(observation_path, observation)
+                run("observe-runtime", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--event", event, "--event-id", event_id, "--event-file", str(observation_path))
+                state, _ = ledger.load_state(case["paths"])
+                attempt = ledger.attempt_by_id(state, attempt_id)
+            (case["repo"] / "app.txt").write_text("q28 repaired\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(case["repo"]), "add", "app.txt"], check=True)
+            subprocess.run(["git", "-C", str(case["repo"]), "-c", "user.name=PhaseH", "-c", "user.email=phase-h@example.invalid", "commit", "-qm", "q28 repaired"], check=True)
+            done_sha = subprocess.run(["git", "-C", str(case["repo"]), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+            done_tree = subprocess.run(["git", "-C", str(case["repo"]), "rev-parse", "HEAD^{tree}"], text=True, capture_output=True, check=True).stdout.strip()
+            worker_return = {"identity": {**packet["identity"], "packet_hash": attempt["packet_hash"]}, "status": "DONE", "result": "repair complete", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": item["check_id"], "outcome": "pass", "actual": "pass", "evidence_ref": "EV-Q28-W"} for item in packet["verification"]], "criteria": [{"criterion_id": item["criterion_id"], "outcome": "satisfied", "evidence_refs": ["EV-Q28-W"]} for item in packet["acceptance"]]}
+            worker_path = case["paths"]["scratch"] / attempt_id / "return.json"
+            write_json(worker_path, worker_return)
+            run("ingest-return", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--return-file", str(worker_path), "--kind", "worker")
+            state, _ = ledger.load_state(case["paths"])
+            operation_id = "OP-Q28-REPAIR"
+            run("prepare-effect", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--operation-id", operation_id, "--kind", "candidate_commit", "--target", str(case["repo"]), "--expected-before", parent["sha"], "--authority-ref", "AUTH-Q28-REPAIR")
+            receipt_path = root / "q28-repair.receipt.json"
+            write_json(receipt_path, {"status": "PASS", "run_id": continuation_candidates.RUN_ID, "ticket_id": "T-1", "attempt_id": attempt_id, "operation_id": operation_id, "kind": "candidate_commit", "target": str(case["repo"]), "checkout": str(case["repo"]), "expected_before": parent["sha"], "base_sha": parent["sha"], "intended_after": done_sha, "commit_sha": done_sha, "tree_sha": done_tree, "authority_ref": "AUTH-Q28-REPAIR"})
+            state, _ = ledger.load_state(case["paths"])
+            run("candidate", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", attempt_id, "--commit-receipt", str(receipt_path), "--operation-id", operation_id)
+            state, _ = ledger.load_state(case["paths"])
+            final_candidate = ledger.current_candidate_record(state, state["tickets"][0])
+            self.assertEqual("DONE", final_candidate["quality"])
+            self.assertEqual(parent["id"], final_candidate["parent_candidate_ref"])
+            first_done_id = final_candidate["id"]
+
+            # A second candidate-bound repair is required before the final
+            # review; it must consume a distinct authorization and advance the
+            # parent chain from the first DONE child.
+            review2_id = "RV-Q28-REPAIR-2"
+            review2_packet = {"identity": {"run_id": continuation_candidates.RUN_ID, "ticket_id": "T-1", "attempt_id": review2_id, "epoch": 0}, "kind": "review", "purpose": "ticket_review", "mandate": "Q28 second repair review", "subject_fingerprint": final_candidate["sha"], "criteria": [{"criterion_id": "C-1"}], "axes": ["correctness"], "return_target": {"path": "return.json"}}
+            review2_packet_path = root / "q28-review-2.packet.json"
+            write_json(review2_packet_path, review2_packet)
+            run("prepare-review", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--ticket-id", "T-1", "--review-attempt-id", review2_id, "--lease-id", "L-Q28-R2", "--packet", str(review2_packet_path))
+            state, _ = ledger.load_state(case["paths"])
+            review2_attempt = ledger.attempt_by_id(state, review2_id)
+            for event, event_id, descendants in (("start", "OBS-Q28-R2-START", "not_applicable"), ("stop", "OBS-Q28-R2-STOP", "included")):
+                observation = {"kind": "runtime_observation", "event_id": event_id, "event": event, "run_id": continuation_candidates.RUN_ID, "attempt_id": review2_id, "epoch": review2_attempt["epoch"], "packet_hash": review2_attempt["packet_hash"], "spawn_request_id": review2_attempt["runtime"]["spawn_request_id"], "runtime_instance_id": "runtime-q28-review-2", "observed_at": "2026-09-18T12:00:00Z", "observer": "q28", "runtime_build": "fixture-1", "return_hash": None, "coverage": {"scope": "test process tree", "descendant_writers": descendants}}
+                observation_path = root / f"{event_id}.json"
+                write_json(observation_path, observation)
+                run("observe-runtime", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", review2_id, "--event", event, "--event-id", event_id, "--event-file", str(observation_path))
+                state, _ = ledger.load_state(case["paths"])
+                review2_attempt = ledger.attempt_by_id(state, review2_id)
+            review2_return = {"identity": {**review2_packet["identity"], "packet_hash": review2_attempt["packet_hash"]}, "subject_fingerprint": final_candidate["sha"], "verdict": "BLOCK", "coverage": [{"criterion_id": "C-1", "outcome": "partial", "evidence_refs": ["EV-Q28-R2"]}], "checks": [{"check_id": "correctness", "axis": "correctness", "outcome": "failed", "actual": "second repair required", "evidence_ref": "EV-Q28-R2"}], "context_refs": ["CTX-Q28-R2"], "findings": [{"axis": "correctness", "impact": "blocking", "claim": "second repair required", "expected": "fresh DONE candidate", "actual": "first repair candidate", "evidence": "EV-Q28-R2", "affected_refs": ["T-1"]}]}
+            review2_return_path = case["paths"]["scratch"] / review2_id / "return.json"
+            write_json(review2_return_path, review2_return)
+            integrity2 = root / "q28-review-2.integrity.json"
+            write_json(integrity2, {"status": "PASS", "candidate_fingerprint": final_candidate["sha"], "ledger_hash": ledger.sha256_bytes(case["paths"]["ledger"].read_bytes()), "reviewer_stopped": True})
+            run("ingest-return", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", review2_id, "--return-file", str(review2_return_path), "--kind", "review", "--integrity-receipt", str(integrity2))
+            state, _ = ledger.load_state(case["paths"])
+            finding2 = next(item for item in reversed(state["findings"]) if item.get("source_ref") == review2_id)
+            repair2 = {"cause": "implementation", "finding_ref": finding2["id"], "hypothesis": "second candidate-bound repair", "expected_proof": "fresh DONE candidate", "stopping_condition": "focused check passes", "causal_change": "complete app.txt again"}
+            repair2_path = root / "q28-repair-2.json"
+            write_json(repair2_path, repair2)
+            run("authorize-repair", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--ticket-id", "T-1", "--finding-ref", finding2["id"], "--authorization-id", "AUTH-Q28-REPAIR-2", "--repair-contract", str(repair2_path))
+            state, _ = ledger.load_state(case["paths"])
+            packet2 = copy.deepcopy(packet)
+            attempt2_id = "A-Q28-REPAIR-2"
+            packet2["identity"] = {**packet["identity"], "attempt_id": attempt2_id}
+            packet2["repair"] = repair2
+            packet2["workspace"] = {"root": str(case["repo"]), "expected_base": final_candidate["sha"]}
+            packet2_path = root / "q28-repair-2.packet.json"
+            write_json(packet2_path, packet2)
+            run("dispatch", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--ticket-id", "T-1", "--attempt-id", attempt2_id, "--lease-id", "L-Q28-REPAIR-2", "--route-id", "route-q28-repair-2", "--packet", str(packet2_path))
+            state, _ = ledger.load_state(case["paths"])
+            attempt2 = ledger.attempt_by_id(state, attempt2_id)
+            for event, event_id, descendants in (("start", "OBS-Q28-W2-START", "not_applicable"), ("stop", "OBS-Q28-W2-STOP", "included")):
+                observation = {"kind": "runtime_observation", "event_id": event_id, "event": event, "run_id": continuation_candidates.RUN_ID, "attempt_id": attempt2_id, "epoch": attempt2["epoch"], "packet_hash": attempt2["packet_hash"], "spawn_request_id": attempt2["runtime"]["spawn_request_id"], "runtime_instance_id": "runtime-q28-worker-2", "observed_at": "2026-09-18T12:00:00Z", "observer": "q28", "runtime_build": "fixture-1", "return_hash": None, "coverage": {"scope": "test process tree", "descendant_writers": descendants}}
+                observation_path = root / f"{event_id}.json"
+                write_json(observation_path, observation)
+                run("observe-runtime", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", attempt2_id, "--event", event, "--event-id", event_id, "--event-file", str(observation_path))
+                state, _ = ledger.load_state(case["paths"])
+                attempt2 = ledger.attempt_by_id(state, attempt2_id)
+            (case["repo"] / "app.txt").write_text("q28 repaired twice\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(case["repo"]), "add", "app.txt"], check=True)
+            subprocess.run(["git", "-C", str(case["repo"]), "-c", "user.name=PhaseH", "-c", "user.email=phase-h@example.invalid", "commit", "-qm", "q28 repaired twice"], check=True)
+            done2_sha = subprocess.run(["git", "-C", str(case["repo"]), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+            done2_tree = subprocess.run(["git", "-C", str(case["repo"]), "rev-parse", "HEAD^{tree}"], text=True, capture_output=True, check=True).stdout.strip()
+            worker2_return = {"identity": {**packet2["identity"], "packet_hash": attempt2["packet_hash"]}, "status": "DONE", "result": "second repair complete", "files": [{"path": "app.txt", "operation": "modify"}], "checks": [{"check_id": item["check_id"], "outcome": "pass", "actual": "pass", "evidence_ref": "EV-Q28-W2"} for item in packet2["verification"]], "criteria": [{"criterion_id": item["criterion_id"], "outcome": "satisfied", "evidence_refs": ["EV-Q28-W2"]} for item in packet2["acceptance"]]}
+            worker2_path = case["paths"]["scratch"] / attempt2_id / "return.json"
+            write_json(worker2_path, worker2_return)
+            run("ingest-return", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", attempt2_id, "--return-file", str(worker2_path), "--kind", "worker")
+            state, _ = ledger.load_state(case["paths"])
+            operation2 = "OP-Q28-REPAIR-2"
+            run("prepare-effect", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--operation-id", operation2, "--kind", "candidate_commit", "--target", str(case["repo"]), "--expected-before", final_candidate["sha"], "--authority-ref", "AUTH-Q28-REPAIR-2")
+            receipt2 = root / "q28-repair-2.receipt.json"
+            write_json(receipt2, {"status": "PASS", "run_id": continuation_candidates.RUN_ID, "ticket_id": "T-1", "attempt_id": attempt2_id, "operation_id": operation2, "kind": "candidate_commit", "target": str(case["repo"]), "checkout": str(case["repo"]), "expected_before": final_candidate["sha"], "base_sha": final_candidate["sha"], "intended_after": done2_sha, "commit_sha": done2_sha, "tree_sha": done2_tree, "authority_ref": "AUTH-Q28-REPAIR-2"})
+            state, _ = ledger.load_state(case["paths"])
+            run("candidate", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", attempt2_id, "--commit-receipt", str(receipt2), "--operation-id", operation2)
+            state, _ = ledger.load_state(case["paths"])
+            final_candidate = ledger.current_candidate_record(state, state["tickets"][0])
+            self.assertEqual("DONE", final_candidate["quality"])
+            self.assertEqual(first_done_id, final_candidate["parent_candidate_ref"])
+            self.assertEqual("consumed", next(item for item in state["decisions"] if item.get("id") == "AUTH-Q28-REPAIR")["status"])
+            self.assertEqual("consumed", next(item for item in state["decisions"] if item.get("id") == "AUTH-Q28-REPAIR-2")["status"])
+
+            # Fresh PASS review explicitly resolves only the repair finding and
+            # the exact external blocker; unrelated issues are not touched.
+            final_review = {"identity": {"run_id": continuation_candidates.RUN_ID, "ticket_id": "T-1", "attempt_id": "RV-Q28-FINAL", "epoch": 0}, "kind": "review", "purpose": "ticket_review", "mandate": "Q28 final repaired candidate qualification", "subject_fingerprint": final_candidate["sha"], "criteria": [{"criterion_id": "C-1"}], "axes": ["OFFLINE-SUITE"], "return_target": {"path": "return.json"}}
+            final_review_path = root / "q28-final-review.packet.json"
+            write_json(final_review_path, final_review)
+            run("prepare-review", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--ticket-id", "T-1", "--review-attempt-id", "RV-Q28-FINAL", "--lease-id", "L-Q28-FINAL", "--packet", str(final_review_path))
+            state, _ = ledger.load_state(case["paths"])
+            final_attempt = ledger.attempt_by_id(state, "RV-Q28-FINAL")
+            for event, event_id, descendants in (("start", "OBS-Q28-F-START", "not_applicable"), ("stop", "OBS-Q28-F-STOP", "included")):
+                observation = {"kind": "runtime_observation", "event_id": event_id, "event": event, "run_id": continuation_candidates.RUN_ID, "attempt_id": "RV-Q28-FINAL", "epoch": final_attempt["epoch"], "packet_hash": final_attempt["packet_hash"], "spawn_request_id": final_attempt["runtime"]["spawn_request_id"], "runtime_instance_id": "runtime-q28-final", "observed_at": "2026-09-18T12:00:00Z", "observer": "q28", "runtime_build": "fixture-1", "return_hash": None, "coverage": {"scope": "test process tree", "descendant_writers": descendants}}
+                observation_path = root / f"{event_id}.json"
+                write_json(observation_path, observation)
+                run("observe-runtime", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", "RV-Q28-FINAL", "--event", event, "--event-id", event_id, "--event-file", str(observation_path))
+                state, _ = ledger.load_state(case["paths"])
+                final_attempt = ledger.attempt_by_id(state, "RV-Q28-FINAL")
+            final_return = {"identity": {**final_review["identity"], "packet_hash": final_attempt["packet_hash"]}, "subject_fingerprint": final_candidate["sha"], "verdict": "PASS", "coverage": [{"criterion_id": "C-1", "outcome": "fulfilled", "evidence_refs": ["EV-Q28-OFFLINE-C1"]}], "checks": [{"check_id": "OFFLINE-SUITE", "axis": "OFFLINE-SUITE", "outcome": "fulfilled", "actual": "external fixture restored and suite passed", "evidence_ref": "EV-Q28-OFFLINE"}], "context_refs": ["CTX-Q28-FINAL"], "findings": [], "finding_resolution": [{"finding_ref": finding["id"], "candidate_ref": final_candidate["id"], "evidence_refs": ["EV-Q28-OFFLINE"], "reason": "fresh repaired candidate review resolves the named finding"}, {"finding_ref": finding2["id"], "candidate_ref": final_candidate["id"], "evidence_refs": ["EV-Q28-OFFLINE"], "reason": "fresh repaired candidate review resolves the second named finding"}, {"finding_ref": case["blocker"]["id"], "candidate_ref": final_candidate["id"], "evidence_refs": ["EV-Q28-OFFLINE", "EV-Q28-OFFLINE-C1"], "reason": "fresh exact OFFLINE-SUITE evidence resolves the external fixture blocker"}]}
+            final_return_path = case["paths"]["scratch"] / "RV-Q28-FINAL" / "return.json"
+            write_json(final_return_path, final_return)
+            final_integrity = root / "q28-final.integrity.json"
+            write_json(final_integrity, {"status": "PASS", "candidate_fingerprint": final_candidate["sha"], "ledger_hash": ledger.sha256_bytes(case["paths"]["ledger"].read_bytes()), "reviewer_stopped": True})
+            run("ingest-return", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--attempt-id", "RV-Q28-FINAL", "--return-file", str(final_return_path), "--kind", "review", "--integrity-receipt", str(final_integrity))
+            state, _ = ledger.load_state(case["paths"])
+            qualification = max((item for item in state["review_qualifications"] if item["subject_fingerprint"] == final_candidate["sha"]), key=lambda item: item["created_revision"])
             self.assertEqual("PASS", qualification["result"])
-            integrated = json.loads(run("integrate", "--control-root", str(case["control"]), "--run-id", phase_e_reviews.RUN_ID, "--owner-token", phase_e_reviews.OWNER, "--revision", str(state["revision"]), "--qualification-ref", qualification["id"]).stdout)
+            integrated = json.loads(run("integrate", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(state["revision"]), "--qualification-ref", qualification["id"]).stdout)
             self.assertTrue(integrated["integrated"])
             final, _ = ledger.load_state(case["paths"])
             current = ledger.current_candidate_record(final, final["tickets"][0])
-            self.assertEqual(second["id"], current["id"])
-            self.assertEqual(qualification["id"], current["qualification_ref"])
             self.assertEqual("INTEGRATED", final["tickets"][0]["state"])
-            self.assertTrue(all(item["status"] == "consumed" for item in final["decisions"] if item.get("type") == "repair_authorization" and item.get("id", "").startswith("AUTH-Q28-")))
-            self.assertTrue(all(item.get("lease", {}).get("state") == "released" for item in final["attempts"] if item.get("kind") == "worker"))
+            self.assertEqual(qualification["id"], current["qualification_ref"])
+            self.assertEqual("advisory", next(item for item in final["issues"] if item["id"] == case["blocker"]["id"])["impact"])
+            self.assertEqual("ACTIVE", final["lifecycle"]["control"])
+            self.assertFalse(any(item.get("type") == "review_verdict" and item.get("impact") == "blocking" and not item.get("invalidated_by") for item in final["issues"]))
+            self.assertEqual("released", ledger.attempt_by_id(final, attempt_id)["lease"]["state"])
+            replay = json.loads(run("integrate", "--control-root", str(case["control"]), "--run-id", continuation_candidates.RUN_ID, "--owner-token", continuation_candidates.OWNER, "--revision", str(final["revision"]), "--qualification-ref", qualification["id"]).stdout)
+            self.assertTrue(replay["idempotent"])
+
+    def test_Q28_qualification_resolution_rejects_unrelated_target_and_evidence(self) -> None:
+        """Q28 negative: a PASS cannot clear an unrelated issue or foreign evidence."""
+        helper = phase_e_reviews.PhaseEReviewQualificationTests()
+        with tempfile.TemporaryDirectory() as directory:
+            case = helper.prepare_candidate(Path(directory))
+            review = helper.prepare_review(case, "ticket_review", attempt_id="RV-Q28-NEG")
+            returned = helper.review_return(case, review, verdict="PASS")
+            payload = json.loads(returned.read_text(encoding="utf-8"))
+            payload["finding_resolution"] = [{"finding_ref": "ISS-UNRELATED", "candidate_ref": review["candidate"]["id"], "evidence_refs": ["EV-ticket_review-coverage", "EV-ticket_review-check"], "reason": "must not clear unrelated issue"}]
+            write_json(returned, payload)
+            helper.ingest_review(case, review, returned)
+            state, _ = ledger.load_state(case["paths"])
+            qualification = helper.qualification(state, review["candidate"]["sha"])
+            before = case["paths"]["ledger"].read_bytes()
+            rejected = run("integrate", "--control-root", str(case["control"]), "--run-id", phase_e_reviews.RUN_ID, "--owner-token", phase_e_reviews.OWNER, "--revision", str(state["revision"]), "--qualification-ref", qualification["id"], expect=2)
+            self.assertRegex(rejected.stderr.lower(), r"evidence|unique|current|resolution")
+            self.assertEqual(before, case["paths"]["ledger"].read_bytes())
 
     def test_Q29_semi_mode_wait_is_not_a_human_checkpoint(self) -> None:
         """Q29: routine worker delivery remains ACTIVE in semi mode."""

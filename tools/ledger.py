@@ -8111,11 +8111,104 @@ def cmd_integrate_qualification(args: argparse.Namespace) -> dict[str, Any]:
             fail("integration requires a complete PASS review qualification")
         if state.get("intent") and qualification.get("intent_revision") != state.get("intent", {}).get("current_revision"):
             fail("review qualification is stale for the current intent")
-        if open_ticket_finding_obligations(state, ticket["id"]):
+        if ticket.get("state") == "INTEGRATED" and candidate.get("qualification_ref") == qualification["id"]:
+            if worker.get("lease", {}).get("state") != "released":
+                fail("idempotent integration found an unreleased producer lease")
+            return {"integrated": True, "idempotent": True, "qualification_ref": qualification["id"], "revision": state["revision"]}
+
+        # A qualification may carry narrowly scoped, evidence-bound closure
+        # claims from its accepted fresh PASS reviews.  They are intentionally
+        # consumed here (the immutable integration writer), rather than by a
+        # mutable review-file reread.  A claim can resolve either a current
+        # ticket finding or a typed external continuation issue, but only when
+        # it names this exact candidate and is present in the accepted return.
+        resolution_entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        resolved_finding_refs: set[str] = set()
+        resolved_blocker_refs: set[str] = set()
+        resolved_review_issue_refs: set[str] = set()
+        for review_ref in qualification.get("accepted_review_refs", []):
+            review = next((item for item in state.get("reviews", []) if item.get("id") == review_ref), None)
+            if review is None or review.get("verdict") != "PASS" or review.get("subject_fingerprint") != candidate.get("sha"):
+                fail("qualification contains a non-current or non-PASS review")
+            review_attempt = attempt_by_id(state, review.get("attempt_ref")) if review.get("attempt_ref") else None
+            if review_attempt is None or review_attempt.get("kind") != "review" or review_attempt.get("state") != "RETURNED":
+                fail("qualification resolution requires a returned exact review attempt")
+            returned = stored_payload(p, review.get("return_ref"), "accepted review return")
+            if returned.get("verdict") != "PASS" or returned.get("subject_fingerprint") != candidate.get("sha"):
+                fail("qualification resolution return is not bound to the exact current candidate")
+            if returned.get("finding_resolution", []) != review.get("finding_resolution", []):
+                fail("qualification resolution differs from its immutable accepted review return")
+            for resolution in review.get("finding_resolution", []):
+                finding_ref = resolution.get("finding_ref")
+                candidate_ref = resolution.get("candidate_ref")
+                evidence_refs = resolution.get("evidence_refs")
+                if candidate_ref != candidate.get("id") or not isinstance(evidence_refs, list) or not evidence_refs:
+                    fail("qualification finding resolution is not bound to the exact current candidate")
+                if not set(evidence_refs).issubset({*returned.get("context_refs", []), *(item.get("evidence_ref") for item in returned.get("checks", []) if item.get("evidence_ref")), *(ref for item in returned.get("coverage", []) for ref in item.get("evidence_refs", []))}):
+                    fail("qualification finding resolution cites evidence outside its accepted review")
+                finding = next((item for item in state.get("findings", []) if item.get("id") == finding_ref), None)
+                if finding is not None:
+                    if finding_ref in resolved_finding_refs or finding_ref not in {
+                        item.get("finding_ref") for item in finding_obligation_projection(state).get("obligations", [])
+                        if ticket["id"] in item.get("ticket_refs", [])
+                    }:
+                        fail("qualification finding resolution is not a unique current ticket obligation")
+                    resolved_finding_refs.add(finding_ref)
+                    source_attempt = next((item for item in state.get("attempts", []) if item.get("id") == finding.get("source_ref")), None)
+                    if source_attempt is not None:
+                        resolved_review_issue_refs.update(
+                            item.get("id") for item in state.get("reviews", [])
+                            if item.get("attempt_ref") == source_attempt.get("id") and item.get("id")
+                        )
+                else:
+                    issue = next((item for item in state.get("issues", []) if item.get("id") == finding_ref), None)
+                    if (
+                        issue is None
+                        or finding_ref in resolved_blocker_refs
+                        or issue.get("impact") != "blocking"
+                        or issue.get("invalidated_by")
+                        or ticket["id"] not in issue.get("affected_refs", [])
+                        or not (str(issue.get("type", "")).startswith("external_") or issue.get("cause") == "environment")
+                    ):
+                        fail("qualification external blocker resolution is not a unique typed current issue")
+                    source_attempt = next((item for item in state.get("attempts", []) if item.get("id") == issue.get("source_ref")), None)
+                    continuation = stored_payload(p, source_attempt.get("continuation_ref"), "external continuation receipt") if source_attempt and source_attempt.get("continuation_ref") else None
+                    if not isinstance(continuation, dict) or continuation.get("blocker_ref") != finding_ref:
+                        fail("qualification external blocker resolution is not bound to its preserved continuation receipt")
+                    required_checks = set(continuation.get("external_check_ids", []))
+                    required_criteria = set(continuation.get("external_criterion_ids", []))
+                    returned_checks = {item.get("check_id"): item for item in returned.get("checks", [])}
+                    returned_criteria = {item.get("criterion_id"): item for item in returned.get("coverage", [])}
+                    if any(returned_checks.get(check_id, {}).get("outcome") != "fulfilled" for check_id in required_checks):
+                        fail("qualification external blocker resolution lacks a fulfilled exact external check")
+                    if any(returned_criteria.get(criterion_id, {}).get("outcome") != "fulfilled" for criterion_id in required_criteria):
+                        fail("qualification external blocker resolution lacks fulfilled external criterion coverage")
+                    exact_external_evidence = {
+                        *(returned_checks[check_id].get("evidence_ref") for check_id in required_checks),
+                        *(evidence_ref for criterion_id in required_criteria for evidence_ref in returned_criteria[criterion_id].get("evidence_refs", [])),
+                    }
+                    if not exact_external_evidence.issubset(set(evidence_refs)):
+                        fail("qualification external blocker resolution does not cite exact external evidence")
+                    resolved_blocker_refs.add(finding_ref)
+                resolution_entries.append((review, resolution))
+
+        if [item.get("finding_ref") for _, item in resolution_entries].count(None):
+            fail("qualification resolution has an empty target")
+        open_obligations = [
+            item for item in open_ticket_finding_obligations(state, ticket["id"])
+            if item.get("finding_ref") not in resolved_finding_refs
+        ]
+        if open_obligations:
             fail("integration is blocked by unresolved ticket-scoped finding obligations")
         relevant_blockers = [
             item for item in state.get("issues", [])
             if item.get("impact") == "blocking" and not item.get("invalidated_by")
+            and item.get("id") not in resolved_blocker_refs
+            and item.get("finding_ref") not in resolved_finding_refs
+            and not (
+                item.get("type") == "review_verdict"
+                and item.get("source_ref") in resolved_review_issue_refs
+            )
             and (ticket["id"] in item.get("affected_refs", []) or candidate["id"] in item.get("affected_refs", []))
         ]
         if relevant_blockers:
@@ -8139,6 +8232,47 @@ def cmd_integrate_qualification(args: argparse.Namespace) -> dict[str, Any]:
         next_candidate["integration_status"] = "INTEGRATED"
         next_candidate["qualification_ref"] = qualification["id"]
         next_worker["lease"]["state"] = "released"
+        for index, (review, resolution) in enumerate(resolution_entries, start=1):
+            target_ref = resolution["finding_ref"]
+            decision_id = f"finding-resolution-{review['id']}-{index}"
+            if any(item.get("id") == decision_id for item in next_state.get("decisions", [])):
+                fail("qualification finding resolution decision ID already exists")
+            issue = next((item for item in next_state.get("issues", []) if item.get("id") == target_ref), None)
+            next_state.setdefault("decisions", []).append({
+                "id": decision_id,
+                "type": "external_blocker_resolution" if issue is not None else "finding_resolution",
+                "status": "accepted",
+                "decision": "RESOLVED",
+                "reason": resolution["reason"],
+                "evidence_refs": [review["id"], *resolution["evidence_refs"]],
+                "affected_refs": [target_ref],
+                "candidate_ref": candidate["id"],
+                "introduced_revision": str(state["revision"] + 1),
+                "intent_revision": next_state.get("intent", {}).get("current_revision"),
+                "invalidated_by": [],
+            })
+            if issue is not None:
+                issue["impact"] = "advisory"
+                issue["disposition"] = f"resolved by exact qualification review {review['id']}"
+                issue.setdefault("invalidated_by", []).append(review["id"])
+            else:
+                for mirrored in next_state.get("issues", []):
+                    finding_record = next((item for item in next_state.get("findings", []) if item.get("id") == target_ref), None)
+                    if (
+                        mirrored.get("finding_ref") == target_ref
+                        or (
+                            finding_record is not None
+                            and mirrored.get("type") == "review_verdict"
+                            and mirrored.get("source_ref") in {finding_record.get("source_ref"), review.get("id")}
+                        )
+                        or (
+                            mirrored.get("type") == "review_verdict"
+                            and mirrored.get("source_ref") in resolved_review_issue_refs
+                        )
+                    ):
+                        mirrored["impact"] = "advisory"
+                        mirrored["disposition"] = f"resolved by exact qualification review {review['id']}"
+                        mirrored.setdefault("invalidated_by", []).append(review["id"])
         if next_state.get("lifecycle", {}).get("control") == "BLOCKED":
             remaining = [
                 item for item in next_state.get("issues", [])
