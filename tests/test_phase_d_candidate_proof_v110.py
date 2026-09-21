@@ -58,13 +58,14 @@ class PhaseDCandidateProofTests(unittest.TestCase):
     def prepare_done_candidate(
         self, root: Path, *, parent_drift: bool = False,
         extra_committed_path: bool = False, rename_outside_lease: bool = False,
+        registered_ignored_return: bool = False,
     ) -> dict[str, Any]:
         root.mkdir(parents=True, exist_ok=True)
         control, repo = root / "control", root / "repo"
         control.mkdir()
         repo.mkdir()
         subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
-        (repo / ".gitignore").write_text("ignored.generated\n", encoding="utf-8")
+        (repo / ".gitignore").write_text("ignored.generated\n.autopilot/\n", encoding="utf-8")
         (repo / "app.txt").write_text("baseline\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(repo), "add", ".gitignore", "app.txt"], check=True)
         subprocess.run([
@@ -109,7 +110,12 @@ class PhaseDCandidateProofTests(unittest.TestCase):
             "write": {"allow": [{"path": "app.txt", "operations": ["modify"]}]},
             "verification": [{"check_id": "focused", "required": True, "scenario": "focused regression"}],
             "risk": {"level": "routine"}, "context": [{"ref": "contracts/worker.md"}],
-            "return_target": {"path": "return.json"},
+            "return_target": {
+                "path": (
+                    f".autopilot/scratch/{RUN_ID}/{ATTEMPT_ID}/return.json"
+                    if registered_ignored_return else "return.json"
+                )
+            },
         }
         intent = ledger.current_intent_binding(state)
         publication = state["design_publication"]
@@ -163,6 +169,8 @@ class PhaseDCandidateProofTests(unittest.TestCase):
         }
         return_path = paths["scratch"] / ATTEMPT_ID / "return.json"
         write_json(return_path, worker_return)
+        if registered_ignored_return:
+            write_json(repo / packet["return_target"]["path"], worker_return)
         run(
             "ingest-return", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
             "--revision", str(state["revision"]), "--attempt-id", ATTEMPT_ID, "--return-file", str(return_path), "--kind", "worker",
@@ -289,6 +297,34 @@ class PhaseDCandidateProofTests(unittest.TestCase):
             self.assertTrue(replay["idempotent"])
             self.assertEqual(state["revision"], ledger.load_state(case["paths"])[0]["revision"])
             self.assertEqual(raw, case["paths"]["ledger"].read_bytes())
+
+    def test_exact_registered_ignored_return_inbox_is_not_a_product_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case = self.prepare_done_candidate(Path(directory), registered_ignored_return=True)
+            result = json.loads(run(*self.candidate_args(case, receipt_path=case["receipt_path"])).stdout)
+            self.assertEqual(case["candidate_sha"], result["candidate"])
+            proof, _, _, _ = self.proof_and_records(case)
+            audit = ledger.stored_payload(case["paths"], proof["write_set_audit_ref"], "candidate write-set audit")
+            control_path = f".autopilot/scratch/{RUN_ID}/{ATTEMPT_ID}/return.json"
+            self.assertTrue(audit["pass"])
+            self.assertEqual(["app.txt"], audit["changed_paths"])
+            self.assertEqual(
+                ledger.stored_payload(case["paths"], proof["return_ref"], "candidate worker return"),
+                json.loads((case["repo"] / control_path).read_text(encoding="utf-8")),
+            )
+            self.assertEqual(
+                proof["return_ref"].split("/", 1)[1],
+                audit["trusted_ignored_control_files"][control_path]["sha256"],
+            )
+
+    def test_registered_ignored_return_does_not_hide_other_ignored_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case = self.prepare_done_candidate(Path(directory), registered_ignored_return=True)
+            (case["repo"] / "ignored.generated").write_text("foreign ignored write\n", encoding="utf-8")
+            result = self.assert_rejected_without_mutation(
+                case, *self.candidate_args(case, receipt_path=case["receipt_path"]),
+            )
+            self.assertIn("ignored.generated", result.stderr)
 
     def test_done_and_continuation_publications_share_the_same_proof_shape_and_refs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

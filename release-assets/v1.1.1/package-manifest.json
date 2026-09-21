@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "release": "v1.1.1",
+  "package_kind": "codex-autopilot-qualification",
+  "source_manifest": "release-assets/v1.1.1/source-manifest.json",
+  "fixture_inventory": "release-assets/v1.1.1/fixture-inventory.json",
+  "content_manifest": "release-assets/v1.1.1/content-manifest.json",
+  "environment_manifest": "release-assets/v1.1.1/environment-manifest.json",
+  "runtime_conformance": "release-assets/v1.1.1/runtime-conformance.json",
+  "qualification_entrypoint": "experiments/v111_release_qualification.py",
+  "suite_entrypoint": "python3 -m unittest discover -s tests -v",
+  "integrity_policy": {
+    "hash": "sha256",
+    "encoding": "utf-8",
+    "newline": "preserve",
+    "symlinks": "reject",
+    "missing_or_extra": "fail"
+  }
+}

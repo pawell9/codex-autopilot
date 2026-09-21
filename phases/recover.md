@@ -20,6 +20,18 @@ Pause preserves worktree and changes. Cancel records the goal termination, prese
 5. Audit foreign tracked/untracked/ignored changes, symlink targets, protected paths, and Git common-dir state. Preserve foreign fingerprints. Old-epoch returns are historical evidence until the current owner re-audits and accepts them by version/subject checks.
 6. Invalidate facts affected by build, permission, surface, repo, HEAD, instruction, toolchain, configuration, or contradictory observations. Set the earliest invalid gate and a precise `next_action`.
 
+An affected v1.1.0 run that reached G1–G3 before its first worker dispatch may
+have `repository.initial_head=null` or an execution root that still names the
+pre-worktree checkout. Do not edit the ledger. While control is `BLOCKED` or
+`RECOVERING`, use `bind-bootstrap` with the exact expected commit, clean target
+worktree, owner/revision fence, authority reference, and (when the root changes)
+the already-applied `worktree_create` operation. The command rejects worker
+attempts, candidates, live/quarantined reservations, unrelated unresolved
+effects, repository-identity drift, dirty targets, and mismatched receipts. It
+appends a hash-addressed migration report, updates only the repository binding,
+and finalizes only that exact worktree operation. Then use ordinary `recover`
+and lifecycle reconciliation before returning to `ACTIVE`.
+
 Do not hand-edit a quarantined lease. A returned legacy repair attempt may be
 restored to candidate authority only through `reconcile-quarantined-attempt`
 and only for the provenance-bound same-ticket create-to-modify case documented
@@ -31,6 +43,17 @@ candidate. The helper validates the external claim; it does not stop/kill
 native workers or independently enumerate their descendants. This path discards partial work; it never
 turns unknown or foreign writes into a candidate. Failed proof, stale base,
 pending effects, or incomplete cleanup remains explicitly quarantined.
+
+One amendment/resume compatibility case has a separate fail-closed command:
+`reconcile-stale-lease`. Use it only when the exact current owner epoch still
+owns a returned worker attempt whose active lease survived amendment, both the
+attempt and its current ticket are invalidated by that same approved amendment,
+the ticket is `STALE`, the typed runtime stop covers descendant writers, the
+candidate proof/finalized operation are exact, no other lease/effect is live,
+and the registered checkout is the clean candidate checkpoint. The transaction
+changes only that lease state and appends a hash-addressed report plus
+decision/provenance; it must leave historical routes and evidence byte-for-byte
+unchanged. An exact retry is idempotent; any ambiguous binding fails closed.
 
 Use `tools/ledger.py recover` for deterministic publication. If current JSON is corrupt, validate verified previous snapshots newest-first; do not overwrite the namespace with a guessed reconstruction. Use `diagnose` for an unknown schema; it is strictly read-only. If no safe recovery exists, remain `BLOCKED` or `FAILED` after all in-flight activity is stopped; a successor run needs an explicit new scope decision and a fresh namespace initialized with `init-successor` from a typed successor manifest binding exact predecessor evidence.
 

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from experiments import v110_release_qualification as qualification
+from experiments import v111_release_qualification as qualification
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class PhaseHReleaseParityTests(unittest.TestCase):
     def test_reproducible_release_qualification_passes(self) -> None:
         result = subprocess.run(
-            ["python3", str(ROOT / "experiments" / "v110_release_qualification.py")],
+            ["python3", str(ROOT / "experiments" / "v111_release_qualification.py")],
             cwd=ROOT,
             text=True,
             capture_output=True,
@@ -25,7 +25,7 @@ class PhaseHReleaseParityTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         report = json.loads(result.stdout)
         self.assertTrue(report["qualified"])
-        self.assertEqual("v1.1.0", report["release"])
+        self.assertEqual("v1.1.1", report["release"])
         self.assertEqual(21, report["source"]["files"])
         self.assertEqual("UNSUPPORTED", report["native_runtime"]["status"])
 
@@ -97,7 +97,7 @@ class PhaseHReleaseParityTests(unittest.TestCase):
         report = qualification.verify_install_parity(ROOT, entries)
         self.assertEqual(len(entries), report["files"])
         self.assertTrue(report["isolated"])
-        self.assertEqual("1.1.0", report["runtime_version"])
+        self.assertEqual("1.1.1", report["runtime_version"])
 
 
 if __name__ == "__main__":

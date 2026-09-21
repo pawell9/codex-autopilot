@@ -1,5 +1,23 @@
 # Changelog
 
+## [v1.1.1] — 2026-09-21
+
+Post-v1.1.0 lifecycle patch validated during the completed Idea Scout T02
+run.
+
+- Bound Git-backed initialization and pre-dispatch bootstrap recovery to the
+  exact checkout, commit, worktree receipt, and clean-state evidence.
+- Preserved exact replacement checkpoints and routed completed repairs to a
+  fresh candidate review before finding closure.
+- Made registered ignored return inboxes control-only, preserved route/evidence
+  hashes across amendments, and kept manual final-G5 imports behind the G4
+  barrier.
+- Added fail-closed stale-lease, historical-review, and stopped unimportable
+  final-G5 reconciliations with immutable provenance and idempotent replay.
+- Added regression coverage and a reproducible v1.1.1 source/runtime package.
+
+Idea Scout source, fixtures, and run artifacts are unchanged.
+
 ## [v1.1.0] — 2026-09-19
 
 Durable lifecycle hardening and qualification release.

@@ -21,7 +21,55 @@ Required records are `repository/owner`, `lifecycle.next_action`, `documents/int
 
 For every mutation, the helper acquires the fixed advisory owner lock, rereads the current ledger, checks owner token/epoch and expected revision, validates the entire proposed snapshot and semantic invariants, and writes the prior valid bytes to `ledger.prev.json`. It then writes a same-directory temporary file, flushes/fsyncs, atomically replaces `ledger.json`, and syncs the directory. If the previous backup fails, no new publication is accepted. Orphan temporary files/objects are harmless and never authority. A same-byte unreferenced initial-intent document may be adopted by a retry after interruption; conflicting bytes block rather than overwrite. Generated view failure does not roll back state.
 
-`ready-ticket` atomically materializes dependency/current-publication readiness. `dispatch` publishes the route, checkout reservation, packet ref/hash, execution binding, and `PREPARED` attempt; it registers a stable spawn request but does not spawn. `terminate-attempt` records LOST/INTERRUPTED plus exact typed runtime stop/not-started evidence and releases or quarantines its reservation. `finalize-attempt` records the total safe disposition for returned non-DONE and terminated worker attempts without inventing a candidate; `reconcile-finalized-attempt` can later release its quarantine only from an exact runtime receipt and a fresh exact-baseline audit. `close-blocked-attempt` remains the narrow no-write BLOCKED repair closure and has the same runtime stop guard. After G1, `adopt-requirements` may publish an explicit legacy requirements/criteria manifest, `migrate-review-currentness` may fence provably superseded legacy findings after fresh current G2/G3 PASS ingestion, and `publish-design-bundle` publishes the complete design bundle. `prepare-design-review` registers coverage or plan identity and immutable subject bindings without spawning. `validate-return` is a read-only state-bound preflight; return/review ingestion releases a reservation only when exact stop/not-started evidence is already valid. `candidate` and `preserve-blocked-candidate` consume the ingested worker return and the exact Git operation receipt through one `VerifiedCandidateProof` finalizer. `authorize-repair` binds one bounded grouped finding set to a canonical `RepairPlan` and packet-bound `AttemptPlan`; dispatch reruns the same preflight and consumes it once. `integrate` accepts exact review evidence and integrity PASS, resolves the authorized repair finding, and publishes current integration. `publish-intent`, `gate`, `amend`, and `recover` are compound intent commands. `diagnose`, `brief`, and `status` are bounded reads.
+`ready-ticket` atomically materializes dependency/current-publication readiness. `dispatch` publishes the route, checkout reservation, packet ref/hash, execution binding, and `PREPARED` attempt; it registers a stable spawn request but does not spawn. `terminate-attempt` records LOST/INTERRUPTED plus exact typed runtime stop/not-started evidence and releases or quarantines its reservation. `finalize-attempt` records the total safe disposition for returned non-DONE and terminated worker attempts without inventing a candidate; `reconcile-finalized-attempt` can later release its quarantine only from an exact runtime receipt and a fresh exact-baseline audit. `close-blocked-attempt` remains the narrow no-write BLOCKED repair closure and has the same runtime stop guard. `bind-bootstrap` is the pre-dispatch-only recovery transaction for an affected run whose repository baseline/root was not durably bound: it verifies the clean exact Git target and optional applied worktree receipt, stores a hash-addressed migration report, and changes no lifecycle decision. After G1, `adopt-requirements` may publish an explicit legacy requirements/criteria manifest, `migrate-review-currentness` may fence provably superseded legacy findings after fresh current G2/G3 PASS ingestion, and `publish-design-bundle` publishes the complete design bundle. `prepare-design-review` registers coverage or plan identity and immutable subject bindings without spawning. `validate-return` is a read-only state-bound preflight; return/review ingestion releases a reservation only when exact stop/not-started evidence is already valid. `candidate` and `preserve-blocked-candidate` consume the ingested worker return and the exact Git operation receipt through one `VerifiedCandidateProof` finalizer. `authorize-repair` binds one bounded grouped finding set to a canonical `RepairPlan` and packet-bound `AttemptPlan`; dispatch reruns the same preflight and consumes it once. `integrate` accepts exact review evidence and integrity PASS, resolves the authorized repair finding, and publishes current integration. `publish-intent`, `gate`, `amend`, and `recover` are compound intent commands. `diagnose`, `brief`, and `status` are bounded reads.
+
+`reconcile-stale-lease` covers only the amendment gap in which a returned
+worker and its current `STALE` ticket carry the same approved invalidation but
+the worker lease remains active. The caller supplies the exact run, owner
+token, owner epoch, attempt, lease, amendment, revision, and reconciliation
+ID. The helper requires a valid typed stop receipt, one verified candidate and
+finalized invalidated candidate operation, no other occupied lease or
+unresolved effect, and the exact clean registered checkout at that candidate.
+It atomically changes only the selected lease to `released` and appends a
+content-addressed report, decision, and runtime-provenance migration. Route and
+evidence collections are hashed into the report and remain unchanged. Exact
+replay is zero-effect; conflicting IDs or any ambiguity reject without state
+mutation.
+
+`reconcile-historical-review-obligations` handles one legacy EXECUTE review
+accepted as `UNVERIFIABLE` on the current frozen candidate when its packet
+lacked proof for a separately resolved finding and described a later final-G5
+obligation. The owner supplies exact run/revision/epoch, candidate, old
+review/finding/issues, fresh stopped PASS routine and critical reviews, and a
+stopped, released interrupted critical predecessor. Every other finding from
+the old review must have a fresh PASS resolution claim. The command appends
+one hash-addressed decision/report/provenance, makes only the three matched
+issue projections advisory, and records a qualification over the two fresh
+PASS reviews. Old review, finding, return, route, evidence, and prior BLOCK
+qualification remain unchanged. The deferred finding is a historical review
+obligation, not final-G5 evidence: G4 still requires integration and G6 still
+requires a new current-intent final-G5 PASS. Exact replay is a no-op;
+ambiguous linkage or checkout drift rejects publication.
+
+`register-final-g5` registers one fresh `PREPARED` acceptance reviewer after
+G4 on the exact current integrated, proof-carrying candidate. It requires the
+run, owner token/epoch, revision, ticket, candidate, unused attempt/lease IDs,
+and a current-intent `final_g5` packet covering every active criterion. The
+registered checkout must be clean at the candidate HEAD/tree, with no open
+lease, effect, blocker, or finding obligation. The command does not start a
+reviewer or credit G5; `prepare-handoff` supplies the clean manual transport,
+and only a fresh accepted return can qualify G5. Exact replay is a no-op.
+
+`reconcile-unimportable-final-g5` is the owner/epoch/revision-fenced exit for
+one stopped manual G5 whose raw return says `REJECT` with complete
+pass/unverifiable criterion evidence but cannot satisfy the acceptance-return
+schema. It requires the exact integrated candidate, active attempt/lease,
+typed runtime stop, matching packet/intent/setup hashes, clean checkout, and
+no other blocker. It stores the four original files plus a hash-addressed
+report, marks only that attempt `INTERRUPTED` and its lease released, and
+permits a fresh same-candidate G5 registration. The rejected artifact is not
+an accepted review, finding, repair wave, or G5 credit. Exact replay is a
+no-op; conflicting evidence fails closed.
 
 ## Runtime observations and reservation safety
 
@@ -103,7 +151,13 @@ issues, never converts partial work into `DONE`, and makes an initial ticket
 after later pointer progress; conflicting evidence or any remaining write or
 effect leaves quarantine unchanged.
 
-`init` publishes revision 0 without intent. `publish-intent` is the single-use bootstrap transaction: from PREFLIGHT/INTENT and ACTIVE/BLOCKED/RECOVERING it validates non-empty UTF-8 Markdown, owner/revision, destination, complete next ledger, and absence of any prior intent binding before installing immutable bytes and publishing the INTENT revision. Existing blocking issue refs remain blocking; a recovering run remains `RECOVERING` until reconciliation completes. Once intent exists, only `amend` may publish a later intent revision.
+`init` publishes revision 0 without intent. For an existing Git checkout it first verifies the exact top-level root and records committed `initial_head`, branch, common directory, checkout, and execution root; an unborn/no-commit Git target is rejected rather than publishing a dispatch-incapable baseline. Non-Git directory fixtures remain diagnostic-compatible with `initial_head=null` but cannot dispatch a Git-backed worker. `publish-intent` is the single-use bootstrap transaction: from PREFLIGHT/INTENT and ACTIVE/BLOCKED/RECOVERING it validates non-empty UTF-8 Markdown, owner/revision, destination, complete next ledger, and absence of any prior intent binding before installing immutable bytes and publishing the INTENT revision. Existing blocking issue refs remain blocking; a recovering run remains `RECOVERING` until reconciliation completes. Once intent exists, only `amend` may publish a later intent revision.
+
+`amend` records supersession as an append-only invalidation consumer closure.
+Historical route records that are hash-bound by attempt execution bindings and
+historical evidence records remain byte-for-byte immutable; the amendment
+names their IDs in the invalidation record instead of adding in-place
+`invalidated_by` metadata that would change their identity.
 
 `adopt-requirements` is the schema-1.0 compatibility publication for a nonterminal, pre-execution run. Its explicit manifest contains complete requirement↔criterion links and criterion oracles and binds the current intent revision/document/hash and owner epoch. The helper validates uniqueness, cross-links, provenance refs, status, and conflicts; stores exact bytes as `objects/<sha256>`; and atomically appends requirements, criteria, the requirements publication, and a migration record. It never infers prose. An exact retry is zero-effect; same ID with different bytes/records, active leases, prepared effects, stale fencing, or execution entry is rejected.
 

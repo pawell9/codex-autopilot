@@ -19,6 +19,16 @@ The orchestrator owns the run ledger, canonical Markdown revisions, routing, pac
 
 For a new run, `init` creates revision 0 and `publish-intent` atomically binds the first canonical intent as revision 1 before G1 work continues. `publish-intent` is valid exactly once; use `amend` only after that binding exists. On resume, a nonterminal legacy or blocked run without `intent` publishes its existing authorized intent through this command instead of editing the ledger or starting a successor run.
 
+For a Git-backed run, `init` also verifies and records the exact checkout root,
+committed `initial_head`, branch, and common directory before revision 0 is
+published. A pre-dispatch run created by an affected older v1.1.0 helper may
+use `bind-bootstrap` only while `BLOCKED`/`RECOVERING`: the owner-fenced command
+requires a clean exact checkout at the expected HEAD, the same repository
+identity, no worker attempt/candidate/live reservation, and, when switching to
+an already-created worktree, its exact applied `worktree_create` receipt. It
+stores a hash-addressed append-only migration report and never rewrites prior
+ledger publications.
+
 After G1, publish a complete `design_bundle` containing the versioned design,
 interfaces/contracts, manifest, implementation plan, tickets, routes, and
 dependency bindings with `tools/ledger.py publish-design-bundle`. The
@@ -150,6 +160,14 @@ Read `references/ledger.md` before the first state mutation or any recovery ques
    through `reconcile-finalized-attempt` only with PASS writer-stop evidence
    and an exact audit proving disposal to the verified baseline. Every failed
    proof leaves the ledger and quarantine unchanged.
+9. After an intent amendment, `reconcile-stale-lease` is the only narrow
+   exception for an active lease retained by a returned worker. It requires
+   the exact run owner/epoch/lease, a typed stop receipt with descendant
+   writers included, the same approved amendment on both the attempt and its
+   `STALE` current ticket, one finalized verified candidate operation, and the
+   exact clean candidate checkout. It releases only that lease, writes a
+   hash-addressed report plus decision/provenance records, never changes
+   historical route/evidence records, and an exact replay is zero-effect.
 
 After compaction, resume, owner transfer, or doubt about the retained protocol, reread this entry, obtain a fresh `brief`, reread the current phase and its safety/recovery pointers, and only then perform a state-changing action. The summary and old conversation are hints, not authority.
 

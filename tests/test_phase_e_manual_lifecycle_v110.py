@@ -198,6 +198,8 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
         bundle = case["root"] / f"{attempt_id}-bundle"
         export.mkdir()
         (export / "app.txt").write_text("candidate\n", encoding="utf-8")
+        (export / "nested").mkdir()
+        (export / "nested" / "fixture.txt").write_text("nested candidate evidence\n", encoding="utf-8")
         write_json(packet_path, self.packet(
             case["run_id"], attempt_id, kind, case["intent_hash"], packet_purpose or purpose,
         ))
@@ -418,6 +420,81 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
                     self.assertEqual(1, len(qualifications))
                     self.assertEqual([purpose], qualifications[0]["satisfied_purposes"])
 
+    def test_manual_final_g5_acceptance_preflight_uses_packet_kind_not_review_role(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case = self.init_case(Path(directory))
+            self.prepare(case, "final_g5")
+            state, _ = ledger.load_state(case["paths"])
+            attempt = ledger.attempt_by_id(state, REVIEW_ATTEMPT_ID)
+            payload = self.acceptance_return(case, packet_hash=attempt["packet_hash"])
+            return_path = case["root"] / "preflight-acceptance.json"
+            write_json(return_path, payload)
+            before = case["paths"]["ledger"].read_bytes()
+            result = json.loads(run(
+                "validate-return", "--control-root", str(case["control"]),
+                "--run-id", case["run_id"], "--attempt-id", REVIEW_ATTEMPT_ID,
+                "--return-file", str(return_path), "--kind", "acceptance",
+            ).stdout)
+            self.assertTrue(result["valid"])
+            self.assertEqual(before, case["paths"]["ledger"].read_bytes())
+            payload["candidate_fingerprint"] = "c" * 40
+            write_json(return_path, payload)
+            rejected = run(
+                "validate-return", "--control-root", str(case["control"]),
+                "--run-id", case["run_id"], "--attempt-id", REVIEW_ATTEMPT_ID,
+                "--return-file", str(return_path), "--kind", "acceptance", expect=2,
+            )
+            self.assertIn("candidate fingerprint", rejected.stdout + rejected.stderr)
+            self.assertEqual(before, case["paths"]["ledger"].read_bytes())
+
+    def test_final_g5_import_ignores_invalidated_historical_stale_ticket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case = self.init_case(Path(directory))
+            state, _ = ledger.load_state(case["paths"])
+            historical = dict(state["tickets"][0])
+            historical.update({
+                "id": "T-HISTORICAL", "state": "STALE", "invalidated_by": ["AMEND-HIST"],
+                "current_attempt": None, "current_worker_attempt": None,
+                "last_worker_attempt": None, "current_candidate": None,
+                "replacement_refs": [TICKET_ID],
+            })
+            state["tickets"].append(historical)
+            publication_hash = ledger.object_store(case["paths"], b"fixture-publication")
+            state["design_publication"] = {
+                "id": "PUB-CURRENT", "version": "v1", "status": "PUBLISHED",
+                "owner_epoch": 0, "intent_revision": "v1",
+                "intent_document_ref": "D-INTENT", "intent_document_hash": case["intent_hash"],
+                "publication_hash": publication_hash, "bundle_ref": f"objects/{publication_hash}",
+                "published_revision": 1, "document_refs": ["D-INTENT"],
+                "contract_refs": [], "ticket_refs": [TICKET_ID], "route_refs": [],
+            }
+            ledger.validate_ledger(state)
+            write_json(case["paths"]["ledger"], state)
+            prepared = self.prepare(case, "final_g5")
+            state, _ = ledger.load_state(case["paths"])
+            attempt = ledger.attempt_by_id(state, REVIEW_ATTEMPT_ID)
+            payload = self.acceptance_return(case, packet_hash=attempt["packet_hash"])
+            evidence = self.write_manual_evidence(case, prepared, return_payload=payload)
+            state, _ = ledger.load_state(case["paths"])
+            imported = json.loads(run(
+                "import-manual", "--control-root", str(case["control"]),
+                "--run-id", case["run_id"], "--owner-token", OWNER,
+                "--revision", str(state["revision"]), "--attempt-id", REVIEW_ATTEMPT_ID,
+                "--purpose", "final_g5", "--return-file", str(evidence["return"]),
+                "--environment-receipt", str(evidence["environment"]),
+                "--context-receipt", str(evidence["context"]),
+                "--integrity-receipt", str(evidence["integrity"]),
+                "--intent-revision", "v1", "--candidate-fingerprint", CANDIDATE_SHA,
+                "--required-criteria", "C-1",
+            ).stdout)
+            self.assertTrue(imported["imported"])
+            self.assertEqual("PASS", imported["verdict"])
+            after, _ = ledger.load_state(case["paths"])
+            self.assertEqual("STALE", next(t for t in after["tickets"] if t["id"] == "T-HISTORICAL")["state"])
+            self.assertEqual("INTEGRATED", next(t for t in after["tickets"] if t["id"] == TICKET_ID)["state"])
+            self.assertEqual("ACCEPT", after["lifecycle"]["phase"])
+            self.assertEqual(1, len(after["acceptance"]))
+
     def test_declared_purpose_and_packet_type_must_agree_before_publication(self) -> None:
         cases = (("final_g5", "review", None), ("ticket_review", "acceptance", None),
                  ("ticket_review", "review", "critical_axis"))
@@ -553,6 +630,76 @@ class PhaseEManualLifecycleTests(unittest.TestCase):
             )
             self.assertEqual(["critical_axis"], qualification["satisfied_purposes"])
             self.assertEqual("INCOMPLETE", qualification["result"])
+
+    def test_critical_axis_import_in_execute_before_integration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case = self.init_case(Path(directory))
+            state, _ = ledger.load_state(case["paths"])
+            state["lifecycle"]["phase"] = "EXECUTE"
+            state["tickets"][0]["state"] = "REVIEW"
+            state["candidates"][0]["integration_status"] = "PENDING"
+            state["candidates"][0]["review_status"] = "BLOCK"
+            ledger.validate_ledger(state)
+            write_json(case["paths"]["ledger"], state)
+
+            prepared = self.prepare(case, "critical_axis", kind="review")
+            state, _ = ledger.load_state(case["paths"])
+            attempt = ledger.attempt_by_id(state, REVIEW_ATTEMPT_ID)
+            payload = self.review_return(case, packet_hash=attempt["packet_hash"])
+            evidence = self.write_manual_evidence(case, prepared, return_payload=payload)
+            state, _ = ledger.load_state(case["paths"])
+            result = invoke(
+                "import-manual", "--control-root", str(case["control"]),
+                "--run-id", case["run_id"], "--owner-token", OWNER,
+                "--revision", str(state["revision"]), "--attempt-id", REVIEW_ATTEMPT_ID,
+                "--purpose", "critical_axis", "--return-file", str(evidence["return"]),
+                "--environment-receipt", str(evidence["environment"]),
+                "--context-receipt", str(evidence["context"]),
+                "--integrity-receipt", str(evidence["integrity"]),
+                "--intent-revision", "v1", "--candidate-fingerprint", CANDIDATE_SHA,
+                "--required-criteria", "C-1",
+            )
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            after, _ = ledger.load_state(case["paths"])
+            self.assertEqual("EXECUTE", after["lifecycle"]["phase"])
+            self.assertEqual("REVIEW", after["tickets"][0]["state"])
+            self.assertEqual("review_candidate", after["lifecycle"]["next_action"]["kind"])
+            qualification = next(
+                item for item in after["review_qualifications"]
+                if item["subject_fingerprint"] == CANDIDATE_SHA
+            )
+            self.assertEqual(["critical_axis"], qualification["satisfied_purposes"])
+            self.assertEqual([], after["acceptance"])
+
+    def test_final_g5_import_cannot_skip_g4_from_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case = self.init_case(Path(directory))
+            state, _ = ledger.load_state(case["paths"])
+            state["lifecycle"]["phase"] = "EXECUTE"
+            ledger.validate_ledger(state)
+            write_json(case["paths"]["ledger"], state)
+
+            prepared = self.prepare(case, "final_g5")
+            state, _ = ledger.load_state(case["paths"])
+            attempt = ledger.attempt_by_id(state, REVIEW_ATTEMPT_ID)
+            payload = self.acceptance_return(case, packet_hash=attempt["packet_hash"])
+            evidence = self.write_manual_evidence(case, prepared, return_payload=payload)
+            before = case["paths"]["ledger"].read_bytes()
+            state, _ = ledger.load_state(case["paths"])
+            result = invoke(
+                "import-manual", "--control-root", str(case["control"]),
+                "--run-id", case["run_id"], "--owner-token", OWNER,
+                "--revision", str(state["revision"]), "--attempt-id", REVIEW_ATTEMPT_ID,
+                "--purpose", "final_g5", "--return-file", str(evidence["return"]),
+                "--environment-receipt", str(evidence["environment"]),
+                "--context-receipt", str(evidence["context"]),
+                "--integrity-receipt", str(evidence["integrity"]),
+                "--intent-revision", "v1", "--candidate-fingerprint", CANDIDATE_SHA,
+                "--required-criteria", "C-1",
+            )
+            self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+            self.assertIn("final G5 import requires VERIFY/ACCEPT", result.stdout + result.stderr)
+            self.assertEqual(before, case["paths"]["ledger"].read_bytes())
 
     def test_final_g5_block_creates_repairable_finding_and_rejects_g6_without_fresh_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

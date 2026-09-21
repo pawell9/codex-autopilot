@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-SKILL_VERSION = "1.1.0"
+SKILL_VERSION = "1.1.1"
 POLICY_VERSION = "v1-manual-g5"
 SCHEMA_VERSION = "1.0"
 STATE_CONTRACT_VERSION = "1.1"
@@ -82,7 +82,7 @@ EVENT_PHASE_TABLE = {
     "effect.prepare": frozenset(PHASES),
     "effect.reconcile": frozenset(PHASES),
     "handoff.prepare": frozenset({"EXECUTE", "VERIFY", "ACCEPT"}),
-    "acceptance.import": frozenset({"VERIFY", "ACCEPT"}),
+    "acceptance.import": frozenset({"EXECUTE", "VERIFY", "ACCEPT"}),
     "intent.amend": frozenset(PHASES),
     "usage.publish": frozenset(PHASES),
     "ticket.ready": frozenset({"EXECUTE"}),
@@ -353,6 +353,77 @@ def _review05_grouped_repair_action(state: dict[str, Any]) -> dict[str, Any] | N
     }
 
 
+def _blocked_repaired_candidate_review_action(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Route a finished repair candidate to fresh review without closing its source finding early."""
+    projection = finding_obligation_projection(state)
+    current_ticket_refs = set((state.get("design_publication") or {}).get("ticket_refs", []))
+    findings = {item.get("id"): item for item in state.get("findings", [])}
+    attempts = {item.get("id"): item for item in state.get("attempts", [])}
+    for ticket in state.get("tickets", []):
+        if current_ticket_refs and ticket.get("id") not in current_ticket_refs:
+            continue
+        if ticket.get("state") != "CANDIDATE":
+            continue
+        candidate = current_candidate_record(state, ticket)
+        if (
+            candidate is None
+            or candidate.get("quality") != "DONE"
+            or candidate.get("review_status") != "PENDING"
+        ):
+            continue
+        producer = attempts.get(candidate.get("producer_attempt_ref"))
+        if (
+            producer is None
+            or producer.get("kind") != "worker"
+            or producer.get("mode") != "repair"
+            or producer.get("state") != "RETURNED"
+            or producer.get("lease", {}).get("state") != "active"
+            or producer.get("candidate_sha") != candidate.get("sha")
+            or ticket.get("current_attempt") != producer.get("id")
+        ):
+            continue
+        repaired_refs = set(repair_finding_refs(producer.get("repair_contract")))
+        carried_refs = {
+            item.get("finding_ref")
+            for item in projection.get("obligations", [])
+            if item.get("status") != "closed" and ticket.get("id") in item.get("ticket_refs", [])
+        }
+        carried_refs.discard(None)
+        if not carried_refs or not carried_refs.issubset(repaired_refs):
+            continue
+        source_review_refs = {
+            findings[ref].get("source_ref") for ref in carried_refs if ref in findings
+        }
+        source_review_refs.update(
+            item.get("id") for item in state.get("reviews", [])
+            if item.get("attempt_ref") in source_review_refs
+        )
+        active_ticket_blockers = [
+            item for item in state.get("issues", [])
+            if item.get("impact") == "blocking"
+            and not item.get("invalidated_by")
+            and ticket.get("id") in item.get("affected_refs", [])
+        ]
+        if any(
+            not (
+                item.get("finding_ref") in carried_refs
+                or (item.get("type") == "review_verdict" and item.get("source_ref") in source_review_refs)
+            )
+            for item in active_ticket_blockers
+        ):
+            continue
+        return {
+            "kind": "review_candidate",
+            "subject_refs": [ticket["id"], candidate["id"]],
+            "preconditions": [
+                "prepare an independent review bound to the explicit repaired candidate",
+                "close carried repair findings only after a current PASS review and integration",
+            ],
+            "read_refs": ["contracts/reviewer.md", "phases/execute.md"],
+        }
+    return None
+
+
 def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
     """Derive a safe typed disposition from control, attempts, obligations, and candidate pointers."""
     lifecycle = state.get("lifecycle", {})
@@ -486,6 +557,8 @@ def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
             }
         elif control == "BLOCKED" and (blocked_repair_action := _blocked_repair_candidate_action(state)) is not None:
             action = blocked_repair_action
+        elif control == "BLOCKED" and (repaired_review_action := _blocked_repaired_candidate_review_action(state)) is not None:
+            action = repaired_review_action
         elif control == "BLOCKED":
             projection = finding_obligation_projection(state)
             open_obligations = [item for item in projection["obligations"] if item.get("status") != "closed"]
@@ -684,7 +757,10 @@ def derive_next_action(state: dict[str, Any]) -> dict[str, Any]:
                     }
                 else:
                     candidates_ready: list[tuple[dict[str, Any], dict[str, Any]]] = []
+                    current_ticket_refs = set((state.get("design_publication") or {}).get("ticket_refs", []))
                     for ticket in state.get("tickets", []):
+                        if current_ticket_refs and ticket.get("id") not in current_ticket_refs:
+                            continue
                         candidate = current_candidate_record(state, ticket)
                         if candidate is not None:
                             candidates_ready.append((ticket, candidate))
@@ -1109,6 +1185,51 @@ def repository_identity(path: str | Path) -> dict[str, str]:
         regular_directory(common, "Git common directory")
         return {"key": f"git-common-dir:{common}", "common_dir": str(common), "kind": "git"}
     return {"key": f"directory:{root}", "common_dir": "", "kind": "directory"}
+
+
+def verified_repository_binding(
+    path: str | Path, *, require_git: bool = False, require_clean: bool = False,
+) -> dict[str, Any]:
+    """Resolve the exact checkout root and committed baseline without mutating Git."""
+    root = safe_root(path, "execution root")
+    regular_directory(root, "execution root")
+    identity = repository_identity(root)
+    if identity["kind"] != "git":
+        if require_git:
+            fail("bootstrap repository binding requires a Git checkout")
+        return {
+            "execution_root": str(root), "checkout": str(root),
+            "common_dir": identity["common_dir"], "initial_head": None,
+            "branch": "", "clean": None, "status_hash": None,
+        }
+
+    def checked_git(*command: str, allow_detached: bool = False) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(root), *command], capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            if allow_detached and result.returncode == 1 and not result.stdout.strip():
+                return ""
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown Git error"
+            fail(f"cannot verify bootstrap repository binding: {detail}")
+        return result.stdout.strip()
+
+    top_level = safe_root(checked_git("rev-parse", "--show-toplevel"), "Git checkout root")
+    if top_level != root:
+        fail("execution root must be the exact Git checkout root, not a nested path")
+    initial_head = checked_git("rev-parse", "--verify", "HEAD^{commit}")
+    if not GIT_SHA_RE.fullmatch(initial_head):
+        fail("Git HEAD is not a supported commit SHA")
+    branch = checked_git("symbolic-ref", "--quiet", "--short", "HEAD", allow_detached=True)
+    status = checked_git("status", "--porcelain=v1", "--untracked-files=all")
+    if require_clean and status:
+        fail("bootstrap repository binding requires a clean tracked/untracked checkout")
+    return {
+        "execution_root": str(root), "checkout": str(root),
+        "common_dir": identity["common_dir"], "initial_head": initial_head,
+        "branch": branch, "clean": not bool(status),
+        "status_hash": sha256_bytes((status + ("\n" if status else "")).encode("utf-8")),
+    }
 
 
 def repository_owner_paths(execution_root: str | Path, identity: dict[str, str] | None = None) -> dict[str, Path | str]:
@@ -1543,7 +1664,14 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
                 and item.get("candidate_sha") == base_sha
                 for item in state.get("attempts", [])
             )
+            ticket_record = next(item for item in state.get("tickets", []) if item.get("id") == ticket_ref)
+            replacement_base_match = False
             if not (initial_head_match or candidate_match or legacy_candidate_match):
+                replacement_base_match = bool(
+                    ticket_record.get("replacement_refs")
+                    and replacement_checkpoint_for_ticket(state, ticket_record) == base_sha
+                )
+            if not (initial_head_match or candidate_match or legacy_candidate_match or replacement_base_match):
                 fail(f"attempt execution binding base is not a recorded initial head or candidate: {attempt['id']}")
             contract_ids = {item.get("id") for item in state.get("contracts", [])}
             contract_refs = [item.get("ref") for item in execution_binding.get("contract_bindings", [])]
@@ -1818,6 +1946,20 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
             operation.get("finalized_revision"),
         )
         if operation.get("state") == "finalized":
+            if operation.get("kind") == "worktree_create":
+                if (
+                    not operation.get("receipt_ref")
+                    or not operation.get("resolution_ref")
+                    or operation.get("finalized_revision") is None
+                    or operation.get("proof_ref") is not None
+                    or operation.get("candidate_ref") is not None
+                ):
+                    fail(f"finalized worktree operation lacks receipt/recovery linkage: {operation['id']}")
+                if not re.fullmatch(r"objects/[0-9a-f]{64}", operation.get("receipt_ref", "")):
+                    fail(f"finalized worktree operation receipt is not immutable: {operation['id']}")
+                if operation.get("finalized_revision") > state.get("revision", -1):
+                    fail(f"finalized worktree operation revision is ahead of the ledger: {operation['id']}")
+                continue
             if not operation.get("receipt_ref") or any(value is None for value in linkage):
                 fail(f"finalized operation lacks receipt/candidate/proof linkage: {operation['id']}")
             if not re.fullmatch(r"objects/[0-9a-f]{64}", operation.get("receipt_ref", "")):
@@ -1991,6 +2133,42 @@ def validate_ledger(state: dict[str, Any], *, verify_files: bool = True) -> None
         migration_ids = [item["id"] for item in provenance.get("applied_migrations", [])]
         if len(migration_ids) != len(set(migration_ids)):
             fail("runtime provenance contains duplicate migration IDs")
+    historical_decisions = [
+        item for item in state.get("decisions", [])
+        if item.get("type") == "historical_review_obligation_reconciliation"
+    ]
+    if historical_decisions:
+        historical_review_reconciliation_refs(state)
+    for decision in historical_decisions:
+        report_ref = decision["evidence_refs"][0]
+        migration = next(
+            (item for item in (provenance or {}).get("applied_migrations", []) if item.get("id") == decision["id"]),
+            None,
+        )
+        if (
+            migration is None or migration.get("object_ref") != report_ref
+            or migration.get("manifest_hash") != report_ref.split("/", 1)[1]
+            or migration.get("applied_revision") != int(decision.get("introduced_revision", "-1"))
+        ):
+            fail("historical review reconciliation lacks exact durable provenance")
+        if verify_files:
+            report = stored_payload(
+                paths(state["repository"]["control_root"], state["run_id"]), report_ref,
+                "historical review reconciliation report",
+            )
+            if (
+                report.get("kind") != "historical_review_obligation_reconciliation"
+                or report.get("decision_id") != decision["id"]
+                or report.get("affected_refs") != decision["affected_refs"]
+                or report.get("evidence_refs") != decision["evidence_refs"][1:]
+                or report.get("candidate_id") != decision.get("candidate_ref")
+                or report.get("qualification_ref") not in {
+                    item.get("id") for item in state.get("review_qualifications", [])
+                }
+                or report.get("final_g5_state") != "PENDING_NOT_CREDITED"
+                or sha256_bytes(canonical_bytes(report)) != report_ref.split("/", 1)[1]
+            ):
+                fail("historical review reconciliation report differs from its immutable decision")
     successor = state.get("successor_manifest")
     if successor:
         manifest = successor["manifest"]
@@ -3146,6 +3324,59 @@ def packet_write_zone(packet: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"path": path, "operations": sorted(operations)} for path, operations in sorted(merged.items())]
 
 
+def replacement_checkpoint_for_ticket(state: dict[str, Any], ticket: dict[str, Any]) -> str | None:
+    """Return one exact contract-bound predecessor checkpoint for a replacement ticket."""
+    replacement_refs = ticket.get("replacement_refs", [])
+    if not replacement_refs:
+        return None
+    tickets = {item.get("id"): item for item in state.get("tickets", [])}
+    attempts = {item.get("id"): item for item in state.get("attempts", [])}
+    inherited: list[dict[str, Any]] = []
+    for ref in replacement_refs:
+        replaced = tickets.get(ref)
+        if replaced is None:
+            continue
+        prior = current_candidate_record(state, replaced)
+        producer = attempts.get((prior or {}).get("producer_attempt_ref"))
+        if (
+            prior is not None
+            and prior.get("quality") == "DONE"
+            and prior.get("sha")
+            and prior.get("tree_sha")
+            and prior.get("superseded_by") in (None, ticket.get("current_candidate"))
+            and producer is not None
+            and producer.get("state") == "RETURNED"
+            and producer.get("candidate_sha") == prior.get("sha")
+            and producer.get("candidate_tree_sha") == prior.get("tree_sha")
+            and producer.get("candidate_proof_ref")
+            and producer.get("lease", {}).get("state") == "released"
+            and producer.get("runtime", {}).get("liveness") == "stopped"
+        ):
+            inherited.append(prior)
+    inherited_by_sha = {item["sha"]: item for item in inherited}
+    if len(inherited_by_sha) != 1:
+        fail("replacement ticket execution base is missing or ambiguous")
+    checkpoint_sha = next(iter(inherited_by_sha))
+    contracts = {item.get("id"): item for item in state.get("contracts", [])}
+    checkpoint_ref = f"checkpoint:{checkpoint_sha}"
+    if not any(
+        checkpoint_ref in contracts.get(ref, {}).get("implementation_availability_evidence_refs", [])
+        and contracts.get(ref, {}).get("implementation_availability") == "available"
+        for ref in ticket.get("contract_refs", [])
+    ):
+        fail("replacement ticket execution base lacks an exact available checkpoint contract")
+    return checkpoint_sha
+
+
+def execution_base_for_ticket(state: dict[str, Any], ticket: dict[str, Any]) -> str | None:
+    """Return the exact current or amendment-replacement execution checkpoint."""
+    candidate = current_candidate_record(state, ticket)
+    if candidate is not None:
+        return candidate.get("sha")
+    checkpoint = replacement_checkpoint_for_ticket(state, ticket)
+    return checkpoint or state.get("repository", {}).get("initial_head")
+
+
 def validate_execution_binding(
     p: dict[str, Path], state: dict[str, Any], ticket: dict[str, Any], packet: dict[str, Any], *,
     kind: str, attempt_id: str, packet_hash: str, route_id: str,
@@ -3246,8 +3477,7 @@ def validate_execution_binding(
             "evidence_refs": sorted(contract.get("implementation_availability_evidence_refs", [])),
         })
 
-    candidate = current_candidate_record(state, ticket)
-    expected_base = candidate.get("sha") if candidate is not None else state.get("repository", {}).get("initial_head")
+    expected_base = execution_base_for_ticket(state, ticket)
     packet_base = packet.get("workspace", {}).get("expected_base")
     if not expected_base or packet_base != expected_base:
         fail("worker packet base SHA does not match the exact current ticket candidate/base")
@@ -4038,7 +4268,22 @@ def build_verified_candidate_proof(
         fail("candidate checkout must be clean after its exact candidate commit")
 
     baseline = git_tree_baseline(checkout, base_sha)
-    audit = audit_write_set(checkout, baseline, worker_return.get("files", []), attempt.get("lease", {}).get("zone", []))
+    expected_control_files: dict[str, str] = {}
+    return_target = packet.get("return_target", {}).get("path")
+    if isinstance(return_target, str) and return_target:
+        try:
+            return_rel = relative_path(return_target, "candidate return target")
+        except LedgerError:
+            return_rel = None
+        if return_rel is not None:
+            expected_control_files[return_rel] = returned_ref.split("/", 1)[1]
+    audit = audit_write_set(
+        checkout,
+        baseline,
+        worker_return.get("files", []),
+        attempt.get("lease", {}).get("zone", []),
+        expected_ignored_control_files=expected_control_files,
+    )
     if not audit.get("pass") or not audit.get("changed_paths"):
         fail(f"candidate write-set audit must PASS with a non-empty exact delta: {json.dumps(audit, sort_keys=True)}")
     if set(audit.get("changed_paths", [])) != {item.get("path") for item in worker_return.get("files", [])}:
@@ -4109,8 +4354,70 @@ def verify_verified_candidate_proof(p: dict[str, Path], proof_ref: str) -> dict[
     return proof
 
 
+def historical_review_reconciliation_refs(state: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """Project only the exact, current candidate-bound legacy review deferral."""
+    review_refs: set[str] = set()
+    finding_refs: set[str] = set()
+    for decision in state.get("decisions", []):
+        if decision.get("type") != "historical_review_obligation_reconciliation":
+            continue
+        if (
+            decision.get("status") != "accepted"
+            or decision.get("decision") != "DEFER_FINAL_G5_OBLIGATION"
+            or decision.get("invalidated_by")
+            or len(decision.get("supersedes", [])) != 1
+            or len(decision.get("affected_refs", [])) != 5
+            or len(decision.get("evidence_refs", [])) != 4
+        ):
+            fail("historical review reconciliation has an invalid durable decision")
+        ticket_ref, deferred_ref, mirror_ref, verdict_issue_ref, interrupted_issue_ref = decision["affected_refs"]
+        old_review_ref = decision["supersedes"][0]
+        report_ref, routine_ref, critical_ref, interrupted_ref = decision["evidence_refs"]
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == ticket_ref), None)
+        candidate = next((item for item in state.get("candidates", []) if item.get("id") == decision.get("candidate_ref")), None)
+        old_review = next((item for item in state.get("reviews", []) if item.get("id") == old_review_ref), None)
+        routine = next((item for item in state.get("reviews", []) if item.get("id") == routine_ref), None)
+        critical = next((item for item in state.get("reviews", []) if item.get("id") == critical_ref), None)
+        deferred = next((item for item in state.get("findings", []) if item.get("id") == deferred_ref), None)
+        interrupted = next((item for item in state.get("attempts", []) if item.get("id") == interrupted_ref), None)
+        issues = {item.get("id"): item for item in state.get("issues", [])}
+        if (
+            not isinstance(report_ref, str) or not re.fullmatch(r"objects/[0-9a-f]{64}", report_ref)
+            or any(item is None for item in (ticket, candidate, old_review, routine, critical, deferred, interrupted))
+            or candidate.get("ticket_ref") != ticket_ref
+            or old_review.get("attempt_ref") != deferred.get("source_ref")
+            or deferred_ref not in old_review.get("finding_refs", [])
+            or old_review.get("accepted") is not True or old_review.get("verdict") != "UNVERIFIABLE"
+            or old_review.get("purpose") != "ticket_review"
+            or routine.get("accepted") is not True or routine.get("verdict") != "PASS"
+            or routine.get("purpose") != "ticket_review"
+            or critical.get("accepted") is not True or critical.get("verdict") != "PASS"
+            or critical.get("purpose") != "critical_axis"
+            or any(item.get("subject_fingerprint") != candidate.get("sha") for item in (old_review, routine, critical))
+            or interrupted.get("state") != "INTERRUPTED"
+            or interrupted.get("review_purpose") != "critical_axis"
+            or interrupted.get("candidate_sha") != candidate.get("sha")
+            or interrupted.get("lease", {}).get("state") != "released"
+            or issues.get(mirror_ref, {}).get("finding_ref") != deferred_ref
+            or issues.get(verdict_issue_ref, {}).get("source_ref") != old_review_ref
+            or issues.get(interrupted_issue_ref, {}).get("source_ref") != interrupted_ref
+            or any(decision["id"] not in issues[ref].get("invalidated_by", []) for ref in (mirror_ref, verdict_issue_ref, interrupted_issue_ref))
+        ):
+            fail("historical review reconciliation lost its exact review, finding, or interruption binding")
+        if (
+            ticket.get("current_candidate") == candidate.get("id")
+            and decision.get("intent_revision") == state.get("intent", {}).get("current_revision")
+        ):
+            if old_review_ref in review_refs or deferred_ref in finding_refs:
+                fail("overlapping historical review reconciliations are ambiguous")
+            review_refs.add(old_review_ref)
+            finding_refs.add(deferred_ref)
+    return review_refs, finding_refs
+
+
 def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
     """Pure current/history/resolution projection over immutable findings and their issue mirrors."""
+    _, deferred_historical_findings = historical_review_reconciliation_refs(state)
     tickets = {item.get("id"): item for item in state.get("tickets", [])}
     attempts = {item.get("id"): item for item in state.get("attempts", [])}
     candidates = {item.get("id"): item for item in state.get("candidates", [])}
@@ -4121,6 +4428,12 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
     design = state.get("design_publication") or {}
     design_history = state.get("design_publication_history", [])
     publications = {item.get("id"): item for item in [*design_history, design] if item.get("id")}
+    invalidated_consumer_refs = {
+        ref
+        for invalidation in state.get("invalidations", [])
+        for ref in invalidation.get("consumer_refs", [])
+        if isinstance(ref, str)
+    }
     effective_reconciliations: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for event in state.get("finding_binding_reconciliations", []):
         ticket = tickets.get(event.get("ticket_ref"))
@@ -4204,6 +4517,7 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
 
     for finding in state.get("findings", []):
         finding_id = finding.get("id")
+        invalidated_as_consumer = finding_id in invalidated_consumer_refs
         source_id = finding.get("source_ref")
         source = attempts.get(source_id) or reviews.get(source_id)
         issue_refs = sorted(item["id"] for item in issues if item.get("finding_ref") == finding_id)
@@ -4286,6 +4600,8 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
         all_affected_tickets_resolved = bool(affected_tickets) and not unresolved_ticket_refs
         if all_affected_tickets_resolved:
             status = "resolved"
+        elif invalidated_as_consumer or finding_id in deferred_historical_findings:
+            status = "superseded"
         elif binding_kind == "superseded":
             status = "superseded"
         elif binding_kind == "current":
@@ -4296,7 +4612,11 @@ def finding_obligation_projection(state: dict[str, Any]) -> dict[str, Any]:
             status = "unbound"
 
         is_blocking = finding.get("impact") == "blocking"
-        obligation_status = "closed" if all_affected_tickets_resolved or not is_blocking else ("binding_required" if status == "unbound" else "open")
+        obligation_status = (
+            "closed"
+            if all_affected_tickets_resolved or invalidated_as_consumer or finding_id in deferred_historical_findings or not is_blocking
+            else ("binding_required" if status == "unbound" else "open")
+        )
         projection_classification = (
             "current" if status == "current" else
             "carry_forward" if status in ("historical", "superseded") and obligation_status == "open" else
@@ -5309,6 +5629,7 @@ def append_review_qualification(
     """Append an immutable aggregate over all accepted reviews for one exact subject."""
     ticket = next((item for item in state.get("tickets", []) if item.get("id") == subject_ref), None)
     required = required_review_purposes(ticket, purpose)
+    reconciled_reviews, _ = historical_review_reconciliation_refs(state)
     accepted = [
         item for item in state.get("reviews", [])
         if item.get("accepted") is True
@@ -5317,6 +5638,7 @@ def append_review_qualification(
         and item.get("return_ref")
         and item.get("integrity_ref")
         and not item.get("invalidated_by")
+        and item.get("id") not in reconciled_reviews
     ]
     accepted.sort(key=lambda item: item.get("id", ""))
     satisfied = sorted({item["purpose"] for item in accepted if item.get("verdict") == "PASS"})
@@ -5369,7 +5691,15 @@ def validate_return_against_attempt(p: dict[str, Path], state: dict[str, Any], a
     definition = {"worker": "worker_return", "review": "review_return", "acceptance": "acceptance_return"}.get(kind)
     if definition is None:
         fail(f"unsupported return kind: {kind}")
-    if attempt.get("kind") != kind:
+    manual_final_g5 = (
+        kind == "acceptance"
+        and attempt.get("kind") == "review"
+        and attempt.get("mode") == "user_assisted"
+        and attempt.get("review_purpose") == "final_g5"
+        and (attempt.get("handoff") or {}).get("purpose") == "final_g5"
+        and (attempt.get("handoff") or {}).get("packet_kind") == "acceptance"
+    )
+    if attempt.get("kind") != kind and not manual_final_g5:
         fail("supplied return kind does not match the registered attempt kind")
     root = schema()
     validate(payload, root["$defs"][definition], root, "$.return")
@@ -5384,6 +5714,8 @@ def validate_return_against_attempt(p: dict[str, Path], state: dict[str, Any], a
     if identity.get("epoch") != attempt.get("epoch") or attempt.get("epoch") != state["owner"]["epoch"]:
         fail("return epoch mismatch; stale payload has no current authority")
     packet = stored_payload(p, attempt.get("packet_ref"), f"{kind} packet")
+    if manual_final_g5 and (packet.get("kind") != "acceptance" or packet.get("purpose") != "final_g5"):
+        fail("manual final G5 packet is not acceptance-bound")
     packet_id = packet_identity(packet)
     if kind == "worker":
         ticket = next((item for item in state.get("tickets", []) if item.get("id") == attempt.get("subject_ref")), None)
@@ -5397,6 +5729,12 @@ def validate_return_against_attempt(p: dict[str, Path], state: dict[str, Any], a
         validate_worker_return_semantics(payload, packet)
     elif kind == "review":
         validate_review_return_semantics(payload, packet)
+    elif kind == "acceptance":
+        validate_acceptance_return_semantics(
+            payload, [review_criterion_id(item) for item in packet.get("criteria", [])],
+        )
+        if payload.get("candidate_fingerprint") != attempt.get("candidate_sha"):
+            fail("acceptance return candidate fingerprint does not match the registered attempt")
 
     packet_source = attempt.get("packet_source_revision", packet_id.get("source_revision"))
     packet_registration = attempt.get("packet_registration_revision", packet_id.get("registration_revision", packet_id.get("source_revision")))
@@ -5575,14 +5913,23 @@ def append_review_findings(state: dict[str, Any], payload: dict[str, Any], sourc
 
 
 def base_state(control_root: Path, run_id: str, repo_root: Path, token: str) -> dict[str, Any]:
-    repo_identity = repository_identity(repo_root)
+    repo_binding = verified_repository_binding(repo_root)
     state = {
         "schema_version": SCHEMA_VERSION, "run_id": run_id, "revision": 0, "previous_publication_hash": None,
         "updated_at": now(), "skill_version": SKILL_VERSION, "policy_version": POLICY_VERSION,
         "candidate_model_version": "1.1", "candidates": [],
         "review_model_version": "1.1", "review_qualifications": [], "repair_waves": [], "acceptance": [],
         "runtime_provenance": {"creation_skill_version": SKILL_VERSION, "current_schema_version": SCHEMA_VERSION, "last_mutating_skill_version": SKILL_VERSION, "compatibility_floor": COMPATIBILITY_FLOOR, "state_contract_version": STATE_CONTRACT_VERSION, "minimum_writer_version": WRITER_VERSION, "applied_migrations": []},
-        "repository": {"control_root": str(control_root), "execution_root": str(repo_root), "common_dir": repo_identity["common_dir"], "initial_head": None, "branch": "", "checkout": str(repo_root), "inventory_ref": None, "instruction_refs": []},
+        "repository": {
+            "control_root": str(control_root),
+            "execution_root": repo_binding["execution_root"],
+            "common_dir": repo_binding["common_dir"],
+            "initial_head": repo_binding["initial_head"],
+            "branch": repo_binding["branch"],
+            "checkout": repo_binding["checkout"],
+            "inventory_ref": None,
+            "instruction_refs": [],
+        },
         "owner": {"token": token, "epoch": 0, "observed_session": None, "handoff_ref": None, "attestation_ref": None},
         "run_settings": dict(DEFAULT_RUN_SETTINGS),
         "usage": default_usage(),
@@ -7932,6 +8279,334 @@ def cmd_prepare_review(args: argparse.Namespace) -> dict[str, Any]:
     return {"prepared": True, "spawn_disposition": "register_only_use_spawn_request_id_once", "spawn_request_id": registered["runtime"]["spawn_request_id"], "attempt_id": args.review_attempt_id, "packet_hash": packet_hash, "purpose": purpose, "revision": result["revision"]}
 
 
+def cmd_register_final_g5(args: argparse.Namespace) -> dict[str, Any]:
+    """Register only a fresh final-G5 reviewer on the exact integrated candidate."""
+    p = paths(args.control_root, args.run_id)
+    packet_path = Path(args.packet).expanduser().resolve()
+    packet = read_json(packet_path, "final G5 packet")
+    root = schema()
+    validate(packet, root["$defs"]["acceptance_packet"], root, "$.packet")
+    if packet.get("purpose") != "final_g5":
+        fail("final G5 registration requires an explicit final_g5 acceptance packet")
+    identity = packet_identity(packet)
+    if identity.get("run_id") != args.run_id or identity.get("attempt_id") != args.attempt_id or identity.get("ticket_id") not in (None, args.ticket_id):
+        fail("final G5 packet identity does not match the exact run/ticket/attempt")
+    packet_raw = packet_path.read_bytes()
+    packet_hash = sha256_bytes(packet_raw)
+    observed, _ = load_mutation_state(p, args.owner_token)
+    if observed.get("owner", {}).get("token") != args.owner_token or observed.get("owner", {}).get("epoch") != args.owner_epoch:
+        fail("final G5 registration owner/epoch fence mismatch")
+    prior = next((item for item in observed.get("attempts", []) if item.get("id") == args.attempt_id), None)
+    if prior is not None:
+        if (
+            prior.get("kind") == "review" and prior.get("review_purpose") == "final_g5"
+            and prior.get("subject_ref") == args.ticket_id and prior.get("packet_hash") == packet_hash
+            and prior.get("epoch") == args.owner_epoch and prior.get("lease", {}).get("id") == args.lease_id
+            and prior.get("candidate_sha") == packet.get("subject_fingerprint")
+        ):
+            return {"registered": True, "idempotent": True, "attempt_id": args.attempt_id, "revision": observed["revision"]}
+        fail("final G5 attempt ID already exists with conflicting registration")
+
+    def change(state: dict[str, Any]) -> None:
+        admit_event(state, "review.dispatch")
+        if state.get("run_id") != args.run_id or state["owner"].get("epoch") != args.owner_epoch:
+            fail("final G5 registration lost its run/owner epoch fence")
+        if state["lifecycle"].get("phase") != "VERIFY" or state["lifecycle"].get("control") != "ACTIVE":
+            fail("final G5 registration requires active VERIFY after G4")
+        if state.get("acceptance"):
+            fail("final G5 registration requires no existing acceptance")
+        if active_publication_leases(state) or any(effect_is_unresolved(op) for op in state.get("operations", [])):
+            fail("final G5 registration requires released leases and reconciled effects")
+        if any(item.get("impact") == "blocking" and not item.get("invalidated_by") for item in state.get("issues", [])):
+            fail("final G5 registration has a current blocking issue")
+        if any(item.get("status") != "closed" for item in finding_obligation_projection(state)["obligations"]):
+            fail("final G5 registration has an unresolved finding obligation")
+        publication = current_design_publication(state)
+        current_tickets = [item for item in state.get("tickets", []) if item.get("id") in publication.get("ticket_refs", [])]
+        if not current_tickets or any(item.get("state") != "INTEGRATED" for item in current_tickets):
+            fail("final G5 registration requires every current publication ticket integrated")
+        ticket = next((item for item in current_tickets if item.get("id") == args.ticket_id), None)
+        if ticket is None or ticket.get("current_candidate") != args.candidate_id:
+            fail("final G5 registration ticket/candidate mismatch")
+        candidate = current_candidate_record(state, ticket)
+        worker = current_candidate_producer(state, ticket)
+        if (
+            candidate is None or worker is None or candidate.get("quality") != "DONE"
+            or candidate.get("integration_status") != "INTEGRATED" or not candidate.get("proof_ref")
+            or worker.get("state") != "RETURNED" or candidate.get("sha") != worker.get("candidate_sha")
+            or candidate.get("tree_sha") != worker.get("candidate_tree_sha")
+        ):
+            fail("final G5 registration requires the exact integrated proof-carrying candidate")
+        checkout = safe_root(state.get("repository", {}).get("execution_root", ""), "final G5 checkout")
+        if checkout != safe_root(state.get("repository", {}).get("checkout", ""), "registered checkout"):
+            fail("final G5 checkout does not match the registered execution root")
+        binding = verified_repository_binding(checkout, require_git=True, require_clean=True)
+        if binding.get("initial_head") != candidate["sha"] or git_output(checkout, "rev-parse", "HEAD^{tree}").decode().strip() != candidate["tree_sha"]:
+            fail("final G5 candidate checkout has drifted")
+        intent = current_intent_binding(state)
+        if (
+            identity.get("epoch") != args.owner_epoch or identity.get("source_revision") != state["revision"]
+            or identity.get("intent_revision") != intent["revision"]
+            or identity.get("intent_document_ref") != intent["document_ref"]
+            or identity.get("intent_document_hash") != intent["document_hash"]
+            or packet.get("subject_fingerprint") != candidate["sha"]
+            or packet.get("subject", {}).get("candidate_sha") != candidate["sha"]
+            or packet.get("subject", {}).get("candidate_tree_sha") != candidate["tree_sha"]
+        ):
+            fail("final G5 packet is stale or does not identify the exact candidate/intent")
+        active_criteria = {item["id"] for item in state.get("criteria", []) if item.get("status") == "active"}
+        packet_criteria = [item["id"] for item in packet["criteria"]]
+        if len(packet_criteria) != len(set(packet_criteria)) or set(packet_criteria) != active_criteria:
+            fail("final G5 packet criteria must exactly match current active criteria")
+        if any(item.get("id") == args.attempt_id or item.get("lease", {}).get("id") == args.lease_id for item in state.get("attempts", [])):
+            fail("final G5 attempt or lease ID already exists")
+        for prior_g5 in state.get("attempts", []):
+            if prior_g5.get("review_purpose") != "final_g5" or prior_g5.get("candidate_sha") != candidate["sha"] or prior_g5.get("epoch") != args.owner_epoch:
+                continue
+            reconciliations = [
+                item for item in state.get("decisions", [])
+                if item.get("type") == "unimportable_final_g5_reconciliation"
+                and item.get("decision") == "RETRY_SAME_CANDIDATE"
+                and item.get("candidate_ref") == candidate["id"]
+                and prior_g5.get("id") in item.get("affected_refs", [])
+            ]
+            if (
+                prior_g5.get("state") != "INTERRUPTED"
+                or prior_g5.get("lease", {}).get("state") != "released"
+                or not runtime_stop_proven(p, prior_g5) or len(reconciliations) != 1
+            ):
+                fail("a final G5 attempt already exists without exact stopped protocol-rejection reconciliation")
+        object_store(p, packet_raw)
+        attempt = {
+            "id": args.attempt_id, "kind": "review", "mode": "change", "review_purpose": "final_g5",
+            "subject_ref": ticket["id"], "packet_ref": f"objects/{packet_hash}", "packet_hash": packet_hash,
+            "epoch": args.owner_epoch, "state": "PREPARED", "lease": {"id": args.lease_id, "state": "active", "zone": []},
+            "route_ref": None, "checkout": None, "base_sha": candidate["sha"], "candidate_sha": candidate["sha"],
+            "candidate_tree_sha": candidate["tree_sha"], "return_ref": None, "finding_refs": [],
+            "subject_fingerprint": candidate["sha"], "packet_registration_revision": state["revision"],
+            "packet_source_revision": state["revision"], "subject_revision": state["revision"],
+            "attempt_created_revision": state["revision"] + 1, "return_source_revision": None,
+            "intent_revision": intent["revision"], "intent_document_ref": intent["document_ref"],
+            "intent_document_hash": intent["document_hash"],
+        }
+        initialize_attempt_runtime(args.run_id, attempt)
+        state.setdefault("attempts", []).append(attempt)
+        add_usage(state.setdefault("usage", default_usage()).setdefault("counters", zero_usage()), {"packet_bytes": packet_path.stat().st_size, "attempt_registrations": 1})
+        state["lifecycle"]["next_action"] = {"kind": "prepare_acceptance_handoff", "subject_refs": [args.attempt_id], "preconditions": ["transfer exact acceptance packet and clean candidate export", "fresh independent final G5 only"], "read_refs": ["phases/accept.md", "references/ledger.md"]}
+
+    result = transaction(p, args.owner_token, args.revision, change)
+    return {"registered": True, "idempotent": False, "attempt_id": args.attempt_id, "packet_hash": packet_hash, "revision": result["revision"]}
+
+
+def cmd_reconcile_unimportable_final_g5(args: argparse.Namespace) -> dict[str, Any]:
+    """Preserve one stopped schema-incompatible final G5 return and permit an evidence-only retry."""
+    p = paths(args.control_root, args.run_id)
+    reconciliation_id = safe_id(args.reconciliation_id, "reconciliation_id")
+    decision_id = f"unimportable-final-g5-{reconciliation_id}"
+    inputs: dict[str, tuple[dict[str, Any], bytes, str]] = {}
+    for label, argument in (
+        ("return", args.return_file), ("context", args.context_receipt),
+        ("environment", args.environment_receipt), ("stop_confirmation", args.stop_confirmation),
+    ):
+        path = Path(argument).expanduser().absolute()
+        regular_non_symlink(path)
+        raw = path.read_bytes()
+        if len(raw) > 4 * 1024 * 1024:
+            fail(f"{label} evidence exceeds the 4 MiB contract bound")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            fail(f"invalid {label} evidence: {exc}")
+        if not isinstance(payload, dict):
+            fail(f"{label} evidence must be an object")
+        inputs[label] = (payload, raw, sha256_bytes(raw))
+    rejected = inputs["return"][0]
+    if rejected.get("kind") != "final_g5_return" or rejected.get("verdict") != "REJECT" or rejected.get("accepted") is not False:
+        fail("reconciliation requires an explicit rejected final G5 artifact")
+    try:
+        validate(rejected, schema()["$defs"]["acceptance_return"], schema(), "$.return")
+    except LedgerError:
+        pass
+    else:
+        fail("schema-valid acceptance returns must use the ordinary import path")
+    criteria = rejected.get("criteria")
+    if not isinstance(criteria, list) or not criteria:
+        fail("rejected G5 artifact lacks criterion-level evidence")
+    criterion_ids = [item.get("id") for item in criteria if isinstance(item, dict)]
+    statuses = [item.get("status") for item in criteria if isinstance(item, dict)]
+    if (
+        len(criterion_ids) != len(criteria) or any(not isinstance(item, str) for item in criterion_ids)
+        or len(set(criterion_ids)) != len(criteria)
+        or not set(statuses).issubset({"pass", "unverifiable"}) or "unverifiable" not in statuses
+        or rejected.get("findings") not in (None, [])
+    ):
+        fail("rejected G5 artifact is not a complete oracle-only UNVERIFIABLE result")
+    observed, _ = load_state(p)
+    if observed.get("run_id") != args.run_id or observed.get("owner", {}).get("token") != args.owner_token or observed.get("owner", {}).get("epoch") != args.owner_epoch:
+        fail("rejected G5 reconciliation run/owner/epoch fence mismatch")
+    input_hashes = {label: item[2] for label, item in inputs.items()}
+    prior = next((item for item in observed.get("decisions", []) if item.get("id") == decision_id), None)
+    if prior is not None:
+        if (
+            prior.get("type") != "unimportable_final_g5_reconciliation"
+            or prior.get("candidate_ref") != args.candidate_id
+            or prior.get("affected_refs") != [args.ticket_id, args.attempt_id, args.lease_id]
+            or len(prior.get("evidence_refs", [])) != 6
+        ):
+            fail("rejected G5 reconciliation ID conflicts with published decision")
+        report_ref = prior["evidence_refs"][0]
+        report = stored_payload(p, report_ref, "rejected G5 reconciliation report")
+        attempt = attempt_by_id(observed, args.attempt_id)
+        if (
+            report.get("reconciliation_id") != reconciliation_id
+            or report.get("run_id") != args.run_id or report.get("owner_epoch") != args.owner_epoch
+            or report.get("input_hashes") != input_hashes
+            or report.get("candidate_id") != args.candidate_id
+            or report.get("attempt_id") != args.attempt_id
+            or report.get("authority_ref") != args.authority_ref
+            or prior.get("evidence_refs", [])[1:5] != [f"objects/{input_hashes[label]}" for label in ("return", "context", "environment", "stop_confirmation")]
+            or prior.get("evidence_refs", [])[5] != report.get("runtime_stop_ref")
+            or attempt.get("state") != "INTERRUPTED"
+            or attempt.get("lease", {}).get("state") != "released"
+            or not runtime_stop_proven(p, attempt)
+        ):
+            fail("rejected G5 reconciliation report conflicts with exact replay")
+        return {"reconciled": True, "idempotent": True, "report_ref": report_ref, "revision": observed["revision"]}
+
+    def change(state: dict[str, Any]) -> None:
+        admit_event(state, "attempt.reconcile")
+        if state.get("run_id") != args.run_id or state["owner"].get("epoch") != args.owner_epoch:
+            fail("rejected G5 reconciliation lost its run/owner epoch fence")
+        if state["lifecycle"].get("phase") != "VERIFY" or state["lifecycle"].get("control") != "BLOCKED" or state["lifecycle"].get("reason") != "manual_review_pending":
+            fail("rejected G5 reconciliation requires the pending manual VERIFY gate")
+        if state.get("acceptance"):
+            fail("rejected G5 reconciliation cannot replace accepted G5 history")
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == args.ticket_id), None)
+        candidate = next((item for item in state.get("candidates", []) if item.get("id") == args.candidate_id), None)
+        attempt = attempt_by_id(state, args.attempt_id)
+        if (
+            ticket is None or candidate is None or ticket.get("state") != "INTEGRATED"
+            or ticket.get("current_candidate") != args.candidate_id
+            or candidate.get("ticket_ref") != args.ticket_id or candidate.get("quality") != "DONE"
+            or candidate.get("integration_status") != "INTEGRATED" or not candidate.get("proof_ref")
+            or attempt.get("subject_ref") != args.ticket_id or attempt.get("state") != "PREPARED"
+            or attempt.get("kind") != "review" or attempt.get("mode") != "user_assisted"
+            or attempt.get("review_purpose") != "final_g5" or attempt.get("return_ref")
+            or attempt.get("epoch") != args.owner_epoch
+            or attempt.get("lease", {}).get("id") != args.lease_id
+            or attempt.get("lease", {}).get("state") != "active"
+            or attempt.get("candidate_sha") != candidate["sha"]
+            or attempt.get("candidate_tree_sha") != candidate["tree_sha"]
+        ):
+            fail("rejected G5 reconciliation does not own the exact current attempt/lease/candidate")
+        require_runtime_stopped(p, attempt, "rejected G5 lease release")
+        handoff = attempt.get("handoff") or {}
+        if handoff.get("purpose") != "final_g5" or handoff.get("packet_kind") != "acceptance" or handoff.get("candidate_fingerprint") != candidate["sha"]:
+            fail("rejected G5 attempt lacks the exact final acceptance handoff")
+        binding = current_intent_binding(state)
+        if attempt.get("intent_revision") != binding["revision"] or handoff.get("intent_revision") != binding["revision"]:
+            fail("rejected G5 intent binding is stale")
+        identity = rejected.get("identity") or {}
+        if (
+            identity.get("run_id") != args.run_id or identity.get("ticket_id") != args.ticket_id
+            or identity.get("attempt_id") != args.attempt_id
+            or identity.get("intent_revision") != binding["revision"]
+            or identity.get("intent_document_hash") != binding["document_hash"]
+            or identity.get("candidate_sha_expected") != candidate["sha"]
+            or identity.get("candidate_tree_sha_expected") != candidate["tree_sha"]
+        ):
+            fail("rejected G5 artifact identity is not exact")
+        active_criteria = {item["id"] for item in state.get("criteria", []) if item.get("status") == "active"}
+        if set(criterion_ids) != active_criteria:
+            fail("rejected G5 artifact omits or adds active criteria")
+        context = inputs["context"][0]
+        environment = inputs["environment"][0]
+        stopped = inputs["stop_confirmation"][0]
+        if (
+            rejected.get("receipts", {}).get("packet_sha256") != attempt["packet_hash"]
+            or rejected.get("receipts", {}).get("projection_sha256") != handoff.get("projection_hash")
+            or rejected.get("receipts", {}).get("manifest_sha256") != handoff.get("manifest_ref", "").removeprefix("sha256:")
+            or context.get("packet", {}).get("sha256") != attempt["packet_hash"]
+            or context.get("projection", {}).get("sha256") != handoff.get("projection_hash")
+            or context.get("candidate_export", {}).get("manifest_sha256") != handoff.get("manifest_ref", "").removeprefix("sha256:")
+            or context.get("candidate_export", {}).get("candidate_sha") != candidate["sha"]
+            or context.get("candidate_export", {}).get("candidate_tree_sha") != candidate["tree_sha"]
+            or environment.get("precheck_status") != "recorded_before_review_checks"
+            or stopped.get("reviewer_state") != "STOPPED"
+            or stopped.get("attempt_id") != args.attempt_id
+            or stopped.get("candidate_sha") != candidate["sha"]
+            or stopped.get("scope_closed") is not True
+            or stopped.get("post_return_candidate_mutation") is not False
+            or stopped.get("post_return_control_or_protected_path_mutation") is not False
+        ):
+            fail("rejected G5 receipts do not bind the exact stopped handoff")
+        other_leases = [item["id"] for item in state.get("attempts", []) if item["id"] != attempt["id"] and item.get("lease", {}).get("state") in ("active", "quarantined")]
+        if other_leases or any(effect_is_unresolved(op) for op in state.get("operations", [])):
+            fail("rejected G5 reconciliation cannot bypass another lease or unresolved effect")
+        blockers = [item for item in state.get("issues", []) if item.get("impact") == "blocking" and not item.get("invalidated_by")]
+        obligations = [item for item in finding_obligation_projection(state)["obligations"] if item.get("status") != "closed"]
+        if blockers or obligations:
+            fail("rejected G5 reconciliation cannot bypass current blockers or findings")
+        checkout = safe_root(state.get("repository", {}).get("execution_root", ""), "rejected G5 checkout")
+        if checkout != safe_root(state.get("repository", {}).get("checkout", ""), "registered checkout"):
+            fail("rejected G5 checkout does not match registered execution root")
+        repository = verified_repository_binding(checkout, require_git=True, require_clean=True)
+        if repository.get("initial_head") != candidate["sha"] or git_output(checkout, "rev-parse", "HEAD^{tree}").decode().strip() != candidate["tree_sha"]:
+            fail("rejected G5 candidate checkout has drifted")
+        refs: dict[str, str] = {}
+        for label, (_, raw, digest) in inputs.items():
+            object_store(p, raw)
+            refs[label] = f"objects/{digest}"
+        stop_ref = attempt["runtime"].get("stop_ref")
+        report = {
+            "kind": "unimportable_final_g5_reconciliation", "reconciliation_id": reconciliation_id,
+            "run_id": args.run_id, "owner_epoch": args.owner_epoch, "authority_ref": args.authority_ref,
+            "ticket_id": args.ticket_id, "candidate_id": args.candidate_id,
+            "candidate_sha": candidate["sha"], "candidate_tree_sha": candidate["tree_sha"],
+            "attempt_id": args.attempt_id, "lease_id": args.lease_id,
+            "packet_hash": attempt["packet_hash"], "intent_revision": binding["revision"],
+            "input_hashes": input_hashes, "input_refs": refs, "runtime_stop_ref": stop_ref,
+            "outcome": "protocol_rejected_not_imported", "g5_credit": False,
+            "criteria_pass": statuses.count("pass"), "criteria_unverifiable": statuses.count("unverifiable"),
+        }
+        report_raw = canonical_bytes(report)
+        report_hash = sha256_bytes(report_raw)
+        object_store(p, report_raw)
+        report_ref = f"objects/{report_hash}"
+        attempt["state"] = "INTERRUPTED"
+        attempt["lease"]["state"] = "released"
+        attempt["termination_evidence_ref"] = stop_ref
+        attempt["failure_signature"] = "unimportable_final_g5_return"
+        state.setdefault("decisions", []).append({
+            "id": decision_id, "type": "unimportable_final_g5_reconciliation", "status": "applied",
+            "decision": "RETRY_SAME_CANDIDATE", "reason": "Stopped G5 returned oracle-only REJECT in a non-importable schema; preserve exact bytes without G5 credit or product repair",
+            "evidence_refs": [report_ref, refs["return"], refs["context"], refs["environment"], refs["stop_confirmation"], stop_ref],
+            "affected_refs": [args.ticket_id, args.attempt_id, args.lease_id],
+            "candidate_ref": candidate["id"], "intent_revision": binding["revision"],
+            "introduced_revision": str(state["revision"] + 1),
+        })
+        state.setdefault("evidence", []).append({
+            "id": f"ev-{report_hash[:16]}", "hash": report_hash,
+            "source": "unimportable_final_g5_reconciliation", "scenario": "manual_final_g5",
+            "outcome": "rejected_not_imported", "observer": "ledger-helper", "subject": args.attempt_id,
+        })
+        ensure_runtime_provenance(state)["applied_migrations"].append({
+            "id": decision_id, "helper_version": SKILL_VERSION,
+            "applied_revision": state["revision"] + 1, "manifest_hash": report_hash, "object_ref": report_ref,
+        })
+        state["lifecycle"]["control"] = "ACTIVE"
+        state["lifecycle"]["reason"] = "rejected_final_g5_protocol_reconciled"
+        state["lifecycle"]["next_action"] = {
+            "kind": "register_final_g5_retry", "subject_refs": [args.ticket_id, candidate["id"]],
+            "preconditions": ["fresh acceptance packet with only missing oracle evidence", "new independent manual session", "no G5 credit from rejected artifact"],
+            "read_refs": ["phases/accept.md", "references/ledger.md"],
+        }
+
+    result = transaction(p, args.owner_token, args.revision, change, "unimportable-final-g5-reconciled")
+    report_ref = next(item["evidence_refs"][0] for item in result["decisions"] if item["id"] == decision_id)
+    return {"reconciled": True, "idempotent": False, "report_ref": report_ref, "revision": result["revision"]}
+
+
 def cmd_prepare_design_review(args: argparse.Namespace) -> dict[str, Any]:
     p = paths(args.control_root, args.run_id)
     packet_path = Path(args.packet).expanduser().resolve()
@@ -8569,7 +9244,12 @@ def git_tree_baseline(root: Path, base_sha: str) -> dict[str, Any]:
 
 
 def audit_write_set(
-    root: Path, baseline: dict[str, Any], declared: list[Any], zones: list[dict[str, Any]]
+    root: Path,
+    baseline: dict[str, Any],
+    declared: list[Any],
+    zones: list[dict[str, Any]],
+    *,
+    expected_ignored_control_files: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Inspect the complete checkout and return a deterministic write-set receipt."""
 
@@ -8631,6 +9311,23 @@ def audit_write_set(
         if stat.S_ISDIR(info.st_mode):
             return {"path": rel, "type": "directory", "mode": mode}
         return {"path": rel, "type": "other", "mode": mode}
+
+    trusted_control_files: dict[str, dict[str, Any]] = {}
+    for raw_path, expected_sha256 in sorted((expected_ignored_control_files or {}).items()):
+        rel = relative_path(raw_path, "expected ignored control path")
+        current = fingerprint(rel)
+        if (
+            rel in ignored
+            and isinstance(expected_sha256, str)
+            and HASH_RE.fullmatch(expected_sha256)
+            and current is not None
+            and current.get("type") == "file"
+            and current.get("sha256") == expected_sha256
+            and not (current.get("mode", 0) & 0o111)
+        ):
+            ignored.remove(rel)
+            actual.discard(rel)
+            trusted_control_files[rel] = current
 
     fingerprints = {rel: fingerprint(rel) for rel in actual | set(baseline_map)}
     changed: set[str] = set()
@@ -8720,6 +9417,7 @@ def audit_write_set(
         "rename_endpoints": sorted(renamed),
         "foreign_changes": sorted(foreign_changes),
         "unsafe_paths": unsafe_paths,
+        "trusted_ignored_control_files": trusted_control_files,
         "fingerprints": fingerprints,
         "pass": not undeclared
         and not overdeclared
@@ -10121,11 +10819,12 @@ def cmd_prepare_handoff(args: argparse.Namespace) -> dict[str, Any]:
             continue
         if path.is_symlink():
             fail(f"export contains symlink: {rel}")
+        if path.is_dir():
+            continue
         if not path.is_file() or not stat.S_ISREG(path.stat().st_mode):
             fail(f"export contains unsupported file type: {rel}")
-        if path.is_file():
-            data = path.read_bytes()
-            manifest.append({"path": rel.as_posix(), "sha256": sha256_bytes(data), "bytes": len(data), "mode": stat.S_IMODE(path.stat().st_mode)})
+        data = path.read_bytes()
+        manifest.append({"path": rel.as_posix(), "sha256": sha256_bytes(data), "bytes": len(data), "mode": stat.S_IMODE(path.stat().st_mode)})
     manifest_bytes = canonical_bytes({"candidate_fingerprint": projection.get("candidate_fingerprint"), "files": manifest})
     checklist = "# Operator checklist\n\nTransfer only this bundle. Start a new clean reviewer session; do not fork/resume author context. Record the packet/export hashes and environment/context receipts before running checks. Return exact structured JSON.\n"
     bundle_writes = (
@@ -10343,6 +11042,8 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
     with Lock(p["lock"]):
         state, previous_raw = load_mutation_state(p, args.owner_token, args.revision)
         admit_event(state, "acceptance.import")
+        if purpose == "final_g5" and state["lifecycle"]["phase"] not in ("VERIFY", "ACCEPT"):
+            fail("final G5 import requires VERIFY/ACCEPT after the G4 integration gate")
         attempt = attempt_by_id(state, args.attempt_id)
         require_runtime_stopped(p, attempt, "manual acceptance/review import")
         if attempt.get("state") != "PREPARED" or attempt.get("return_ref"):
@@ -10466,7 +11167,24 @@ def cmd_import_manual(args: argparse.Namespace) -> dict[str, Any]:
         elif purpose == "final_g5":
             if qualification.get("result") != "PASS":
                 fail("final G5 PASS conflicts with another accepted result for this candidate; repair and use a fresh candidate")
-            if any(item.get("state") != "INTEGRATED" for item in next_state.get("tickets", []) if item.get("state") != "CANCELLED"):
+            publication = next_state.get("design_publication")
+            if isinstance(publication, dict):
+                if publication.get("status") != "PUBLISHED":
+                    fail("final G5 requires a current published design")
+                current_ticket_refs = set(publication.get("ticket_refs", []))
+            else:
+                current_ticket_refs = {
+                    item["id"] for item in next_state.get("tickets", [])
+                    if item.get("state") != "CANCELLED" and not item.get("invalidated_by")
+                }
+            current_tickets = [
+                item for item in next_state.get("tickets", [])
+                if item.get("id") in current_ticket_refs
+            ]
+            if (
+                not current_ticket_refs or len(current_tickets) != len(current_ticket_refs)
+                or any(item.get("state") != "INTEGRATED" or item.get("invalidated_by") for item in current_tickets)
+            ):
                 fail("final G5 requires every current ticket to be integrated")
             if any(effect_is_unresolved(item) for item in next_state.get("operations", [])):
                 fail("final G5 is blocked by an unresolved durable effect")
@@ -11414,6 +12132,7 @@ def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
         documents.append({"id": doc_id, "version": args.doc_version, "path": str(doc_path), "hash": digest, "kind": "intent", "section_anchors": []})
 
         collections = ("documents", "requirements_publications", "requirements", "criteria", "contracts", "decisions", "tickets", "attempts", "issues", "findings", "reviews", "acceptance", "operations", "capabilities", "routes", "evidence")
+        immutable_historical_collections = {"routes", "evidence"}
         consumer_refs: list[str] = []
         for collection in collections:
             for item in state.get(collection, []):
@@ -11421,7 +12140,15 @@ def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
                     continue
                 if item.get("id"):
                     consumer_refs.append(item["id"])
-                    if "invalidated_by" in item or collection in {"documents", "requirements_publications", "requirements", "criteria", "contracts", "decisions", "tickets", "attempts", "issues", "findings", "reviews", "acceptance", "operations", "capabilities", "routes", "evidence"}:
+                    # Routes can be hash-bound into historical attempt execution
+                    # bindings, and evidence is itself an immutable historical
+                    # observation.  Amendment currentness for both is carried by
+                    # the append-only invalidation consumer closure below; never
+                    # mutate the referenced record and thereby change its hash.
+                    if collection not in immutable_historical_collections and (
+                        "invalidated_by" in item
+                        or collection in {"documents", "requirements_publications", "requirements", "criteria", "contracts", "decisions", "tickets", "attempts", "issues", "findings", "reviews", "acceptance", "operations", "capabilities"}
+                    ):
                         item.setdefault("invalidated_by", []).append(args.amendment_id)
                     if collection == "requirements_publications":
                         item["status"] = "INVALIDATED"
@@ -11461,6 +12188,742 @@ def cmd_amend(args: argparse.Namespace) -> dict[str, Any]:
     except IdempotentResult as prior:
         return prior.result
     return {"amended": True, "document_hash": digest, "revision": result["revision"], "next_action": result["lifecycle"]["next_action"]}
+
+
+def cmd_bind_bootstrap(args: argparse.Namespace) -> dict[str, Any]:
+    """Append one exact pre-dispatch Git baseline/worktree binding recovery."""
+    p = paths(args.control_root, args.run_id)
+    binding_id = safe_id(args.binding_id, "bootstrap binding ID")
+    authority_ref = nonempty_string(args.authority_ref, "bootstrap binding authority")
+    if not GIT_SHA_RE.fullmatch(args.expected_head or ""):
+        fail("bootstrap binding expected HEAD must be a supported Git commit SHA")
+    target_root = safe_root(args.repo_root, "bootstrap execution root")
+    migration_id = f"bootstrap-binding-{binding_id}"
+
+    observed, _ = load_state(p)
+    if observed.get("owner", {}).get("token") != args.owner_token:
+        fail("owner token mismatch; stale orchestrator is fenced")
+    prior = next(
+        (
+            item for item in (observed.get("runtime_provenance") or {}).get("applied_migrations", [])
+            if item.get("id") == migration_id
+        ),
+        None,
+    )
+    if prior is not None:
+        report = stored_payload(p, prior.get("object_ref"), "bootstrap binding report")
+        expected = {
+            "kind": "bootstrap_repository_binding",
+            "binding_id": binding_id,
+            "run_id": args.run_id,
+            "authority_ref": authority_ref,
+            "execution_root": str(target_root),
+            "initial_head": args.expected_head,
+            "operation_ref": args.operation_id,
+        }
+        if any(report.get(key) != value for key, value in expected.items()):
+            fail("bootstrap binding ID already exists with conflicting recovery evidence")
+        repository = observed.get("repository", {})
+        if (
+            repository.get("execution_root") != str(target_root)
+            or repository.get("checkout") != str(target_root)
+            or repository.get("initial_head") != args.expected_head
+        ):
+            fail("bootstrap binding migration exists but the current repository projection conflicts")
+        return {
+            "bound": True, "idempotent": True, "binding_id": binding_id,
+            "report_hash": prior["manifest_hash"], "revision": observed["revision"],
+            "execution_root": str(target_root), "initial_head": args.expected_head,
+        }
+
+    def change(state: dict[str, Any]) -> None:
+        lifecycle = state.get("lifecycle", {})
+        if lifecycle.get("control") not in ("BLOCKED", "RECOVERING"):
+            fail("bootstrap binding recovery requires BLOCKED or RECOVERING control")
+        if any(item.get("kind") == "worker" for item in state.get("attempts", [])):
+            fail("bootstrap binding recovery is pre-dispatch only and rejects existing worker attempts")
+        if state.get("candidates"):
+            fail("bootstrap binding recovery is pre-candidate only")
+        if any(item.get("lease", {}).get("state") in ("active", "quarantined") for item in state.get("attempts", [])):
+            fail("bootstrap binding recovery requires released review reservations")
+
+        binding = verified_repository_binding(target_root, require_git=True, require_clean=True)
+        if binding["initial_head"] != args.expected_head:
+            fail("bootstrap binding target HEAD does not match the owner-verified expected baseline")
+        repository = state.get("repository", {})
+        if repository.get("common_dir") != binding["common_dir"]:
+            fail("bootstrap binding target is not a worktree of the owned Git repository")
+        if repository.get("initial_head") not in (None, args.expected_head):
+            fail("bootstrap binding cannot replace a different existing initial HEAD")
+
+        previous_root = safe_root(repository.get("execution_root", ""), "registered execution root")
+        selected_operation = None
+        if previous_root != target_root:
+            if not args.operation_id:
+                fail("changing execution root requires the exact applied worktree operation ID")
+            selected_operation = next(
+                (item for item in state.get("operations", []) if item.get("id") == args.operation_id),
+                None,
+            )
+            if (
+                selected_operation is None
+                or selected_operation.get("kind") != "worktree_create"
+                or selected_operation.get("state") != "applied"
+                or safe_root(selected_operation.get("target", ""), "worktree operation target") != target_root
+                or selected_operation.get("intended_after") != args.expected_head
+                or not selected_operation.get("receipt_ref")
+            ):
+                fail("bootstrap binding requires the exact applied worktree_create operation")
+            receipt = stored_payload(p, selected_operation["receipt_ref"], "worktree creation receipt")
+            if (
+                receipt.get("status") != "PASS"
+                or receipt.get("operation_id") != selected_operation.get("id")
+                or receipt.get("kind") != "worktree_create"
+                or safe_root(receipt.get("checkout", ""), "worktree receipt checkout") != target_root
+                or receipt.get("observed_head") != args.expected_head
+                or receipt.get("worktree_clean") is not True
+                or receipt.get("authority_ref") != selected_operation.get("authority_ref")
+            ):
+                fail("worktree creation receipt does not prove the exact clean bootstrap target")
+        elif args.operation_id:
+            fail("bootstrap binding operation ID is only valid when changing execution root")
+
+        unresolved = [
+            item for item in state.get("operations", [])
+            if effect_is_unresolved(item) and item is not selected_operation
+        ]
+        if unresolved:
+            fail("bootstrap binding recovery requires every unrelated durable effect to be resolved")
+
+        report = {
+            "kind": "bootstrap_repository_binding",
+            "binding_id": binding_id,
+            "run_id": state["run_id"],
+            "source_revision": state["revision"],
+            "applied_revision": state["revision"] + 1,
+            "owner_epoch": state["owner"]["epoch"],
+            "authority_ref": authority_ref,
+            "execution_root": binding["execution_root"],
+            "initial_head": binding["initial_head"],
+            "branch": binding["branch"],
+            "common_dir": binding["common_dir"],
+            "clean": binding["clean"],
+            "status_hash": binding["status_hash"],
+            "previous_execution_root": repository.get("execution_root"),
+            "previous_initial_head": repository.get("initial_head"),
+            "operation_ref": selected_operation.get("id") if selected_operation else None,
+            "operation_receipt_ref": selected_operation.get("receipt_ref") if selected_operation else None,
+        }
+        report_raw = canonical_bytes(report)
+        report_hash = sha256_bytes(report_raw)
+        object_store(p, report_raw)
+
+        repository.update({
+            "execution_root": binding["execution_root"],
+            "checkout": binding["checkout"],
+            "common_dir": binding["common_dir"],
+            "initial_head": binding["initial_head"],
+            "branch": binding["branch"],
+        })
+        if selected_operation is not None:
+            transition_effect(selected_operation, "finalized")
+            selected_operation["resolution_ref"] = f"objects/{report_hash}"
+            selected_operation["finalized_revision"] = state["revision"] + 1
+        provenance = ensure_runtime_provenance(state)
+        provenance["applied_migrations"].append({
+            "id": migration_id,
+            "helper_version": SKILL_VERSION,
+            "applied_revision": state["revision"] + 1,
+            "manifest_hash": report_hash,
+            "object_ref": f"objects/{report_hash}",
+        })
+        evidence_id = f"ev-{report_hash[:16]}"
+        if evidence_id in {item.get("id") for item in state.get("evidence", [])}:
+            fail("bootstrap binding evidence ID collision")
+        state.setdefault("evidence", []).append({
+            "id": evidence_id,
+            "hash": report_hash,
+            "source": "bootstrap_repository_binding",
+            "scenario": "pre_dispatch_recovery",
+            "outcome": "PASS",
+            "observer": "ledger-helper",
+            "subject": binding_id,
+        })
+
+    result = transaction(p, args.owner_token, args.revision, change, "bootstrap-binding")
+    migration = next(
+        item for item in result["runtime_provenance"]["applied_migrations"]
+        if item["id"] == migration_id
+    )
+    return {
+        "bound": True, "idempotent": False, "binding_id": binding_id,
+        "report_hash": migration["manifest_hash"], "revision": result["revision"],
+        "execution_root": result["repository"]["execution_root"],
+        "initial_head": result["repository"]["initial_head"],
+    }
+
+
+def cmd_reconcile_stale_lease(args: argparse.Namespace) -> dict[str, Any]:
+    """Release one stopped worker lease made stale by an exact amendment."""
+    p = paths(args.control_root, args.run_id)
+    attempt_id = safe_id(args.attempt_id, "stale lease attempt ID")
+    lease_id = safe_id(args.lease_id, "stale lease ID")
+    amendment_id = safe_id(args.amendment_id, "stale lease amendment ID")
+    reconciliation_id = safe_id(args.reconciliation_id, "stale lease reconciliation ID")
+    if args.owner_epoch < 0:
+        fail("stale lease owner epoch must be non-negative")
+    migration_id = f"stale-lease-release-{reconciliation_id}"
+    decision_id = f"decision-{migration_id}"
+    decision_reason = (
+        "Exact stopped returned worker attempt and current ticket were invalidated by the current approved "
+        "amendment; finalized candidate checkpoint was clean and unambiguous."
+    )
+
+    def exact_matches(state: dict[str, Any], collection: str, record_id: str) -> list[dict[str, Any]]:
+        return [item for item in state.get(collection, []) if item.get("id") == record_id]
+
+    def verify_shared_fences(state: dict[str, Any], *, released: bool) -> dict[str, Any]:
+        if state.get("run_id") != args.run_id:
+            fail("stale lease recovery run identity mismatch")
+        owner = state.get("owner", {})
+        if owner.get("token") != args.owner_token:
+            fail("owner token mismatch; stale orchestrator is fenced")
+        if owner.get("epoch") != args.owner_epoch:
+            fail("stale lease recovery owner epoch mismatch")
+        if state.get("lifecycle", {}).get("control") in ("ACCEPTED", "FAILED", "CANCELLED"):
+            fail("terminal run is immutable; stale lease recovery is forbidden")
+
+        attempts = exact_matches(state, "attempts", attempt_id)
+        if len(attempts) != 1:
+            fail("stale lease recovery attempt is missing or ambiguous")
+        attempt = attempts[0]
+        if attempt.get("kind") != "worker" or attempt.get("state") != "RETURNED":
+            fail("stale lease recovery requires one returned worker attempt")
+        if attempt.get("epoch") != args.owner_epoch:
+            fail("stale lease recovery attempt belongs to another owner epoch")
+        lease = attempt.get("lease", {})
+        expected_lease_state = "released" if released else "active"
+        if lease.get("id") != lease_id or lease.get("state") != expected_lease_state:
+            fail("stale lease recovery lease ownership/state mismatch")
+        lease_owners = [
+            item.get("id") for item in state.get("attempts", [])
+            if item.get("lease", {}).get("id") == lease_id
+        ]
+        if lease_owners != [attempt_id]:
+            fail("stale lease recovery lease ID is missing, duplicated, or cross-owned")
+        if amendment_id not in attempt.get("invalidated_by", []):
+            fail("stale lease recovery attempt is not invalidated by the exact amendment")
+        require_runtime_stopped(p, attempt, "stale invalidated lease release")
+
+        tickets = exact_matches(state, "tickets", attempt.get("subject_ref"))
+        if len(tickets) != 1:
+            fail("stale lease recovery ticket is missing or ambiguous")
+        ticket = tickets[0]
+        if (
+            ticket.get("state") != "STALE"
+            or amendment_id not in ticket.get("invalidated_by", [])
+            or ticket.get("current_attempt") != attempt_id
+        ):
+            fail("stale lease recovery requires the exact amendment-staled current ticket/attempt")
+
+        intent = state.get("intent", {})
+        if amendment_id not in intent.get("approved_amendments", []):
+            fail("stale lease amendment is not approved by the current intent")
+        invalidations = [
+            item for item in state.get("invalidations", [])
+            if item.get("amendment_ref") == amendment_id
+        ]
+        if len(invalidations) != 1:
+            fail("stale lease amendment invalidation is missing or ambiguous")
+        invalidation = invalidations[0]
+        consumers = set(invalidation.get("consumer_refs", []))
+        if (
+            invalidation.get("intent_revision") != intent.get("current_revision")
+            or attempt_id not in consumers
+            or ticket.get("id") not in consumers
+        ):
+            fail("stale lease invalidation does not bind the current intent, attempt, and ticket")
+
+        candidate = current_candidate_record(state, ticket)
+        if (
+            candidate is None
+            or candidate.get("producer_attempt_ref") != attempt_id
+            or candidate.get("sha") != attempt.get("candidate_sha")
+            or candidate.get("tree_sha") != attempt.get("candidate_tree_sha")
+            or ticket.get("current_candidate") != candidate.get("id")
+            or not attempt.get("candidate_proof_ref")
+            or candidate.get("proof_ref") != attempt.get("candidate_proof_ref")
+        ):
+            fail("stale lease recovery candidate/producer projection is missing or ambiguous")
+        proof = verify_verified_candidate_proof(p, attempt["candidate_proof_ref"])
+        if (
+            proof.get("run_id") != state.get("run_id")
+            or proof.get("ticket_id") != ticket.get("id")
+            or proof.get("attempt_id") != attempt_id
+            or proof.get("candidate_sha") != candidate.get("sha")
+            or proof.get("candidate_tree_sha") != candidate.get("tree_sha")
+        ):
+            fail("stale lease recovery candidate proof identity mismatch")
+        operations = exact_matches(state, "operations", proof.get("operation_id"))
+        if len(operations) != 1:
+            fail("stale lease recovery candidate operation is missing or ambiguous")
+        operation = operations[0]
+        if (
+            operation.get("state") != "finalized"
+            or operation.get("candidate_ref") != candidate.get("id")
+            or operation.get("proof_ref") != attempt.get("candidate_proof_ref")
+            or amendment_id not in operation.get("invalidated_by", [])
+        ):
+            fail("stale lease recovery requires the exact finalized invalidated candidate operation")
+        if any(effect_is_unresolved(item) for item in state.get("operations", [])):
+            fail("stale lease recovery rejects unresolved durable effects")
+
+        occupied_leases = [
+            item.get("id") for item in state.get("attempts", [])
+            if item.get("lease", {}).get("state") in ("active", "quarantined")
+            and item.get("id") != attempt_id
+        ]
+        if occupied_leases:
+            fail("stale lease recovery rejects any other active or quarantined lease")
+
+        repository = state.get("repository", {})
+        checkout = safe_root(attempt.get("checkout", ""), "stale lease attempt checkout")
+        registered = safe_root(repository.get("checkout", ""), "registered checkout")
+        execution_root = safe_root(repository.get("execution_root", ""), "registered execution root")
+        if checkout != registered or checkout != execution_root:
+            fail("stale lease recovery checkout is not the exact registered execution root")
+        binding = verified_repository_binding(checkout, require_git=True, require_clean=True)
+        if (
+            binding.get("execution_root") != str(checkout)
+            or binding.get("initial_head") != candidate.get("sha")
+            or git_output(checkout, "rev-parse", "HEAD^{tree}").decode().strip() != candidate.get("tree_sha")
+        ):
+            fail("stale lease recovery checkout is not the exact clean candidate checkpoint")
+        return {
+            "attempt": attempt, "ticket": ticket, "candidate": candidate,
+            "operation": operation, "proof": proof, "binding": binding,
+            "invalidation": invalidation,
+        }
+
+    observed, _ = load_state(p)
+    if observed.get("owner", {}).get("token") != args.owner_token:
+        fail("owner token mismatch; stale orchestrator is fenced")
+    prior = next(
+        (
+            item for item in (observed.get("runtime_provenance") or {}).get("applied_migrations", [])
+            if item.get("id") == migration_id
+        ),
+        None,
+    )
+    if prior is not None:
+        if observed.get("run_id") != args.run_id:
+            fail("stale lease recovery run identity mismatch")
+        owner = observed.get("owner", {})
+        if owner.get("epoch") != args.owner_epoch:
+            fail("stale lease recovery owner epoch mismatch")
+        attempts = exact_matches(observed, "attempts", attempt_id)
+        if len(attempts) != 1:
+            fail("stale lease replay attempt is missing or ambiguous")
+        attempt = attempts[0]
+        if (
+            attempt.get("kind") != "worker"
+            or attempt.get("state") != "RETURNED"
+            or attempt.get("epoch") != args.owner_epoch
+            or attempt.get("lease", {}).get("id") != lease_id
+            or attempt.get("lease", {}).get("state") != "released"
+            or amendment_id not in attempt.get("invalidated_by", [])
+        ):
+            fail("stale lease replay attempt/lease binding conflicts with the published release")
+        lease_owners = [
+            item.get("id") for item in observed.get("attempts", [])
+            if item.get("lease", {}).get("id") == lease_id
+        ]
+        if lease_owners != [attempt_id]:
+            fail("stale lease replay lease ID is missing, duplicated, or cross-owned")
+        require_runtime_stopped(p, attempt, "stale invalidated lease replay")
+
+        report = stored_payload(p, prior.get("object_ref"), "stale invalidated lease release report")
+        report_raw = canonical_bytes(report)
+        report_hash = sha256_bytes(report_raw)
+        prior_helper_version = prior.get("helper_version")
+        if (
+            semver_tuple(prior_helper_version) is None
+            or prior.get("manifest_hash") != report_hash
+            or prior.get("object_ref") != f"objects/{report_hash}"
+            or prior.get("applied_revision") != report.get("applied_revision")
+            or report.get("source_revision") != report.get("applied_revision", -1) - 1
+        ):
+            fail("stale lease migration/report provenance is incomplete or conflicting")
+
+        tickets = exact_matches(observed, "tickets", report.get("ticket_id"))
+        candidates = exact_matches(observed, "candidates", report.get("candidate_id"))
+        operations = exact_matches(observed, "operations", report.get("operation_id"))
+        invalidations = [
+            item for item in observed.get("invalidations", [])
+            if item.get("id") == report.get("invalidation_id")
+        ]
+        amendment_invalidations = [
+            item for item in observed.get("invalidations", [])
+            if item.get("amendment_ref") == amendment_id
+        ]
+        if (
+            any(len(items) != 1 for items in (tickets, candidates, operations, invalidations))
+            or amendment_invalidations != invalidations
+        ):
+            fail("stale lease replay historical bindings are missing or ambiguous")
+        ticket, candidate, operation, invalidation = (
+            tickets[0], candidates[0], operations[0], invalidations[0]
+        )
+        proof = verify_verified_candidate_proof(p, attempt.get("candidate_proof_ref"))
+        if (
+            attempt.get("subject_ref") != ticket.get("id")
+            or candidate.get("producer_attempt_ref") != attempt_id
+            or candidate.get("sha") != attempt.get("candidate_sha")
+            or candidate.get("tree_sha") != attempt.get("candidate_tree_sha")
+            or candidate.get("proof_ref") != attempt.get("candidate_proof_ref")
+            or operation.get("state") != "finalized"
+            or operation.get("candidate_ref") != candidate.get("id")
+            or operation.get("proof_ref") != attempt.get("candidate_proof_ref")
+            or invalidation.get("amendment_ref") != amendment_id
+            or attempt_id not in set(invalidation.get("consumer_refs", []))
+            or ticket.get("id") not in set(invalidation.get("consumer_refs", []))
+            or proof.get("operation_id") != operation.get("id")
+        ):
+            fail("stale lease replay historical projection conflicts with the published release")
+        for key in ("checkout_status_hash", "route_records_hash", "evidence_records_hash"):
+            if not HASH_RE.fullmatch(report.get(key, "")):
+                fail(f"stale lease report has an invalid {key}")
+        expected = {
+            "kind": "stale_invalidated_lease_release",
+            "reconciliation_id": reconciliation_id,
+            "run_id": args.run_id,
+            "source_revision": prior["applied_revision"] - 1,
+            "applied_revision": prior["applied_revision"],
+            "helper_version": prior_helper_version,
+            "owner_token_hash": sha256_bytes(args.owner_token.encode("utf-8")),
+            "owner_epoch": args.owner_epoch,
+            "attempt_id": attempt_id,
+            "ticket_id": ticket["id"],
+            "lease_id": lease_id,
+            "amendment_id": amendment_id,
+            "invalidation_id": invalidation["id"],
+            "candidate_id": candidate["id"],
+            "candidate_sha": candidate["sha"],
+            "candidate_tree_sha": candidate["tree_sha"],
+            "proof_ref": attempt["candidate_proof_ref"],
+            "operation_id": operation["id"],
+            "stop_ref": attempt["runtime"]["stop_ref"],
+            "checkout": str(safe_root(attempt["checkout"], "stale lease replay checkout")),
+            "checkout_clean": True,
+            "checkout_status_hash": report["checkout_status_hash"],
+            "lease_state_before": "active",
+            "lease_state_after": "released",
+            "route_records_hash": report["route_records_hash"],
+            "evidence_records_hash": report["evidence_records_hash"],
+        }
+        if report != expected:
+            fail("stale lease reconciliation ID already exists with conflicting recovery evidence")
+        decisions = exact_matches(observed, "decisions", decision_id)
+        expected_decision = {
+            "id": decision_id,
+            "type": "stale_invalidated_lease_release",
+            "status": "applied",
+            "decision": "RELEASE_STOPPED_STALE_LEASE",
+            "reason": decision_reason,
+            "evidence_refs": [prior["object_ref"]],
+            "affected_refs": [ticket["id"], attempt_id, lease_id, candidate["id"]],
+            "intent_revision": invalidation["intent_revision"],
+        }
+        if len(decisions) != 1 or decisions[0] != expected_decision:
+            fail("stale lease migration exists without its exact durable decision record")
+        return {
+            "released": True, "idempotent": True, "reconciliation_id": reconciliation_id,
+            "report_hash": prior["manifest_hash"], "revision": observed["revision"],
+            "attempt_id": attempt_id, "lease_id": lease_id,
+        }
+
+    def change(state: dict[str, Any]) -> None:
+        admit_event(state, "attempt.reconcile")
+        verified = verify_shared_fences(state, released=False)
+        if exact_matches(state, "decisions", decision_id):
+            fail("stale lease recovery decision ID already exists without matching provenance")
+
+        report = {
+            "kind": "stale_invalidated_lease_release",
+            "reconciliation_id": reconciliation_id,
+            "run_id": state["run_id"],
+            "source_revision": state["revision"],
+            "applied_revision": state["revision"] + 1,
+            "helper_version": SKILL_VERSION,
+            "owner_token_hash": sha256_bytes(args.owner_token.encode("utf-8")),
+            "owner_epoch": args.owner_epoch,
+            "attempt_id": attempt_id,
+            "ticket_id": verified["ticket"]["id"],
+            "lease_id": lease_id,
+            "amendment_id": amendment_id,
+            "invalidation_id": verified["invalidation"]["id"],
+            "candidate_id": verified["candidate"]["id"],
+            "candidate_sha": verified["candidate"]["sha"],
+            "candidate_tree_sha": verified["candidate"]["tree_sha"],
+            "proof_ref": verified["attempt"]["candidate_proof_ref"],
+            "operation_id": verified["operation"]["id"],
+            "stop_ref": verified["attempt"]["runtime"]["stop_ref"],
+            "checkout": verified["binding"]["checkout"],
+            "checkout_clean": verified["binding"]["clean"],
+            "checkout_status_hash": verified["binding"]["status_hash"],
+            "lease_state_before": "active",
+            "lease_state_after": "released",
+            "route_records_hash": sha256_bytes(canonical_bytes(state.get("routes", []))),
+            "evidence_records_hash": sha256_bytes(canonical_bytes(state.get("evidence", []))),
+        }
+        report_raw = canonical_bytes(report)
+        report_hash = sha256_bytes(report_raw)
+        object_store(p, report_raw)
+        report_ref = f"objects/{report_hash}"
+
+        verified["attempt"]["lease"]["state"] = "released"
+        state.setdefault("decisions", []).append({
+            "id": decision_id,
+            "type": "stale_invalidated_lease_release",
+            "status": "applied",
+            "decision": "RELEASE_STOPPED_STALE_LEASE",
+            "reason": decision_reason,
+            "evidence_refs": [report_ref],
+            "affected_refs": [verified["ticket"]["id"], attempt_id, lease_id, verified["candidate"]["id"]],
+            "intent_revision": state["intent"]["current_revision"],
+        })
+        provenance = ensure_runtime_provenance(state)
+        provenance["applied_migrations"].append({
+            "id": migration_id,
+            "helper_version": SKILL_VERSION,
+            "applied_revision": state["revision"] + 1,
+            "manifest_hash": report_hash,
+            "object_ref": report_ref,
+        })
+        state["lifecycle"]["next_action"] = {
+            "kind": "adopt_requirements",
+            "subject_refs": [amendment_id, verified["ticket"]["id"], attempt_id],
+            "preconditions": ["current amendment requirements manifest", "no active or quarantined leases"],
+            "read_refs": ["phases/design.md", "phases/recover.md", "references/ledger.md"],
+        }
+
+    result = transaction(p, args.owner_token, args.revision, change, "stale-lease-release")
+    migration = next(
+        item for item in result["runtime_provenance"]["applied_migrations"]
+        if item["id"] == migration_id
+    )
+    return {
+        "released": True, "idempotent": False, "reconciliation_id": reconciliation_id,
+        "report_hash": migration["manifest_hash"], "revision": result["revision"],
+        "attempt_id": attempt_id, "lease_id": lease_id,
+    }
+
+
+def cmd_reconcile_historical_review_obligations(args: argparse.Namespace) -> dict[str, Any]:
+    """Fence one legacy UNVERIFIABLE review whose final-G5 claim is downstream."""
+    p = paths(args.control_root, args.run_id)
+    reconciliation_id = safe_id(args.reconciliation_id, "reconciliation_id")
+    decision_id = f"historical-review-{reconciliation_id}"
+    expected_refs = [
+        args.ticket_id, args.deferred_finding_id, args.mirror_issue_id,
+        args.verdict_issue_id, args.interrupted_issue_id,
+    ]
+    expected_evidence = [args.routine_review_id, args.critical_review_id, args.interrupted_attempt_id]
+    observed, _ = load_state(p)
+    if observed.get("run_id") != args.run_id or observed.get("owner", {}).get("token") != args.owner_token:
+        fail("historical review reconciliation run/owner mismatch")
+    if observed["owner"].get("epoch") != args.owner_epoch:
+        fail("historical review reconciliation owner epoch mismatch")
+    prior = next((item for item in observed.get("decisions", []) if item.get("id") == decision_id), None)
+    if prior is not None:
+        if (
+            prior.get("type") != "historical_review_obligation_reconciliation"
+            or prior.get("supersedes") != [args.historical_review_id]
+            or prior.get("affected_refs") != expected_refs
+            or prior.get("evidence_refs", [])[1:] != expected_evidence
+            or prior.get("candidate_ref") != args.candidate_id
+        ):
+            fail("historical review reconciliation ID conflicts with published evidence")
+        historical_review_reconciliation_refs(observed)
+        report_ref = prior["evidence_refs"][0]
+        report = stored_payload(p, report_ref, "historical review reconciliation report")
+        if (
+            report.get("reconciliation_id") != reconciliation_id
+            or report.get("run_id") != args.run_id
+            or report.get("owner_epoch") != args.owner_epoch
+            or report.get("decision_id") != decision_id
+            or report.get("affected_refs") != expected_refs
+            or report.get("evidence_refs") != expected_evidence
+        ):
+            fail("historical review reconciliation report conflicts with exact replay")
+        return {"reconciled": True, "idempotent": True, "qualification_ref": report["qualification_ref"], "revision": observed["revision"]}
+
+    def change(state: dict[str, Any]) -> None:
+        admit_event(state, "attempt.reconcile")
+        if state.get("run_id") != args.run_id or state["owner"].get("epoch") != args.owner_epoch:
+            fail("historical review reconciliation lost its run/owner epoch fence")
+        if state["lifecycle"].get("phase") != "EXECUTE" or state["lifecycle"].get("control") != "ACTIVE":
+            fail("historical review reconciliation requires active EXECUTE before integration")
+        ticket = next((item for item in state.get("tickets", []) if item.get("id") == args.ticket_id), None)
+        candidate = next((item for item in state.get("candidates", []) if item.get("id") == args.candidate_id), None)
+        if (
+            ticket is None or candidate is None or ticket.get("state") != "REVIEW"
+            or ticket.get("current_candidate") != candidate.get("id")
+            or candidate.get("ticket_ref") != ticket.get("id") or candidate.get("quality") != "DONE"
+            or candidate.get("integration_status") == "INTEGRATED"
+        ):
+            fail("historical review reconciliation requires the exact current unintegrated DONE candidate")
+        checkout = safe_root(state.get("repository", {}).get("execution_root", ""), "historical review checkout")
+        if checkout != safe_root(state.get("repository", {}).get("checkout", ""), "registered checkout"):
+            fail("historical review checkout does not match the registered execution root")
+        binding = verified_repository_binding(checkout, require_git=True, require_clean=True)
+        if (
+            binding.get("initial_head") != candidate.get("sha")
+            or git_output(checkout, "rev-parse", "HEAD^{tree}").decode().strip() != candidate.get("tree_sha")
+        ):
+            fail("historical review reconciliation candidate checkout has drifted")
+
+        reviews = {item.get("id"): item for item in state.get("reviews", [])}
+        old_review = reviews.get(args.historical_review_id)
+        routine = reviews.get(args.routine_review_id)
+        critical = reviews.get(args.critical_review_id)
+        if any(item is None for item in (old_review, routine, critical)):
+            fail("historical review reconciliation has a missing review")
+        for review, purpose, verdict in (
+            (old_review, "ticket_review", "UNVERIFIABLE"),
+            (routine, "ticket_review", "PASS"),
+            (critical, "critical_axis", "PASS"),
+        ):
+            attempt = attempt_by_id(state, review.get("attempt_ref"))
+            require_runtime_stopped(p, attempt, "historical review reconciliation")
+            if (
+                review.get("accepted") is not True or review.get("verdict") != verdict
+                or review.get("purpose") != purpose or review.get("subject_fingerprint") != candidate["sha"]
+                or review.get("intent_revision") != state.get("intent", {}).get("current_revision")
+                or review.get("invalidated_by") or not review.get("return_ref") or not review.get("integrity_ref")
+                or attempt.get("subject_ref") != ticket["id"] or attempt.get("state") != "RETURNED"
+                or attempt.get("lease", {}).get("state") != "released"
+            ):
+                fail("historical review reconciliation review lineage is stale or ambiguous")
+        deferred = next((item for item in state.get("findings", []) if item.get("id") == args.deferred_finding_id), None)
+        if (
+            deferred is None or deferred.get("source_ref") != old_review["attempt_ref"]
+            or deferred.get("id") not in old_review.get("finding_refs", [])
+            or deferred.get("impact") != "blocking" or deferred.get("affected_refs") != [ticket["id"]]
+            or deferred.get("axis") != "contract_conformance"
+            or "final G5" not in deferred.get("expected", "")
+            or deferred.get("repair_contract_ref") is not None
+        ):
+            fail("deferred finding is not the historical downstream final-G5 obligation")
+        criteria = {item.get("id"): item for item in state.get("criteria", [])}
+        if not any(
+            ref in ticket.get("criterion_refs", [])
+            and criteria.get(ref, {}).get("status") == "active"
+            and "final G5" in criteria[ref].get("oracle", "")
+            for ref in deferred.get("reported_affected_refs", [])
+        ):
+            fail("deferred finding lacks an active explicit final-G5 criterion")
+        other_findings = set(old_review.get("finding_refs", [])) - {deferred["id"]}
+        resolved_by_routine = {
+            item.get("finding_ref") for item in routine.get("finding_resolution", [])
+            if item.get("candidate_ref") == candidate["id"] and item.get("evidence_refs")
+        }
+        if not other_findings or not other_findings.issubset(resolved_by_routine):
+            fail("historical review has other findings without exact fresh PASS resolution claims")
+        if any(
+            item.get("purpose") == "final_g5" and item.get("result") == "PASS"
+            and item.get("subject_fingerprint") == candidate["sha"]
+            for item in state.get("review_qualifications", [])
+        ):
+            fail("historical review reconciliation must precede fresh final G5")
+        interrupted = attempt_by_id(state, args.interrupted_attempt_id)
+        require_runtime_stopped(p, interrupted, "historical interrupted critical review")
+        if (
+            interrupted.get("kind") != "review" or interrupted.get("review_purpose") != "critical_axis"
+            or interrupted.get("state") != "INTERRUPTED" or interrupted.get("subject_ref") != ticket["id"]
+            or interrupted.get("candidate_sha") != candidate["sha"] or interrupted.get("return_ref") is not None
+            or interrupted.get("lease", {}).get("state") != "released"
+        ):
+            fail("historical critical interruption is not safely superseded by the fresh PASS review")
+        issues = {item.get("id"): item for item in state.get("issues", [])}
+        expected_issues = (
+            (args.mirror_issue_id, "review_finding", old_review["attempt_ref"], deferred["id"]),
+            (args.verdict_issue_id, "review_verdict", old_review["id"], None),
+            (args.interrupted_issue_id, "attempt_termination", interrupted["id"], None),
+        )
+        for issue_id, issue_type, source_ref, finding_ref in expected_issues:
+            issue = issues.get(issue_id)
+            if (
+                issue is None or issue.get("type") != issue_type or issue.get("source_ref") != source_ref
+                or issue.get("finding_ref") != finding_ref or issue.get("impact") != "blocking"
+                or issue.get("invalidated_by")
+            ):
+                fail("historical review reconciliation issue is not the exact active legacy blocker")
+        if any(item.get("id") == decision_id for item in state.get("decisions", [])):
+            fail("historical review reconciliation decision ID already exists")
+        report = {
+            "kind": "historical_review_obligation_reconciliation",
+            "reconciliation_id": reconciliation_id,
+            "decision_id": decision_id,
+            "run_id": state["run_id"],
+            "owner_epoch": args.owner_epoch,
+            "source_revision": state["revision"],
+            "applied_revision": state["revision"] + 1,
+            "ticket_id": ticket["id"],
+            "candidate_id": candidate["id"],
+            "candidate_sha": candidate["sha"],
+            "candidate_tree_sha": candidate["tree_sha"],
+            "historical_review_id": old_review["id"],
+            "affected_refs": expected_refs,
+            "evidence_refs": expected_evidence,
+            "other_finding_refs": sorted(other_findings),
+            "final_g5_state": "PENDING_NOT_CREDITED",
+            "route_records_hash": sha256_bytes(canonical_bytes(state.get("routes", []))),
+            "evidence_records_hash": sha256_bytes(canonical_bytes(state.get("evidence", []))),
+            "qualification_ref": None,
+        }
+        for issue_id, _, _, _ in expected_issues:
+            issue = issues[issue_id]
+            issue["impact"] = "advisory"
+            issue["disposition"] = "historical review obligation reconciled; fresh final G5 remains required"
+            issue.setdefault("invalidated_by", []).append(decision_id)
+        state.setdefault("decisions", []).append({
+            "id": decision_id,
+            "type": "historical_review_obligation_reconciliation",
+            "status": "accepted",
+            "decision": "DEFER_FINAL_G5_OBLIGATION",
+            "reason": "Historical UNVERIFIABLE review did not decide final G5; exact fresh routine and critical PASS supersede its review obligation while final G5 remains pending.",
+            "evidence_refs": [f"objects/{'0' * 64}", *expected_evidence],
+            "affected_refs": expected_refs,
+            "supersedes": [old_review["id"]],
+            "candidate_ref": candidate["id"],
+            "introduced_revision": str(state["revision"] + 1),
+            "intent_revision": state["intent"]["current_revision"],
+            "invalidated_by": [],
+        })
+        qualification = append_review_qualification(
+            state, ticket["id"], candidate["sha"], purpose="ticket_review",
+            created_revision=state["revision"] + 1,
+        )
+        if qualification.get("result") != "PASS" or set(qualification.get("accepted_review_refs", [])) != {routine["id"], critical["id"]}:
+            fail("historical review reconciliation did not produce the exact two-review PASS qualification")
+        report["qualification_ref"] = qualification["id"]
+        report_raw = canonical_bytes(report)
+        report_hash = object_store(p, report_raw)
+        state["decisions"][-1]["evidence_refs"][0] = f"objects/{report_hash}"
+        ensure_runtime_provenance(state)["applied_migrations"].append({
+            "id": f"historical-review-{reconciliation_id}",
+            "helper_version": SKILL_VERSION,
+            "applied_revision": state["revision"] + 1,
+            "manifest_hash": report_hash,
+            "object_ref": f"objects/{report_hash}",
+        })
+        state["lifecycle"]["issue_refs"] = [ref for ref in state["lifecycle"].get("issue_refs", []) if ref not in {args.mirror_issue_id, args.verdict_issue_id, args.interrupted_issue_id}]
+        state["lifecycle"]["reason"] = "historical_review_obligations_reconciled_g5_pending"
+
+    result = transaction(p, args.owner_token, args.revision, change, "historical-review-reconciliation")
+    qualification = next(item for item in result["review_qualifications"] if item.get("created_revision") == result["revision"] and item.get("result") == "PASS")
+    return {"reconciled": True, "idempotent": False, "qualification_ref": qualification["id"], "revision": result["revision"]}
 
 
 def cmd_gate(args: argparse.Namespace) -> dict[str, Any]:
@@ -11763,12 +13226,17 @@ def build_parser() -> argparse.ArgumentParser:
     effect = sub.add_parser("prepare-effect"); effect.add_argument("--control-root", required=True); effect.add_argument("--run-id", required=True); effect.add_argument("--owner-token", required=True); effect.add_argument("--revision", type=int, required=True); effect.add_argument("--operation-id", required=True); effect.add_argument("--kind", required=True); effect.add_argument("--target", required=True); effect.add_argument("--expected-before", default=None); effect.add_argument("--intended-after", default=None); effect.add_argument("--authority-ref", required=True)
     reconcile_effect = sub.add_parser("reconcile-effect"); reconcile_effect.add_argument("--control-root", required=True); reconcile_effect.add_argument("--run-id", required=True); reconcile_effect.add_argument("--owner-token", required=True); reconcile_effect.add_argument("--revision", type=int, required=True); reconcile_effect.add_argument("--operation-id", required=True); reconcile_effect.add_argument("--result", choices=["applied", "uncertain", "abandoned", "unchanged"], required=True); reconcile_effect.add_argument("--receipt")
     review = sub.add_parser("prepare-review"); review.add_argument("--control-root", required=True); review.add_argument("--run-id", required=True); review.add_argument("--owner-token", required=True); review.add_argument("--revision", type=int, required=True); review.add_argument("--ticket-id", required=True); review.add_argument("--review-attempt-id", required=True); review.add_argument("--lease-id", required=True); review.add_argument("--packet", required=True)
+    final_g5 = sub.add_parser("register-final-g5", help="register one fresh final G5 reviewer on the exact integrated candidate"); final_g5.add_argument("--control-root", required=True); final_g5.add_argument("--run-id", required=True); final_g5.add_argument("--owner-token", required=True); final_g5.add_argument("--revision", type=int, required=True); final_g5.add_argument("--owner-epoch", type=int, required=True); final_g5.add_argument("--ticket-id", required=True); final_g5.add_argument("--candidate-id", required=True); final_g5.add_argument("--attempt-id", required=True); final_g5.add_argument("--lease-id", required=True); final_g5.add_argument("--packet", required=True)
+    rejected_g5 = sub.add_parser("reconcile-unimportable-final-g5", help="preserve one stopped rejected G5 artifact and permit a same-candidate evidence retry"); rejected_g5.add_argument("--control-root", required=True); rejected_g5.add_argument("--run-id", required=True); rejected_g5.add_argument("--owner-token", required=True); rejected_g5.add_argument("--revision", type=int, required=True); rejected_g5.add_argument("--owner-epoch", type=int, required=True); rejected_g5.add_argument("--ticket-id", required=True); rejected_g5.add_argument("--candidate-id", required=True); rejected_g5.add_argument("--attempt-id", required=True); rejected_g5.add_argument("--lease-id", required=True); rejected_g5.add_argument("--return-file", required=True); rejected_g5.add_argument("--context-receipt", required=True); rejected_g5.add_argument("--environment-receipt", required=True); rejected_g5.add_argument("--stop-confirmation", required=True); rejected_g5.add_argument("--reconciliation-id", required=True); rejected_g5.add_argument("--authority-ref", required=True)
     design_review = sub.add_parser("prepare-design-review"); design_review.add_argument("--control-root", required=True); design_review.add_argument("--run-id", required=True); design_review.add_argument("--owner-token", required=True); design_review.add_argument("--revision", type=int, required=True); design_review.add_argument("--review-attempt-id", required=True); design_review.add_argument("--lease-id", required=True); design_review.add_argument("--packet", required=True); design_review.add_argument("--review-kind", choices=["coverage", "plan"], required=True); design_review.add_argument("--reviewer-identity", required=True); design_review.add_argument("--reviewer-role", required=True)
     adjudicate = sub.add_parser("adjudicate"); adjudicate.add_argument("--control-root", required=True); adjudicate.add_argument("--run-id", required=True); adjudicate.add_argument("--owner-token", required=True); adjudicate.add_argument("--revision", type=int, required=True); adjudicate.add_argument("--decision-file", required=True)
     integrate = sub.add_parser("integrate"); integrate.add_argument("--control-root", required=True); integrate.add_argument("--run-id", required=True); integrate.add_argument("--owner-token", required=True); integrate.add_argument("--revision", type=int, required=True); integrate.add_argument("--qualification-ref"); integrate.add_argument("--attempt-id"); integrate.add_argument("--review-file"); integrate.add_argument("--integrity-receipt"); integrate.add_argument("--review-id")
     handoff = sub.add_parser("prepare-handoff"); handoff.add_argument("--control-root", required=True); handoff.add_argument("--run-id", required=True); handoff.add_argument("--owner-token", required=True); handoff.add_argument("--revision", type=int, required=True); handoff.add_argument("--attempt-id", required=True); handoff.add_argument("--packet", required=True); handoff.add_argument("--projection", required=True); handoff.add_argument("--export-root", required=True); handoff.add_argument("--bundle-root", required=True); handoff.add_argument("--purpose", choices=["ticket_change", "ticket_review", "critical_axis", "final_g5"])
     manual = sub.add_parser("import-manual"); manual.add_argument("--control-root", required=True); manual.add_argument("--run-id", required=True); manual.add_argument("--owner-token", required=True); manual.add_argument("--revision", type=int, required=True); manual.add_argument("--attempt-id", required=True); manual.add_argument("--return-file", required=True); manual.add_argument("--environment-receipt", required=True); manual.add_argument("--context-receipt", required=True); manual.add_argument("--integrity-receipt", required=True); manual.add_argument("--intent-revision", required=True); manual.add_argument("--candidate-fingerprint", required=True); manual.add_argument("--required-criteria", required=True); manual.add_argument("--purpose", choices=["ticket_change", "ticket_review", "critical_axis", "final_g5"])
     audit = sub.add_parser("audit-write-set"); audit.add_argument("--root", required=True); audit.add_argument("--baseline", required=True); audit.add_argument("--declared", required=True); audit.add_argument("--zone", required=True)
+    bootstrap = sub.add_parser("bind-bootstrap", help="append an exact pre-dispatch Git baseline/worktree recovery binding"); bootstrap.add_argument("--control-root", required=True); bootstrap.add_argument("--run-id", required=True); bootstrap.add_argument("--owner-token", required=True); bootstrap.add_argument("--revision", type=int, required=True); bootstrap.add_argument("--repo-root", required=True); bootstrap.add_argument("--expected-head", required=True); bootstrap.add_argument("--binding-id", required=True); bootstrap.add_argument("--authority-ref", required=True); bootstrap.add_argument("--operation-id")
+    stale_lease = sub.add_parser("reconcile-stale-lease", help="release one stopped amendment-invalidated worker lease"); stale_lease.add_argument("--control-root", required=True); stale_lease.add_argument("--run-id", required=True); stale_lease.add_argument("--owner-token", required=True); stale_lease.add_argument("--revision", type=int, required=True); stale_lease.add_argument("--owner-epoch", type=int, required=True); stale_lease.add_argument("--attempt-id", required=True); stale_lease.add_argument("--lease-id", required=True); stale_lease.add_argument("--amendment-id", required=True); stale_lease.add_argument("--reconciliation-id", required=True)
+    historical_review = sub.add_parser("reconcile-historical-review-obligations", help="separate one stopped legacy UNVERIFIABLE review from pending final G5"); historical_review.add_argument("--control-root", required=True); historical_review.add_argument("--run-id", required=True); historical_review.add_argument("--owner-token", required=True); historical_review.add_argument("--revision", type=int, required=True); historical_review.add_argument("--owner-epoch", type=int, required=True); historical_review.add_argument("--ticket-id", required=True); historical_review.add_argument("--candidate-id", required=True); historical_review.add_argument("--historical-review-id", required=True); historical_review.add_argument("--routine-review-id", required=True); historical_review.add_argument("--critical-review-id", required=True); historical_review.add_argument("--deferred-finding-id", required=True); historical_review.add_argument("--mirror-issue-id", required=True); historical_review.add_argument("--verdict-issue-id", required=True); historical_review.add_argument("--interrupted-attempt-id", required=True); historical_review.add_argument("--interrupted-issue-id", required=True); historical_review.add_argument("--reconciliation-id", required=True)
     gate = sub.add_parser("gate"); gate.add_argument("--control-root", required=True); gate.add_argument("--run-id", required=True); gate.add_argument("--owner-token", required=True); gate.add_argument("--revision", type=int, required=True); gate.add_argument("--phase"); gate.add_argument("--control"); gate.add_argument("--gate-id", choices=[f"G{i}" for i in range(7)]); gate.add_argument("--reason", default=None); gate.add_argument("--next-action", default="inspect"); gate.add_argument("--subject-refs", default=""); gate.add_argument("--preconditions", default=""); gate.add_argument("--read-refs", default="")
     cancel = sub.add_parser("cancel"); cancel.add_argument("--control-root", required=True); cancel.add_argument("--run-id", required=True); cancel.add_argument("--owner-token", required=True); cancel.add_argument("--revision", type=int, required=True); cancel.add_argument("--reason", default="user_cancelled"); cancel.add_argument("--stop-target", default=None); cancel.add_argument("--finalize", action="store_true"); cancel.add_argument("--stop-evidence")
     recover = sub.add_parser("recover"); recover.add_argument("--control-root", required=True); recover.add_argument("--run-id", required=True); recover.add_argument("--owner-token", required=True); recover.add_argument("--revision", type=int, required=True); recover.add_argument("--reason", default="recovery"); recover.add_argument("--takeover", action="store_true"); recover.add_argument("--new-owner-token", default=None); recover.add_argument("--attestation-ref", default=None)
@@ -11813,12 +13281,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "prepare-effect": result = cmd_prepare_effect(args)
         elif args.command == "reconcile-effect": result = cmd_reconcile_effect(args)
         elif args.command == "prepare-review": result = cmd_prepare_review(args)
+        elif args.command == "register-final-g5": result = cmd_register_final_g5(args)
+        elif args.command == "reconcile-unimportable-final-g5": result = cmd_reconcile_unimportable_final_g5(args)
         elif args.command == "prepare-design-review": result = cmd_prepare_design_review(args)
         elif args.command == "adjudicate": result = cmd_adjudicate(args)
         elif args.command == "integrate": result = cmd_integrate(args)
         elif args.command == "prepare-handoff": result = cmd_prepare_handoff(args)
         elif args.command == "import-manual": result = cmd_import_manual(args)
         elif args.command == "audit-write-set": result = cmd_audit(args)
+        elif args.command == "bind-bootstrap": result = cmd_bind_bootstrap(args)
+        elif args.command == "reconcile-stale-lease": result = cmd_reconcile_stale_lease(args)
+        elif args.command == "reconcile-historical-review-obligations": result = cmd_reconcile_historical_review_obligations(args)
         elif args.command == "gate": result = cmd_gate(args)
         elif args.command == "cancel": result = cmd_cancel(args)
         elif args.command == "recover": result = cmd_recover(args)

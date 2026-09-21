@@ -53,9 +53,9 @@ class SemanticWriterFloorTests(unittest.TestCase):
             control, _, paths = self.initialized(root)
             state, _ = ledger.load_state(paths)
             provenance = state["runtime_provenance"]
-            self.assertEqual("1.1.0", state["skill_version"])
+            self.assertEqual("1.1.1", state["skill_version"])
             self.assertEqual("1.1", provenance["state_contract_version"])
-            self.assertEqual("1.1.0", provenance["minimum_writer_version"])
+            self.assertEqual("1.1.1", provenance["minimum_writer_version"])
             self.assertIsNone(ledger.mutation_ineligibility(state))
             old_writer_schema = copy.deepcopy(ledger.schema())
             del old_writer_schema["$defs"]["runtime_provenance"]["properties"]["state_contract_version"]

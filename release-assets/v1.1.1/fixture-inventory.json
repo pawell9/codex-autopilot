@@ -1,0 +1,70 @@
+{
+  "schema_version": "1",
+  "release": "v1.1.1",
+  "content_manifest": "release-assets/v1.1.1/content-manifest.json",
+  "suite": {
+    "command": [
+      "python3",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      "tests",
+      "-v"
+    ],
+    "test_root": "tests",
+    "test_modules": [
+      "tests/test_40_ticket_qualification.py",
+      "tests/test_continuation_candidates.py",
+      "tests/test_dashboard_currentness.py",
+      "tests/test_design_publication.py",
+      "tests/test_idea_scout_r58_fixture.py",
+      "tests/test_idea_scout_resume.py",
+      "tests/test_initial_intent.py",
+      "tests/test_legacy_diagnostics_v110.py",
+      "tests/test_legacy_sync.py",
+      "tests/test_lifecycle_repairs.py",
+      "tests/test_phase_b_projections_v110.py",
+      "tests/test_phase_c_attempt_finalization_v110.py",
+      "tests/test_phase_c_repair_plans_v110.py",
+      "tests/test_phase_d_candidate_proof_v110.py",
+      "tests/test_phase_d_effects_v110.py",
+      "tests/test_phase_e_manual_lifecycle_v110.py",
+      "tests/test_phase_e_review_qualification_v110.py",
+      "tests/test_phase_f_legacy_r58_v110.py",
+      "tests/test_phase_g_execution_binding_v110.py",
+      "tests/test_phase_g_runtime_observations_v110.py",
+      "tests/test_phase_g_successor_ownership_v110.py",
+      "tests/test_phase_h_boundaries_v110.py",
+      "tests/test_phase_h_qualification_matrix_v110.py",
+      "tests/test_phase_h_release_parity_v111.py",
+      "tests/test_presets.py",
+      "tests/test_requirements_adoption.py",
+      "tests/test_review_currentness_migration.py",
+      "tests/test_semantic_writer_floor_v110.py",
+      "tests/test_stale_lease_recovery_v110.py",
+      "tests/test_state_machine_model.py",
+      "tests/test_storage_safety_v110.py",
+      "tests/test_v104_qualification.py",
+      "tests/test_wave1.py",
+      "tests/test_wave2.py"
+    ]
+  },
+  "qualification_scripts": [
+    "experiments/v104_lifecycle_qualification.py",
+    "experiments/v1_40_ticket_qualification.py",
+    "experiments/v111_release_qualification.py"
+  ],
+  "fixture_roots": [
+    "tests/fixtures",
+    "experiments/fixtures"
+  ],
+  "fixture_policy": {
+    "recursive": true,
+    "include_hidden": false,
+    "symlinks": "reject",
+    "missing_or_extra": "fail",
+    "frozen_legacy": "tests/fixtures/legacy/idea-scout-r58",
+    "native_runtime": "no native process fixtures are claimed"
+  }
+}

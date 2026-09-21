@@ -1,0 +1,25 @@
+{
+  "schema_version": "1",
+  "release": "v1.1.1",
+  "fake_runtime": {
+    "status": "SUPPORTED",
+    "implementation": "experiments/v111_release_qualification.py:FakeRuntime",
+    "determinism": "event IDs and receipt bytes are stable for identical input",
+    "covered_events": ["start", "return_observed", "stop", "not_started"],
+    "replay": "same event is a no-op; conflicting event is rejected",
+    "stop_coverage": "included descendants required for release/reuse"
+  },
+  "native_runtime": {
+    "status": "UNSUPPORTED",
+    "adapter_bound": true,
+    "reason": "the repository cannot prove native process start, descendant enumeration, or physical stop",
+    "accepted_evidence": "only an external adapter receipt bound to the registered attempt",
+    "fake_receipts_are_native_proof": false
+  },
+  "limits": [
+    "No qualification claim covers OS-level process killing.",
+    "A timeout or missing receipt remains UNKNOWN, never STOPPED.",
+    "An observer receipt is not independently proof of observer truthfulness or completeness.",
+    "The helper does not spawn, supervise, enumerate, or kill native agents."
+  ]
+}

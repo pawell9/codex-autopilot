@@ -6,7 +6,7 @@ orchestrator owns the durable ledger, routing, contracts, review flow, and
 Git integration; bounded workers implement ticket-sized changes, and
 independent reviewers verify them.
 
-**CODEX-AUTOPILOT V1.1.0 — QUALIFIED DURABLE LIFECYCLE HARDENING**
+**CODEX-AUTOPILOT V1.1.1 — T02 LIFECYCLE PATCH**
 
 ## Requirements
 

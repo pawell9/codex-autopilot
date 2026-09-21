@@ -350,6 +350,54 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
                 self.assertIsNone(final_ticket["current_worker_attempt"])
                 self.assertNotEqual(final_ticket["current_candidate"], final_ticket["last_worker_attempt"])
 
+    def test_replacement_ticket_inherits_only_exact_contract_bound_stopped_checkpoint(self) -> None:
+        checkpoint = "c" * 40
+        state = {
+            "repository": {"initial_head": "f" * 40},
+            "tickets": [{"id": "T-OLD", "current_candidate": "C-OLD"}],
+            "candidates": [{
+                "id": "C-OLD", "ticket_ref": "T-OLD", "producer_attempt_ref": "W-OLD",
+                "sha": checkpoint, "tree_sha": "d" * 40, "quality": "DONE",
+                "superseded_by": None,
+            }],
+            "attempts": [{
+                "id": "W-OLD", "state": "RETURNED", "candidate_sha": checkpoint,
+                "candidate_tree_sha": "d" * 40, "candidate_proof_ref": "objects/" + "e" * 64,
+                "lease": {"state": "released"}, "runtime": {"liveness": "stopped"},
+            }],
+            "contracts": [{
+                "id": "CT-BASE", "implementation_availability": "available",
+                "implementation_availability_evidence_refs": [f"checkpoint:{checkpoint}"],
+            }],
+        }
+        ticket = {
+            "id": "T-NEW", "current_candidate": None, "replacement_refs": ["T-OLD"],
+            "contract_refs": ["CT-BASE"],
+        }
+        self.assertEqual(checkpoint, ledger.execution_base_for_ticket(state, ticket))
+
+        state["tickets"].append(ticket)
+        ticket["current_candidate"] = "C-NEW"
+        state["candidates"][0]["superseded_by"] = "C-NEW"
+        state["candidates"].append({
+            "id": "C-NEW", "ticket_ref": "T-NEW", "producer_attempt_ref": "W-NEW",
+            "sha": "a" * 40, "tree_sha": "b" * 40, "quality": "DONE",
+            "superseded_by": None,
+        })
+        self.assertEqual(checkpoint, ledger.replacement_checkpoint_for_ticket(state, ticket))
+        ticket["current_candidate"] = None
+        state["candidates"][0]["superseded_by"] = None
+        state["candidates"].pop()
+        state["tickets"].pop()
+
+        state["attempts"][0]["runtime"]["liveness"] = "running"
+        with self.assertRaisesRegex(ledger.LedgerError, "missing or ambiguous"):
+            ledger.execution_base_for_ticket(state, ticket)
+        state["attempts"][0]["runtime"]["liveness"] = "stopped"
+        state["contracts"][0]["implementation_availability_evidence_refs"] = []
+        with self.assertRaisesRegex(ledger.LedgerError, "lacks an exact available checkpoint"):
+            ledger.execution_base_for_ticket(state, ticket)
+
     def test_finding_projection_separates_current_history_binding_resolution_and_supersession(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -459,6 +507,28 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
             self.assertNotIn("F-RESOLVED", obligations)
             mirror_statuses = {item["finding_ref"]: item["status"] for item in projection["mirrored_issues"]}
             self.assertEqual({key: value["status"] for key, value in items.items()}, mirror_statuses)
+
+            # An amendment invalidation consumer closure is different from a
+            # review-resolution marker: it makes the old finding historical
+            # without rewriting or deleting the immutable finding record.
+            state.setdefault("invalidations", []).append({
+                "id": "invalidation-AMEND-1",
+                "amendment_ref": "AMEND-1",
+                "intent_revision": "2",
+                "previous_intent_revision": "1",
+                "previous_document_ref": "intent-v1",
+                "previous_document_hash": "a" * 64,
+                "affected_refs": ["intent-v1", "intent-v2"],
+                "consumer_refs": ["F-CURRENT"],
+                "recorded_at": "2026-09-19T00:00:00Z",
+            })
+            amended = ledger.finding_obligation_projection(state)
+            amended_items = {item["finding_ref"]: item for item in amended["items"]}
+            amended_obligations = {item["finding_ref"] for item in amended["obligations"]}
+            self.assertEqual("superseded", amended_items["F-CURRENT"]["status"])
+            self.assertEqual("history", amended_items["F-CURRENT"]["projection_classification"])
+            self.assertEqual("closed", amended_items["F-CURRENT"]["verification_obligation"]["status"])
+            self.assertNotIn("F-CURRENT", amended_obligations)
 
     def test_finding_resolution_requires_review_side_finding_and_candidate_linkage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -879,6 +949,70 @@ class PhaseBProjectionAndTransitionTests(unittest.TestCase):
             self.assertEqual("authorize_repair", repair["kind"])
             self.assertEqual("repair.authorize", repair["event_id"])
             self.assertIn("F-CURRENT-DISPOSITION", repair["subject_refs"])
+
+    def test_blocked_repair_candidate_routes_to_fresh_review_before_finding_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, repo, paths = init_run(root)
+            seed_ready_ticket(paths, repo)
+            install_execution_design(paths, repo)
+            state, prior = integrated_review_fixture(paths, repo, latest_attempt_drift=False)
+            ticket = state["tickets"][0]
+            prior["review_status"] = "BLOCK"
+            prior_sha = prior["sha"]
+            finding_ref = "F-REPAIRED"
+            review_attempt = next(item for item in state["attempts"] if item["id"] == "RV-INTEGRATE")
+            review_attempt["review_result"] = "BLOCK"
+            review_attempt["finding_refs"] = [finding_ref]
+            state["reviews"][0].update({
+                "id": "REV-BLOCK-RECORD", "attempt_ref": "RV-INTEGRATE",
+                "verdict": "BLOCK", "finding_refs": [finding_ref],
+            })
+            state["findings"] = [{
+                "id": finding_ref, "axis": "correctness", "impact": "blocking",
+                "claim": "Old candidate lacks the required oracle", "expected": "oracle present",
+                "actual": "oracle absent", "evidence": "review evidence",
+                "affected_refs": [TICKET_ID], "source_ref": "RV-INTEGRATE", "invalidated_by": [],
+            }]
+            state["issues"] = [{
+                "id": "ISS-FINDING", "type": "review_finding", "impact": "blocking",
+                "cause": "oracle", "expected": "oracle present", "actual": "oracle absent",
+                "affected_refs": [TICKET_ID], "source_ref": "REV-BLOCK-RECORD",
+                "finding_ref": finding_ref, "invalidated_by": [],
+            }, {
+                "id": "ISS-VERDICT", "type": "review_verdict", "impact": "blocking",
+                "cause": "oracle", "expected": "PASS", "actual": "BLOCK",
+                "affected_refs": [TICKET_ID], "source_ref": "RV-INTEGRATE",
+                "finding_ref": None, "invalidated_by": [],
+            }]
+            repair = attempt_record("W-REPAIR", kind="worker", candidate_sha="7" * 40)
+            repair.update({
+                "mode": "repair", "base_sha": prior_sha, "candidate_tree_sha": "8" * 40,
+                "checkout": str(repo), "repair_contract": {
+                    "cause": "oracle", "finding_refs": [finding_ref],
+                    "finding_proofs": [{
+                        "finding_ref": finding_ref, "hypothesis": "add the missing oracle",
+                        "expected_proof": "fresh review sees the exact oracle",
+                    }],
+                    "causal_change": "add an exhaustive oracle", "stopping_condition": "focused test passes",
+                    "source_attempt_ref": "W-CANDIDATE",
+                },
+            })
+            repair["lease"]["state"] = "active"
+            state["attempts"].append(repair)
+            repaired_candidate = ledger.publish_candidate_projection(state, ticket, repair, quality="DONE")
+            ticket.update({
+                "state": "CANDIDATE", "current_attempt": repair["id"],
+                "last_worker_attempt": repair["id"], "current_worker_attempt": None,
+            })
+            state["lifecycle"].update({"phase": "EXECUTE", "control": "BLOCKED", "reason": "review_not_pass"})
+
+            derived = ledger.derive_next_action(state)
+
+            self.assertEqual("review_candidate", derived["kind"])
+            self.assertEqual([TICKET_ID, repaired_candidate["id"]], derived["subject_refs"])
+            self.assertEqual("review.dispatch", derived["event_id"])
+            self.assertFalse(derived["human_input_required"])
 
     def test_status_keeps_legacy_finding_count_keys_and_separates_projection_counts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

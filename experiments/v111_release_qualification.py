@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproducible v1.1.0 release-package and runtime-boundary qualification.
+"""Reproducible v1.1.1 release-package and runtime-boundary qualification.
 
 This is intentionally independent of ``tools/ledger.py``.  It verifies the
 hash-addressed runtime package, materialises an install copy, inventories the
@@ -25,7 +25,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSET_ROOT = ROOT / "release-assets" / "v1.1.0"
+ASSET_ROOT = ROOT / "release-assets" / "v1.1.1"
 PACKAGE_MANIFEST = ASSET_ROOT / "package-manifest.json"
 REQUIRED_RUNTIME_PATHS = {
     "SKILL.md",
@@ -85,25 +85,25 @@ def safe_relative(value: str, label: str) -> Path:
 
 
 def load_artifacts(root: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    assets = root / "release-assets" / "v1.1.0"
+    assets = root / "release-assets" / "v1.1.1"
     package = read_json(assets / "package-manifest.json")
-    if package.get("release") != "v1.1.0" or package.get("schema_version") != "1":
-        raise QualificationError("package manifest is not the v1.1.0 schema")
+    if package.get("release") != "v1.1.1" or package.get("schema_version") != "1":
+        raise QualificationError("package manifest is not the v1.1.1 schema")
     expected_pointers = {
-        "source_manifest": "release-assets/v1.1.0/source-manifest.json",
-        "fixture_inventory": "release-assets/v1.1.0/fixture-inventory.json",
-        "content_manifest": "release-assets/v1.1.0/content-manifest.json",
-        "environment_manifest": "release-assets/v1.1.0/environment-manifest.json",
-        "runtime_conformance": "release-assets/v1.1.0/runtime-conformance.json",
+        "source_manifest": "release-assets/v1.1.1/source-manifest.json",
+        "fixture_inventory": "release-assets/v1.1.1/fixture-inventory.json",
+        "content_manifest": "release-assets/v1.1.1/content-manifest.json",
+        "environment_manifest": "release-assets/v1.1.1/environment-manifest.json",
+        "runtime_conformance": "release-assets/v1.1.1/runtime-conformance.json",
     }
     if any(package.get(key) != value for key, value in expected_pointers.items()):
-        raise QualificationError("package manifest pointers do not match the v1.1.0 release set")
+        raise QualificationError("package manifest pointers do not match the v1.1.1 release set")
 
     def pointed(name: str) -> dict[str, Any]:
         raw = package.get(name)
         rel = safe_relative(raw, name) if isinstance(raw, str) else None
         if rel is None or (root / rel).parent != assets:
-            raise QualificationError(f"{name} must point to an artifact in release-assets/v1.1.0")
+            raise QualificationError(f"{name} must point to an artifact in release-assets/v1.1.1")
         return read_json(root / rel)
 
     runtime = pointed("runtime_conformance")
@@ -114,7 +114,7 @@ def load_artifacts(root: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str
 
 def verify_source_manifest(root: Path, source_manifest: dict[str, Any]) -> list[dict[str, Any]]:
     entries = source_manifest.get("files")
-    if source_manifest.get("release") != "v1.1.0" or not isinstance(entries, list) or not entries:
+    if source_manifest.get("release") != "v1.1.1" or not isinstance(entries, list) or not entries:
         raise QualificationError("source manifest is empty or has the wrong release")
     seen_source: set[str] = set()
     seen_install: set[str] = set()
@@ -165,8 +165,8 @@ def verify_runtime_version(root: Path) -> str:
     """Check that the installed runtime's source advertises this release."""
     text = (root / "tools" / "ledger.py").read_text(encoding="utf-8")
     match = re.search(r'^SKILL_VERSION\s*=\s*["\']([^"\']+)["\']\s*$', text, re.MULTILINE)
-    if match is None or match.group(1) != "1.1.0":
-        raise QualificationError("runtime source does not advertise SKILL_VERSION 1.1.0")
+    if match is None or match.group(1) != "1.1.1":
+        raise QualificationError("runtime source does not advertise SKILL_VERSION 1.1.1")
     return match.group(1)
 
 
@@ -217,7 +217,7 @@ def verify_fixture_inventory(root: Path, inventory: dict[str, Any]) -> dict[str,
         raise QualificationError("fixture inventory is empty")
     content = inventory.get("_content")
     entries = content.get("files") if isinstance(content, dict) else None
-    if not isinstance(entries, list) or content.get("release") != "v1.1.0":
+    if not isinstance(entries, list) or content.get("release") != "v1.1.1":
         raise QualificationError("content manifest is missing or has the wrong release")
     declared: dict[str, dict[str, Any]] = {}
     for entry in entries:

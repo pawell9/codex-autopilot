@@ -48,11 +48,11 @@ class PhaseDEffectTests(unittest.TestCase):
         tree_sha = git(repo, "rev-parse", "HEAD^{tree}")
         run("init", "--control-root", str(control), "--repo-root", str(repo), "--run-id", run_id, "--owner-token", OWNER)
         paths = ledger.paths(control, run_id)
-        state, previous = ledger.load_state(paths)
-        state["repository"].update({"checkout": str(repo), "branch": git(repo, "branch", "--show-current"), "initial_head": base_sha})
-        state["previous_publication_hash"] = ledger.sha256_bytes(previous)
-        ledger.validate_ledger(state)
-        ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+        state, _ = ledger.load_state(paths)
+        self.assertEqual(base_sha, state["repository"]["initial_head"])
+        self.assertEqual(str(repo.resolve()), state["repository"]["execution_root"])
+        self.assertEqual(str(repo.resolve()), state["repository"]["checkout"])
+        self.assertEqual(git(repo, "branch", "--show-current"), state["repository"]["branch"])
         return {
             "root": root,
             "control": control,
@@ -377,6 +377,90 @@ class PhaseDEffectTests(unittest.TestCase):
         run("ingest-return", "--control-root", str(control), "--run-id", RUN_ID, "--owner-token", OWNER,
             "--revision", str(state["revision"]), "--attempt-id", ATTEMPT_ID, "--return-file", str(inbox), "--kind", "worker")
         return case
+
+    def test_fresh_init_g1_g2_g3_first_dispatch_uses_verified_initial_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case = self.candidate_case(Path(directory))
+            state, _ = ledger.load_state(case["paths"])
+            attempt = ledger.attempt_by_id(state, ATTEMPT_ID)
+            self.assertEqual(case["base_sha"], state["repository"]["initial_head"])
+            self.assertEqual(str(case["repo"].resolve()), state["repository"]["execution_root"])
+            self.assertEqual(case["base_sha"], attempt["base_sha"])
+            self.assertEqual(case["base_sha"], attempt["execution_binding"]["base_sha"])
+            self.assertEqual(case["repo"].resolve(), Path(attempt["checkout"]).resolve())
+
+    def test_revision_39_bootstrap_recovery_rebinds_clean_worktree_append_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = self.init_git_case(root, run_id="bootstrap-recovery-run")
+            worktree = root / "clean-worktree"
+            subprocess.run(
+                ["git", "-C", str(case["repo"]), "worktree", "add", "-qb", "bootstrap-recovery", str(worktree), case["base_sha"]],
+                check=True,
+            )
+            paths = case["paths"]
+            state, prior_raw = ledger.load_state(paths)
+            state["revision"] = 39
+            state["previous_publication_hash"] = ledger.sha256_bytes(prior_raw)
+            state["repository"]["initial_head"] = None
+            state["lifecycle"].update({
+                "phase": "EXECUTE", "control": "BLOCKED", "reason": "missing_bootstrap_binding",
+                "next_action": {"kind": "bind_bootstrap", "subject_refs": [], "preconditions": [], "read_refs": []},
+            })
+            receipt = {
+                "status": "PASS", "operation_id": "OP-worktree", "kind": "worktree_create",
+                "target": str(worktree.resolve()), "checkout": str(worktree.resolve()),
+                "authority_ref": "AUTH-bootstrap", "result": "applied", "expected_before": "absent",
+                "intended_after": case["base_sha"], "observed_head": case["base_sha"],
+                "tree_sha": case["base_tree_sha"], "branch": "bootstrap-recovery",
+                "worktree_clean": True, "observer": "test-owner",
+            }
+            receipt_raw = ledger.canonical_bytes(receipt)
+            receipt_hash = ledger.sha256_bytes(receipt_raw)
+            (paths["objects"]).mkdir(parents=True, exist_ok=True)
+            ledger.atomic_write(paths["objects"] / receipt_hash, receipt_raw)
+            state["operations"] = [{
+                "id": "OP-worktree", "kind": "worktree_create", "target": str(worktree.resolve()),
+                "state": "applied", "expected_before": "absent", "intended_after": case["base_sha"],
+                "authority_ref": "AUTH-bootstrap", "receipt_ref": f"objects/{receipt_hash}",
+            }]
+            ledger.refresh_control_projection(state)
+            ledger.validate_ledger(state)
+            ledger.atomic_write(paths["ledger"], ledger.canonical_bytes(state))
+            revision_39_raw = paths["ledger"].read_bytes()
+
+            result = json.loads(run(
+                "bind-bootstrap", "--control-root", str(case["control"]), "--run-id", "bootstrap-recovery-run",
+                "--owner-token", OWNER, "--revision", "39", "--repo-root", str(worktree),
+                "--expected-head", case["base_sha"], "--binding-id", "BIND-r39",
+                "--authority-ref", "user-approved-bootstrap-fix", "--operation-id", "OP-worktree",
+            ).stdout)
+            self.assertEqual(40, result["revision"])
+            self.assertFalse(result["idempotent"])
+            rebound, rebound_raw = ledger.load_state(paths)
+            self.assertEqual(revision_39_raw, paths["prev"].read_bytes())
+            self.assertEqual(str(worktree.resolve()), rebound["repository"]["execution_root"])
+            self.assertEqual(case["base_sha"], rebound["repository"]["initial_head"])
+            self.assertEqual("finalized", rebound["operations"][0]["state"])
+            migration = next(
+                item for item in rebound["runtime_provenance"]["applied_migrations"]
+                if item["id"] == "bootstrap-binding-BIND-r39"
+            )
+            report = json.loads((paths["run"] / migration["object_ref"]).read_text(encoding="utf-8"))
+            self.assertEqual(39, report["source_revision"])
+            self.assertEqual(40, report["applied_revision"])
+            self.assertEqual("OP-worktree", report["operation_ref"])
+            self.assertTrue(report["clean"])
+
+            replay = json.loads(run(
+                "bind-bootstrap", "--control-root", str(case["control"]), "--run-id", "bootstrap-recovery-run",
+                "--owner-token", OWNER, "--revision", "39", "--repo-root", str(worktree),
+                "--expected-head", case["base_sha"], "--binding-id", "BIND-r39",
+                "--authority-ref", "user-approved-bootstrap-fix", "--operation-id", "OP-worktree",
+            ).stdout)
+            self.assertTrue(replay["idempotent"])
+            self.assertEqual(40, replay["revision"])
+            self.assertEqual(rebound_raw, paths["ledger"].read_bytes())
 
     def test_applied_git_effect_is_adopted_once_without_repeating_commit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

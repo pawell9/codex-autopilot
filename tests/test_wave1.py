@@ -306,7 +306,7 @@ class Wave1Tests(unittest.TestCase):
                 "owner_authorization": "test-fixture:owner-approved-append-only-migration",
                 "source_ledger_hash": ledger.sha256_bytes(prior_raw),
                 "target_state_contract_version": "1.1",
-                "target_minimum_writer_version": "1.1.0",
+                "target_minimum_writer_version": "1.1.1",
             }
             manifest_raw = ledger.canonical_bytes(manifest)
             manifest_hash = ledger.sha256_bytes(manifest_raw)
@@ -316,7 +316,7 @@ class Wave1Tests(unittest.TestCase):
                 "last_mutating_skill_version": ledger.WRITER_VERSION,
                 "compatibility_floor": ledger.COMPATIBILITY_FLOOR,
                 "state_contract_version": "1.1",
-                "minimum_writer_version": "1.1.0",
+                "minimum_writer_version": "1.1.1",
                 "applied_migrations": [{
                     "id": marker,
                     "helper_version": ledger.WRITER_VERSION,
